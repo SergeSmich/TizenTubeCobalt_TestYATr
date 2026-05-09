@@ -17,6 +17,8 @@
 
 #include <jni.h>
 
+#include "base/android/jni_android.h"
+#include "base/android/scoped_java_ref.h"
 #include "base/memory/singleton.h"
 #include "starboard/common/size.h"
 #include "third_party/jni_zero/jni_zero.h"
@@ -103,6 +105,15 @@ class StarboardBridge {
   void CloseAllCobaltService(JNIEnv* env) const;
 
   void HideSplashScreen(JNIEnv* env) const;
+
+  // TizenTube Cobalt APIs
+  bool InstallAppFromURL(JNIEnv* env, const char* url) const;
+  std::string GetVersion(JNIEnv* env) const;
+  std::string GetArchitecture(JNIEnv* env) const;
+  std::string GetBrandAndModel(JNIEnv* env) const;
+  void SetFrameRate(JNIEnv* env, float frame_rate) const;
+  void EnterPIP(JNIEnv* env) const;
+  bool HasSystemFeature(JNIEnv* env, const char* feature_name) const;
 
   void SetStartupMilestone(jint milestone) const;
   void SetStartupDiagnosisInfo(const char* key, const char* value) const;

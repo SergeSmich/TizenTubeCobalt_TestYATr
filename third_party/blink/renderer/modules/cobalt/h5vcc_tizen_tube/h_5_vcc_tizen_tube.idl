@@ -16,9 +16,17 @@
     Exposed=Window,
     SecureContext
 ]
-interface H5vccSettings {
-  // TODO: b/455661813 - Remove this API once Finch is available.
-  // This API is a stop-gap solution until Finch is ready.
+interface H5vccTizenTube {
   [CallWith=ScriptState, RaisesException]
-  Promise<undefined> set(DOMString name, (DOMString or long) value);
+  boolean InstallAppFromURL(DOMString url);
+  [CallWith=ScriptState, RaisesException]
+  DOMString GetVersion();
+  [CallWith=ScriptState, RaisesException]
+  DOMString GetArchitecture();
+  void SetFrameRate(float frame_rate);
+  void EnterPIP();
+  [CallWith=ScriptState, RaisesException]
+  boolean SetUserAgent(DOMString user_agent);
+  [CallWith=ScriptState, RaisesException]
+  boolean HasSystemFeature(DOMString feature_name);
 };

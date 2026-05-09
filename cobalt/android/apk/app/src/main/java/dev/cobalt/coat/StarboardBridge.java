@@ -21,14 +21,19 @@ import static dev.cobalt.util.Log.TAG;
 import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.app.Service;
+import android.app.PictureInPictureParams;
 import android.content.Context;
 import android.content.pm.PackageManager;
 import android.content.res.AssetManager;
 import android.hardware.input.InputManager;
+import android.hardware.display.DisplayManager;
 import android.media.AudioDeviceInfo;
 import android.media.AudioManager;
 import android.os.Build;
+import android.provider.Settings;
+import android.util.Rational;
 import android.view.Display;
+import android.view.Surface;
 import android.view.InputDevice;
 import android.view.accessibility.CaptioningManager;
 import androidx.annotation.Nullable;
@@ -134,7 +139,7 @@ public class StarboardBridge {
     mAudioPermissionRequester = new AudioPermissionRequester(appContext, activityHolder);
     mResourceOverlay = new ResourceOverlay(appContext);
     mAdvertisingId = new AdvertisingId(appContext);
-    mVolumeStateReceiver = new VolumeStateReceiver(appContext);
+    //mVolumeStateReceiver = new VolumeStateReceiver(appContext);
     mIsAmatiDevice = appContext.getPackageManager().hasSystemFeature(AMATI_EXPERIENCE_FEATURE);
 
     mNativeApp =
@@ -483,28 +488,8 @@ public class StarboardBridge {
   /** Returns string for kSbSystemPropertyUserAgentAuxField */
   @CalledByNative
   protected String getUserAgentAuxField() {
-    StringBuilder sb = new StringBuilder();
-
-    String packageName = mAppContext.getApplicationInfo().packageName;
-    sb.append(packageName);
-    sb.append('/');
-
-    try {
-      if (android.os.Build.VERSION.SDK_INT < 33) {
-        sb.append(mAppContext.getPackageManager().getPackageInfo(packageName, 0).versionName);
-      } else {
-        sb.append(
-            mAppContext
-                .getPackageManager()
-                .getPackageInfo(packageName, PackageManager.PackageInfoFlags.of(0))
-                .versionName);
-      }
-    } catch (PackageManager.NameNotFoundException ex) {
-      // Should never happen
-      Log.e(TAG, "Can't find our own package", ex);
-    }
-
-    return sb.toString();
+    // Spoof the aux field
+    return "com.google.android.youtube.tv/7.02.302";
   }
 
   // TODO: (cobalt b/372559388) remove or migrate JNI?
@@ -731,7 +716,7 @@ public class StarboardBridge {
 
   public void setWebContents(WebContents webContents) {
     mCobaltMediaSession.setWebContents(webContents);
-    mVolumeStateReceiver.setWebContents(webContents);
+    //mVolumeStateReceiver.setWebContents(webContents);
   }
 
   @CalledByNative
@@ -740,6 +725,149 @@ public class StarboardBridge {
     if (activity instanceof CobaltActivity) {
       ((CobaltActivity) activity).finishAffinity();
     }
+  }
+
+  @CalledByNative
+  protected boolean installAppFromURL(String url) {
+    java.util.concurrent.ExecutorService executor = java.util.concurrent.Executors.newSingleThreadExecutor();
+    android.os.Handler mainHandler = new android.os.Handler(android.os.Looper.getMainLooper());
+    executor.execute(() -> {
+      java.io.File apkFile = new java.io.File(mAppContext.getFilesDir(), "downloaded_app.apk");
+      boolean success = false;
+      try (java.io.InputStream in = new java.net.URL(url).openStream();
+           java.io.OutputStream out = new java.io.FileOutputStream(apkFile)) {
+        byte[] buffer = new byte[8192];
+        int len;
+        long total = 0;
+        while ((len = in.read(buffer)) != -1) {
+          out.write(buffer, 0, len);
+          total += len;
+        }
+        out.flush();
+        success = true;
+      } catch (Exception e) {
+      }
+      if (success) {
+        mainHandler.post(() -> {
+          try {
+            android.net.Uri contentUri = androidx.core.content.FileProvider.getUriForFile(
+                mAppContext,
+                mAppContext.getPackageName() + ".fileprovider",
+                apkFile);
+            android.content.Intent installIntent = new android.content.Intent(android.content.Intent.ACTION_VIEW);
+            installIntent.setDataAndType(contentUri, "application/vnd.android.package-archive");
+            installIntent.setFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION | android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+            Activity activity = mActivityHolder.get();
+            if (activity != null) {
+              activity.startActivity(installIntent);
+            } else {
+              mAppContext.startActivity(installIntent);
+            }
+          } catch (Exception e) {
+          }
+        });
+      } else {
+      }
+      executor.shutdown();
+    });
+    return true;
+  }
+
+  @CalledByNative
+  protected String getVersion() {
+    try {
+      android.content.pm.PackageInfo packageInfo =
+          mAppContext.getPackageManager().getPackageInfo(mAppContext.getPackageName(), 0);
+      return packageInfo.versionName;
+    } catch (android.content.pm.PackageManager.NameNotFoundException e) {
+      Log.e(TAG, "Failed to get package info", e);
+      return "unknown";
+    }
+  }
+
+  @CalledByNative
+  protected String getBrandAndModel() {
+    return Settings.Global.getString(mAppContext.getContentResolver(), "device_name");
+  }
+
+  @CalledByNative
+  protected String getArchitecture() {
+    return Build.SUPPORTED_ABIS[0];
+  }
+
+  @CalledByNative
+  protected void setFrameRate(float frameRate) {
+    if (Build.VERSION.SDK_INT < 30) {
+      return;
+    }
+
+    Activity activity = mActivityHolder.get();
+    if (activity == null) {
+      return;
+    }
+
+    Display defaultDisplay = activity.getWindowManager().getDefaultDisplay();
+    DisplayManager displayManager =
+        (DisplayManager) mAppContext.getSystemService(Context.DISPLAY_SERVICE);
+
+    boolean canBeSeamless = false;
+    int strategy = 1;
+    if (Build.VERSION.SDK_INT >= 31) {
+        float[] supportedRefreshRates = defaultDisplay.getMode().getAlternativeRefreshRates();
+        for (float rate : supportedRefreshRates) {
+          if (Math.abs(rate - frameRate) < 0.1f || isMultiple(rate, frameRate, 0.1f)) {
+            canBeSeamless = true;
+            break;
+          }
+        }
+
+        int contentPreference = displayManager.getMatchContentFrameRateUserPreference();
+        if (contentPreference == DisplayManager.MATCH_CONTENT_FRAMERATE_NEVER) return;
+        else if (contentPreference == DisplayManager.MATCH_CONTENT_FRAMERATE_SEAMLESSS_ONLY) {
+          if (canBeSeamless) {
+            strategy = Surface.CHANGE_FRAME_RATE_ONLY_IF_SEAMLESS;
+          }
+        } else if (contentPreference == DisplayManager.MATCH_CONTENT_FRAMERATE_ALWAYS) {
+          strategy = Surface.CHANGE_FRAME_RATE_ALWAYS;
+        } else {
+          strategy = Surface.CHANGE_FRAME_RATE_ALWAYS;
+        }
+      }
+
+    if (activity instanceof CobaltActivity) {
+      if (Build.VERSION.SDK_INT == 30) {
+        ((CobaltActivity) activity).setFrameRate(frameRate, 0);
+      } else if (Build.VERSION.SDK_INT >= 31) {
+        ((CobaltActivity) activity).setFrameRate(frameRate, strategy);
+      }
+    }
+  }
+
+  @CalledByNative
+  protected void enterPIP() {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+      Activity activity = mActivityHolder.get();
+      if (activity.getPackageManager().hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE)) {
+        Rational aspectRatio = new Rational(1920, 1080);
+            PictureInPictureParams params = new PictureInPictureParams.Builder()
+                    .setAspectRatio(aspectRatio)
+                    .setTitle("TizenTube")
+                    .setSubtitle("Playing video")
+                    .build();
+            Boolean result = activity.enterPictureInPictureMode(params);
+      }
+    }
+  }
+
+  @CalledByNative
+  protected boolean hasSystemFeature(String featureName) {
+    return mAppContext.getPackageManager().hasSystemFeature(featureName);
+  }
+
+  private static boolean isMultiple(float refreshRate, float fps, float tolerance) {
+    float ratio = refreshRate / fps;
+    float nearestInt = Math.round(ratio);
+    return Math.abs(ratio - nearestInt) < (tolerance / fps);
   }
 
   /** A wrapper of the android.util.Size class to be used by JNI. */

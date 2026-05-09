@@ -35,9 +35,13 @@
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
     <uses-permission android:name="android.permission.GET_ACCOUNTS"/>
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>
     <!-- This is needed when targeting API 28+ to use foreground services -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"/>
+    <!-- DIAL server requires permission to query running apps and tasks -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+    <uses-permission android:name="android.permission.GET_TASKS" />
 
     <!-- https://iabtechlab.com/OTT-IFA, AdvertisingIdClient.Info.getId() -->
     {% if enable_ad_id_permission %}
@@ -55,20 +59,21 @@
             android:zygotePreloadName="org.chromium.content_public.app.ZygotePreload"
             {# Always enable debuggable=true for development. This manifest is only used for the development shell (CoAT) and does not affect the production Kimono app. #}
             android:debuggable="true"
-            android:enableOnBackInvokedCallback="true"
-            android:label="{% block application_label %}Cobalt Shell{% endblock %}">
+            android:label="{% block application_label %}TizenTube{% endblock %}">
         {# Always enable profileable for development. This manifest is only used for the development shell (CoAT) and does not affect the production Kimono app. #}
         <profileable android:shell="true" android:enabled="true" />
         {% block main_activity %}
         <activity android:name="dev.cobalt.app.MainActivity"
                   android:launchMode="singleTask"
                   android:theme="@style/CobaltTheme"
-                  android:configChanges="keyboard|keyboardHidden|navigation|orientation|screenSize|uiMode"
+                  android:configChanges="keyboard|keyboardHidden|navigation|orientation|screenSize|smallestScreenSize|screenLayout|uiMode"
                   android:windowSoftInputMode="adjustResize"
+                  android:supportsPictureInPicture="true"
                   android:hardwareAccelerated="true"
                   android:exported="true">
-            <meta-data android:name="cobalt.APP_URL" android:value="https://www.youtube.com/tv"/>
+            <meta-data android:name="cobalt.APP_URL" android:value="https://www.youtube.com/tv?additionalDataUrl=http://localhost:8012/apps/YouTube"/>
             <meta-data android:name="cobalt.ENABLE_SPLASH_SCREEN" android:value="true"/>
+            <meta-data android:name="com.google.android.tv.pip.category" android:value="communication" />
             <meta-data android:name="cobalt.EVERGREEN_LITE" android:value="false"/>
             {# ENABLE_FEATURES accepts a semi-colon-separated list of Chromium features. #}
             {# Always enable Perfetto tracing for development. This manifest is only used for the development shell (CoAT) and does not affect the production Kimono app. #}
@@ -141,7 +146,15 @@
         {% endfor %}
         {% block extra_application_definitions_for_test %}
         {% endblock %}
-
+        <provider
+          android:name="androidx.core.content.FileProvider"
+          android:authorities="{{ manifest_package }}.fileprovider"
+          android:exported="false"
+          android:grantUriPermissions="true">
+          <meta-data
+            android:name="android.support.FILE_PROVIDER_PATHS"
+            android:resource="@xml/file_paths" />
+    </provider>
     </application>
     {% block extra_root_definitions %}
     {% endblock %}

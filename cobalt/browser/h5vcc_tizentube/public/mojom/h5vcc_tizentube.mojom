@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-[
-    Exposed=Window,
-    SecureContext
-]
-interface H5vccSettings {
-  // TODO: b/455661813 - Remove this API once Finch is available.
-  // This API is a stop-gap solution until Finch is ready.
-  [CallWith=ScriptState, RaisesException]
-  Promise<undefined> set(DOMString name, (DOMString or long) value);
+module h5vcc_tizentube.mojom;
+
+interface H5vccTizentube {
+  InstallAppFromURL(string url) => (bool success);
+  GetVersion() => (string version);
+  GetArchitecture() => (string architecture);
+  GetBrandAndModel() => (string brand_and_model);
+  SetFrameRate(float frame_rate);
+  SetUserAgent(string user_agent);
 };

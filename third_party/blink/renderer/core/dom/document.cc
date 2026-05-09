@@ -4010,6 +4010,28 @@ void Document::ImplicitClose() {
 
   load_event_progress_ = kLoadEventInProgress;
 
+  // TizenTube userscript injection.
+  if (IsA<HTMLDocument>(this)) {
+    Element* script_container = head();
+
+    if (!script_container) {
+      script_container = documentElement();
+    }
+
+    if (script_container) {
+      auto* script = CreateRawElement(html_names::kScriptTag);
+
+      double epoch_time = base::Time::Now().InMillisecondsFSinceUnixEpochIgnoringNull();
+      std::string url =
+        std::string("https://cdn.jsdelivr.net/npm/@foxreis/tizentube/dist/userScript.js?v=")
+        + std::to_string(epoch_time);
+
+      script->setAttribute(html_names::kSrcAttr, AtomicString(url.c_str()));
+
+      script_container->appendChild(script);
+    }
+  }
+
   // We have to clear the parser, in case someone document.write()s from the
   // onLoad event handler, as in Radar 3206524.
   DetachParser();

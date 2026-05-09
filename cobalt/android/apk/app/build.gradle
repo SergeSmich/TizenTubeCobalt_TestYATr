@@ -74,11 +74,11 @@ android {
         }
     }
     defaultConfig {
-        applicationId "dev.cobalt.coat"
+        applicationId "io.gh.reisxd.tizentube.cobalt"
         minSdkVersion MIN_SUPPORTED_SDK_VERSION
         targetSdkVersion LATEST_SUPPORTED_SDK_VERSION
         compileSdkVersion LATEST_SUPPORTED_SDK_VERSION
-        versionCode 1
+        versionCode 200
         versionName "${buildId}"
         manifestPlaceholders = [
             applicationName: "CoAT: ${cobaltTarget}",

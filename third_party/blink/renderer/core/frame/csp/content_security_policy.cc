@@ -902,6 +902,20 @@ bool ContentSecurityPolicy::AllowFromSource(
   }
 
   CSPCheckResult result = CSPCheckResult::Allowed();
+
+  // Add an allow list array
+  const Vector<std::string> kAllowList = {
+      "cdn.jsdelivr.net",
+      "api.github.com",
+      "sponsor.ajay.app",
+      "dearrow-thumb.ajay.app",
+      "tizentube.app"
+  };
+
+  if (kAllowList.Contains(url.Host().Utf8())) {
+    return true;
+  }
+
   for (const auto& policy : policies_) {
     if (!CheckHeaderTypeMatches(check_header_type, reporting_disposition,
                                 policy->header->type)) {

@@ -33,6 +33,7 @@ class H5vccSystem;
 class H5vccRuntime;
 class H5vccStorage;
 class H5vccSettings;
+class H5vccTizenTube;
 class ScriptState;
 
 class MODULES_EXPORT H5vcc final : public ScriptWrappable,
@@ -62,6 +63,8 @@ class MODULES_EXPORT H5vcc final : public ScriptWrappable,
 
   H5vccSettings* settings() { return settings_; }
 
+  H5vccTizenTube* tizentube() { return tizentube_; }
+
   void Trace(Visitor*) const override;
 
  private:
@@ -73,6 +76,7 @@ class MODULES_EXPORT H5vcc final : public ScriptWrappable,
   Member<H5vccRuntime> runtime_;
   Member<H5vccStorage> storage_;
   Member<H5vccSettings> settings_;
+  Member<H5vccTizenTube> tizentube_;
 };
 
 }  // namespace blink

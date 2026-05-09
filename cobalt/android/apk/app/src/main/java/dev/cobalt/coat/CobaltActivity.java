@@ -25,25 +25,25 @@ import android.content.pm.PackageManager.NameNotFoundException;
 import android.media.AudioManager;
 import android.net.Uri;
 import android.os.Bundle;
-import android.os.SystemClock;
 import android.os.Build;
+import android.os.SystemClock;
 import android.text.TextUtils;
 import android.view.KeyEvent;
+import android.view.Surface;
 import android.view.View;
 import android.view.ViewGroup.LayoutParams;
 import android.view.ViewParent;
 import android.view.WindowManager;
-import android.window.OnBackInvokedCallback;
-import android.window.OnBackInvokedDispatcher;
 import android.widget.FrameLayout;
 import android.widget.Toast;
 import androidx.annotation.Nullable;
-import androidx.annotation.RequiresApi;
 import androidx.annotation.VisibleForTesting;
 import dev.cobalt.browser.CobaltContentBrowserClient;
 import dev.cobalt.coat.javabridge.CobaltJavaScriptAndroidObject;
 import dev.cobalt.coat.javabridge.CobaltJavaScriptInterface;
 import dev.cobalt.coat.javabridge.HTMLMediaElementExtension;
+import dev.cobalt.dial.DIALServer;
+import dev.cobalt.dial.DiscoveryServer;
 import dev.cobalt.media.AudioOutputManager;
 import dev.cobalt.media.MediaCodecCapabilitiesLogger;
 import dev.cobalt.media.VideoSurfaceView;
@@ -64,7 +64,6 @@ import org.chromium.base.CommandLine;
 import org.chromium.base.library_loader.LibraryLoader;
 import org.chromium.base.library_loader.LibraryProcessType;
 import org.chromium.base.memory.MemoryPressureMonitor;
-import org.chromium.base.memory.MemoryPressureUma;
 import org.chromium.base.version_info.VersionInfo;
 import org.chromium.content.browser.input.ImeAdapterImpl;
 import org.chromium.content_public.browser.BrowserStartupController;
@@ -350,7 +349,7 @@ public abstract class CobaltActivity extends Activity {
   public boolean onKeyDown(int keyCode, KeyEvent event) {
     // If input is a from a gamepad button, it shouldn't be dispatched to IME which incorrectly
     // consumes the event as a VKEY_UNKNOWN
-    if (KeyEvent.isGamepadButton(keyCode)) {
+    if (KeyEvent.isGamepadButton(keyCode) || keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) {
       return super.onKeyDown(keyCode, event);
     }
     return dispatchKeyEventToIme(keyCode, KeyEvent.ACTION_DOWN) || super.onKeyDown(keyCode, event);
@@ -358,7 +357,7 @@ public abstract class CobaltActivity extends Activity {
 
   @Override
   public boolean onKeyUp(int keyCode, KeyEvent event) {
-    if (KeyEvent.isGamepadButton(keyCode)) {
+    if (KeyEvent.isGamepadButton(keyCode) || keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) {
       return super.onKeyUp(keyCode, event);
     }
     return dispatchKeyEventToIme(keyCode, KeyEvent.ACTION_UP) || super.onKeyUp(keyCode, event);
@@ -444,9 +443,11 @@ public abstract class CobaltActivity extends Activity {
       Log.i(TAG, "StartupGuard skipped by random 25% rollout check.");
     }
 
+    // Start DIAL servers as fallback (in case boot receiver didn't trigger)
+    startDIALServers();
+
     createContent(savedInstanceState);
     MemoryPressureMonitor.INSTANCE.registerComponentCallbacks();
-    MemoryPressureUma.initializeForBrowser();
     NetworkChangeNotifier.init();
     NetworkChangeNotifier.setAutoDetectConnectivityState(true);
 
@@ -458,10 +459,6 @@ public abstract class CobaltActivity extends Activity {
       Log.i(TAG, "Do not create VideoSurfaceView.");
     }
     StartupGuard.getInstance().setStartupMilestone(9);
-
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-      OnBackInvokedHelper.register(this);
-    }
   }
 
   /**
@@ -501,6 +498,21 @@ public abstract class CobaltActivity extends Activity {
   }
 
   /**
+   * Starts the DIAL servers (HTTP and UDP discovery) as a fallback mechanism.
+   * This is called in onStart() to ensure the servers are running even if the
+   * BootCompleteReceiver didn't trigger or if the app is started before boot completed.
+   */
+  private void startDIALServers() {
+    try {
+      DIALServer.getInstance().start(this);
+      DiscoveryServer.getInstance().start(this);
+      Log.i(TAG, "DIAL servers started");
+    } catch (Exception e) {
+      Log.e(TAG, "Failed to start DIAL servers: " + e.getMessage());
+    }
+  }
+
+  /**
    * Instantiates the StarboardBridge. Apps not supporting sign-in should inject an instance of
    * NoopUserAuthorizer. Apps may subclass StarboardBridge if they need to override anything.
    */
@@ -513,6 +525,10 @@ public abstract class CobaltActivity extends Activity {
   @Override
   protected void onStart() {
     StartupGuard.getInstance().setStartupMilestone(10);
+    
+    // Start DIAL servers for casting discovery
+    startDIALServers();
+    
     if (isDevelopmentBuild()) {
       getStarboardBridge().getAudioOutputManager().dumpAllOutputDevices();
       MediaCodecCapabilitiesLogger.dumpAllDecoders();
@@ -830,20 +846,22 @@ public abstract class CobaltActivity extends Activity {
     }
   }
 
-  @RequiresApi(api = 33)
-  private static class OnBackInvokedHelper {
-    static void register(final CobaltActivity activity) {
-      activity.getOnBackInvokedDispatcher().registerOnBackInvokedCallback(
-          OnBackInvokedDispatcher.PRIORITY_DEFAULT,
-          new OnBackInvokedCallback() {
-            @Override
-            public void onBackInvoked() {
-              // Simulate complete key cycle just like onKeyDown -> IME pipeline expects.
-              activity.dispatchKeyEventToIme(KeyEvent.KEYCODE_BACK, KeyEvent.ACTION_DOWN);
-              activity.dispatchKeyEventToIme(KeyEvent.KEYCODE_BACK, KeyEvent.ACTION_UP);
-            }
-          }
-      );
+  public void setFrameRate(float frameRate, int strategy) {
+    if (Build.VERSION.SDK_INT < 30) {
+      return;
     }
+
+    Runnable runnable =
+        new Runnable() {
+          @Override
+          public void run() {
+            Surface videoSurface = VideoSurfaceView.getCurrentSurface();
+            if (Build.VERSION.SDK_INT == 30) videoSurface.setFrameRate(frameRate, Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE);
+            else if (Build.VERSION.SDK_INT >= 31)
+              videoSurface.setFrameRate(frameRate, Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE, strategy);
+          }
+        };
+
+    runOnUiThread(runnable);
   }
 }
