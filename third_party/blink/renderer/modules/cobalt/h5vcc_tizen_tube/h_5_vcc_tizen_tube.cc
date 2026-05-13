@@ -81,8 +81,8 @@ bool H5vccTizenTube::InstallAppFromURL(
 #if BUILDFLAG(IS_ANDROID)
   auto* env = base::android::AttachCurrentThread();
   starboard::StarboardBridge* bridge = starboard::StarboardBridge::GetInstance();
-  bridge->EnterPIP(env);
-  return false;
+  bridge->InstallAppFromURL(env, url.Utf8().data());
+  return true;
 #else
   return false;
 #endif // BUILDFLAG(IS_ANDROID)

@@ -851,8 +851,6 @@ public class StarboardBridge {
         Rational aspectRatio = new Rational(1920, 1080);
             PictureInPictureParams params = new PictureInPictureParams.Builder()
                     .setAspectRatio(aspectRatio)
-                    .setTitle("TizenTube")
-                    .setSubtitle("Playing video")
                     .build();
             Boolean result = activity.enterPictureInPictureMode(params);
       }
