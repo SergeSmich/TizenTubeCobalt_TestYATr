@@ -23,13 +23,28 @@ jobs:
 
       - name: Download latest TizenTubeCobalt APK
         run: |
-          APK_URL=$(curl -s https://api.github.com/repos/reisxd/TizenTubeCobalt/releases/latest \
-            | grep "browser_download_url.*apk" \
-            | head -1 \
-            | cut -d '"' -f 4)
+          RELEASE_JSON=$(curl -s https://api.github.com/repos/reisxd/TizenTubeCobalt/releases/latest)
+          echo "=== Release assets ==="
+          echo "$RELEASE_JSON" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          print('Tag:', data.get('tag_name'))
+          for a in data.get('assets', []):
+              print('Asset:', a['name'], '->', a['browser_download_url'])
+          "
+          APK_URL=$(echo "$RELEASE_JSON" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          for a in data.get('assets', []):
+              if a['name'].endswith('.apk'):
+                  print(a['browser_download_url'])
+                  break
+          ")
           echo "Downloading: $APK_URL"
-          curl -Lo tizentube.apk "$APK_URL"
+          curl -L -o tizentube.apk "$APK_URL"
+          echo "=== APK info ==="
           ls -lh tizentube.apk
+          file tizentube.apk
 
       - name: Decompile APK
         run: |
