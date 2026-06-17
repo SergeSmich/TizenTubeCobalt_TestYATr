@@ -73,23 +73,16 @@ jobs:
           echo "=== Корневая структура APK ==="
           ls -F apk_out/
 
-      - name: Deep Exploration (Разведка структуры)
+      - name: Locate Target Activity & Network Clients
         run: |
-          echo "=== 1. Проверка ВСЕХ файлов в assets ==="
-          find apk_out/assets -type f | head -n 100 || echo "Папка assets пуста или отсутствует"
+          echo "=== 1. Поиск стартовой Активити ==="
+          grep -A 5 "android.intent.action.MAIN" apk_out/AndroidManifest.xml
           
-          echo "=== 2. Поиск любых HTML/JS файлов во всем проекте ==="
-          find apk_out/ -type f \( -name "*.html" -o -name "*.js" -o -name "*.json" \) | head -n 50
+          echo "=== 2. Поиск кастомных классов Cobalt ==="
+          find apk_out/smali* -type f -name "*Cobalt*" | head -n 40
           
-          echo "=== 3. Поиск главного Activity в AndroidManifest ==="
-          grep -oE 'android:name="[^"]+"' apk_out/AndroidManifest.xml | head -n 20
-          
-          echo "=== 4. Поиск WebView или Cobalt компонентов в Smali ==="
-          find apk_out/smali* -type f \( -name "*WebView*" -o -name "*Cobalt*" -o -name "*Client*" \) | head -n 40
-          
-          echo "=== 5. Поиск методов загрузки URL или инжектов ==="
-          grep -rn "loadUrl" apk_out/smali* | head -n 20 || echo "loadUrl не найден"
-          grep -rn "evaluateJavascript" apk_out/smali* | head -n 20 || echo "evaluateJavascript не найден"
+          echo "=== 3. Проверяем наличие Cronet или OkHttp (сеть) ==="
+          find apk_out/smali* -type f \( -name "*Cronet*" -o -name "*OkHttp*" -o -name "*UrlRequest*" \) | head -n 30
 
       # Временная заглушка, чтобы сборка не ломалась, пока мы ищем правильное место для интеграции
       - name: Create Dummy VOT File
