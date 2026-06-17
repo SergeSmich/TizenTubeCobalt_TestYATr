@@ -44,13 +44,28 @@ jobs:
 
       - name: Download latest TizenTubeCobalt APK
         run: |
-          curl -Lo tizentube.apk \
-            $(curl -s https://api.github.com/repos/reisxd/TizenTubeCobalt/releases/latest \
-            | grep "browser_download_url.*apk" \
-            | head -1 \
-            | cut -d '"' -f 4)
-          echo "Downloaded APK:"
+          # Получаем прямую ссылку на APK из релизов с помощью jq
+          DOWNLOAD_URL=$(curl -s https://api.github.com/repos/reisxd/TizenTubeCobalt/releases/latest \
+            | jq -r '.assets[] | select(.name | endswith(".apk")) | .browser_download_url' | head -n 1)
+          
+          if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" = "null" ]; then
+            echo "КРИТИЧЕСКАЯ ОШИБКА: Не удалось получить ссылку на APK из GitHub API!"
+            exit 1
+          fi
+          
+          echo "Скачиваем APK по ссылке: $DOWNLOAD_URL"
+          curl -L -o tizentube.apk "$DOWNLOAD_URL"
+          
+          echo "=== Проверяем размер скачанного файла ==="
           ls -lh tizentube.apk
+          
+          # Если файл весит меньше 1 МБ, значит скачалось что-то не то
+          FILE_SIZE=$(stat -c%s tizentube.apk)
+          if [ "$FILE_SIZE" -lt 1000000 ]; then
+            echo "КРИТИЧЕСКАЯ ОШИБКА: Скачанный файл подозрительно маленький ($FILE_SIZE байт). Возможно, это ошибка 404."
+            cat tizentube.apk | head -n 20 || true
+            exit 1
+          fi
           
       - name: Decompile APK
         run: |
