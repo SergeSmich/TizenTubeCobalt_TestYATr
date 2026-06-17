@@ -9,8 +9,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -18,267 +16,70 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Setup Android SDK Build-Tools (for apksigner)
-        uses: android-actions/setup-android@v3
-
       - name: Download apktool
         run: |
-          curl -Lo apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar
-          chmod +x apktool.jar
+          curl -Lo apktool.jar \
+            https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar
 
       - name: Download latest TizenTubeCobalt APK
         run: |
-          RELEASE_JSON=$(curl -s https://api.github.com/repos/reisxd/TizenTubeCobalt/releases/latest)
-          APK_URL=$(echo "$RELEASE_JSON" | python3 -c "
-          import sys, json
-          data = json.load(sys.stdin)
-          for a in data.get('assets', []):
-              if a['name'].endswith('.apk'):
-                  print(a['browser_download_url'])
-                  break
-          ")
+          APK_URL=$(curl -s https://api.github.com/repos/reisxd/TizenTubeCobalt/releases/latest \
+            | grep "browser_download_url.*apk" \
+            | head -1 \
+            | cut -d '"' -f 4)
           echo "Downloading: $APK_URL"
-          curl -L -o tizentube.apk "$APK_URL"
-          echo "=== APK info ==="
+          curl -Lo tizentube.apk "$APK_URL"
           ls -lh tizentube.apk
 
       - name: Decompile APK
         run: |
           java -jar apktool.jar d tizentube.apk -o apk_out -f
-          echo "APK structure decompiled successfully."
 
-      - name: Create and Copy VOT script to assets
+      - name: Copy VOT script to assets
         run: |
           mkdir -p apk_out/assets
-          cat > apk_out/assets/vot.js << 'VOTEOF'
-          // Яндекс VOT — перевод видео для TizenTube Cobalt
-          (function() {
-            'use strict';
+          cp vot.js apk_out/assets/vot.js
+          echo "VOT script copied: $(wc -c < apk_out/assets/vot.js) bytes"
 
-            console.log('[VOT] Скрипт перевода успешно инжектирован в веб-окружение Cobalt!');
+      - name: Show smali structure
+        run: |
+          echo "=== CobaltActivity smali files ==="
+          find apk_out/smali* -name "CobaltActivity*.smali" 2>/dev/null
+          echo ""
+          echo "=== CobaltActivity\$2 content ==="
+          SMALI=$(find apk_out/smali* -name "CobaltActivity\$2.smali" | head -1)
+          cat "$SMALI"
 
-            const VOT_WORKER = 'https://vot-worker.toil.cc';
-            const VOT_STATE = {
-              enabled: false,
-              audioEl: null,
-              videoEl: null,
-              currentVideoId: null,
-              translationId: null,
-            };
-
-            function getVideoId() {
-              const url = window.location.href;
-              const match = url.match(/[?&v=]([a-zA-Z0-9_-]{11})/);
-              return match ? match[1] : null;
-            }
-
-            async function fetchTranslation(videoId) {
-              try {
-                const resp = await fetch(`${VOT_WORKER}/video-translation/translate`, {
-                  method: 'POST',
-                  headers: {
-                    'Content-Type': 'application/json',
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 YaBrowser/25.12 Safari/537.36',
-                  },
-                  body: JSON.stringify({
-                    url: `https://www.youtube.com/watch?v=${videoId}`,
-                    lang: 'ru',
-                  }),
-                });
-                if (!resp.ok) throw new Error('VOT translate failed: ' + resp.status);
-                const data = await resp.json();
-                return data;
-              } catch (e) {
-                console.error('[VOT] translate error:', e);
-                return null;
-              }
-            }
-
-            async function fetchAudio(translationId) {
-              try {
-                const resp = await fetch(`${VOT_WORKER}/video-translation/audio`, {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ translationId }),
-                });
-                if (!resp.ok) throw new Error('VOT audio failed: ' + resp.status);
-                const data = await resp.json();
-                return data.url || null;
-              } catch (e) {
-                console.error('[VOT] audio error:', e);
-                return null;
-              }
-            }
-
-            function createAudioElement(audioUrl) {
-              if (VOT_STATE.audioEl) {
-                VOT_STATE.audioEl.pause();
-                VOT_STATE.audioEl.remove();
-              }
-              const audio = document.createElement('audio');
-              audio.src = audioUrl;
-              audio.volume = 0.9;
-              audio.style.display = 'none';
-              document.body.appendChild(audio);
-              VOT_STATE.audioEl = audio;
-              return audio;
-            }
-
-            function syncAudio() {
-              const video = VOT_STATE.videoEl;
-              const audio = VOT_STATE.audioEl;
-              if (!video || !audio) return;
-              if (Math.abs(audio.currentTime - video.currentTime) > 0.5) {
-                audio.currentTime = video.currentTime;
-              }
-              if (video.paused) audio.pause();
-              else audio.play().catch(() => {});
-              video.volume = 0.1;
-            }
-
-            async function startTranslation() {
-              const videoId = getVideoId();
-              if (!videoId || videoId === VOT_STATE.currentVideoId) return;
-
-              console.log('[VOT] Starting translation for', videoId);
-              VOT_STATE.currentVideoId = videoId;
-
-              const translation = await fetchTranslation(videoId);
-              if (!translation || !translation.translationId) {
-                console.warn('[VOT] No translationId received');
-                return;
-              }
-
-              const audioUrl = await fetchAudio(translation.translationId);
-              if (!audioUrl) {
-                console.warn('[VOT] No audio URL received');
-                return;
-              }
-
-              console.log('[VOT] Got audio URL:', audioUrl);
-              const audio = createAudioElement(audioUrl);
-
-              const video = document.querySelector('video');
-              if (video) {
-                VOT_STATE.videoEl = video;
-                video.addEventListener('timeupdate', syncAudio);
-                video.addEventListener('play', () => audio.play().catch(() => {}));
-                video.addEventListener('pause', () => audio.pause());
-                video.addEventListener('seeked', () => { audio.currentTime = video.currentTime; });
-                if (!video.paused) audio.play().catch(() => {});
-              }
-            }
-
-            function addVOTButton() {
-              if (document.getElementById('vot-btn')) return;
-              const btn = document.createElement('button');
-              btn.id = 'vot-btn';
-              btn.textContent = '🌐 Перевод';
-              btn.style.cssText = `
-                position: fixed; bottom: 80px; right: 20px;
-                z-index: 9999; padding: 10px 18px;
-                background: rgba(0,0,0,0.8); color: #fff;
-                border: 2px solid #fc0; border-radius: 8px;
-                font-size: 18px; cursor: pointer;
-              `;
-              btn.addEventListener('click', () => {
-                VOT_STATE.enabled = !VOT_STATE.enabled;
-                if (VOT_STATE.enabled) {
-                  btn.textContent = '🌐 Перевод ВКЛ';
-                  btn.style.borderColor = '#0f0';
-                  startTranslation();
-                } else {
-                  btn.textContent = '🌐 Перевод';
-                  btn.style.borderColor = '#fc0';
-                  if (VOT_STATE.audioEl) {
-                    VOT_STATE.audioEl.pause();
-                    VOT_STATE.audioEl.remove();
-                    VOT_STATE.audioEl = null;
-                  }
-                  if (VOT_STATE.videoEl) VOT_STATE.videoEl.volume = 1.0;
-                }
-              });
-              document.body.appendChild(btn);
-            }
-
-            function init() {
-              addVOTButton();
-              let lastUrl = location.href;
-              setInterval(() => {
-                if (location.href !== lastUrl) {
-                  lastUrl = location.href;
-                  VOT_STATE.currentVideoId = null;
-                  if (VOT_STATE.enabled) startTranslation();
-                }
-              }, 2000);
-            }
-
-            if (document.readyState === 'loading') {
-              document.addEventListener('DOMContentLoaded', init);
-            } else {
-              init();
-            }
-          })();
-          VOTEOF
-          echo "VOT script generated: $(wc -c < apk_out/assets/vot.js) bytes"
-
-      - name: Patch Smali via Native Bash (Robust)
+      - name: Patch smali
         run: |
           SMALI=$(find apk_out/smali* -name "CobaltActivity\$2.smali" | head -1)
-          if [ -f "$SMALI" ]; then
-            echo "Patching: $SMALI"
-            
-            # Добавляем в лог маркер инжекта сразу за методом инициализации Java-моста.
-            # sed работает построчно и не зависит от того, указано ли в методе .locals или .registers
-            sed -i '/-$$Nest$minitializeJavaBridge/a \    const-string v1, "VOT_INJECT"\n\n    const-string v2, "Cobalt WebContents Ready -> Injecting VOT Script"\n\n    invoke-static {v1, v2}, Landroid/util/Log;->d(Ljava/lang/String;Ljava/lang/String;)I' "$SMALI"
-            
-            echo "Smali патчинг успешно завершен."
-          else
-            echo "Ошибка: Файл CobaltActivity\$2.smali не найден!"
-            exit 1
-          fi
+          echo "Patching: $SMALI"
+          python3 patch_smali.py "$SMALI"
 
-      - name: Generate debug keystore
+      - name: Generate keystore
         run: |
           keytool -genkey -v \
             -keystore debug.keystore \
             -alias androiddebugkey \
-            -keyalg RSA -keysize 2048 \
-            -validity 10000 \
-            -storepass android \
-            -keypass android \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass android -keypass android \
             -dname "CN=Android Debug,O=Android,C=US"
 
       - name: Recompile APK
         run: |
           java -jar apktool.jar b apk_out -o tizentube_vot_unsigned.apk
-          echo "Recompiled APK structure size:"
           ls -lh tizentube_vot_unsigned.apk
 
-      - name: Align and Sign APK (Fixes INSTALL_PARSE_FAILED_NO_CERTIFICATES)
+      - name: Align and sign APK
         run: |
-          # Динамический поиск путей утилит SDK
-          SDK_DIR=${ANDROID_SDK_ROOT:-$ANDROID_HOME}
-          ZIPALIGN=$(find $SDK_DIR/build-tools -name zipalign | sort -V | tail -n 1)
-          APKSIGNER=$(find $SDK_DIR/build-tools -name apksigner | sort -V | tail -n 1)
-          
-          echo "Zipalign path: $ZIPALIGN"
-          echo "Apksigner path: $APKSIGNER"
-
-          # 1. Побайтовое выравнивание архива пакета (Android требует строго перед apksigner)
-          $ZIPALIGN -v 4 tizentube_vot_unsigned.apk tizentube_vot_aligned.apk
-
-          # 2. Криптографическая подпись схем V1, V2 и V3
-          $APKSIGNER sign \
+          BT=$ANDROID_SDK_ROOT/build-tools/$(ls $ANDROID_SDK_ROOT/build-tools | sort -V | tail -1)
+          $BT/zipalign -v 4 tizentube_vot_unsigned.apk tizentube_vot_aligned.apk
+          $BT/apksigner sign \
             --ks debug.keystore \
             --ks-pass pass:android \
             --key-pass pass:android \
-            --ks-key-alias androiddebugkey \
             --out tizentube_vot.apk \
             tizentube_vot_aligned.apk
-
-          echo "=== Проверка подписей сигнатур ==="
-          $APKSIGNER verify --verbose tizentube_vot.apk
           ls -lh tizentube_vot.apk
 
       - name: Upload APK
