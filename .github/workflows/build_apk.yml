@@ -71,77 +71,24 @@ jobs:
         run: |
           java -jar apktool.jar d tizentube.apk -o apk_out -f
 
-      - name: Create VOT Injection Payload
+      - name: Inspect and Unpack Cobalt Assets
         run: |
-          # Создаем чистый JS-код без лишних переносов строк для безопасного инжекта через Smali
-          cat > vot_inline.js << 'VOTEOF'
-          (function(){if(document.getElementById('vot-btn'))return;var b=document.createElement('button');b.id='vot-btn';b.textContent='🌐 Перевод';b.style.cssText='position:fixed;bottom:40px;left:40px;z-index:99999;padding:12px 24px;background:rgba(0,0,0,0.85);color:#fff;border:3px solid #fc0;border-radius:10px;font-size:20px;font-weight:bold;cursor:pointer;';b.onclick=function(){alert('VOT мост инициализирован в Cobalt!');};document.body.appendChild(b);})();
-          VOTEOF
+          echo "=== 1. Скачиваем утилиту для работы с Chromium PAK ==="
+          curl -sS https://raw.githubusercontent.com/chromium/chromium/main/tools/grit/grit/format/data_pack.py -o data_pack.py
           
-          # Кодируем JS в HEX, чтобы не сломать синтаксис Smali кавычками и спецсимволами
-          HEX_JS=$(xxd -p -c 256 vot_inline.js | tr -d '\n')
-          echo "HEX_JS=$HEX_JS" >> $GITHUB_ENV
-
-      - name: Patch Cobalt JavaBridge (Smali Injection)
-        run: |
-          TARGET_SMALI="apk_out/smali_classes2/dev/cobalt/coat/javabridge/CobaltJavaScriptInterface.smali"
-          
-          if [ -f "$TARGET_SMALI" ]; then
-            echo "Файл моста найден. Начинаем инжект..."
-            
-            # Нам нужно найти метод инициализации или конструктор. 
-            # Добавим вызов кастомного лога или выполнение JS прямо в конец конструктора <init>
-            
-            # Декодируем наш JS на лету внутри Smali-кода через String (создаем костыль инициализации)
-            # Для этого преобразуем HEX обратно в строку внутри Dalvik-кода
-            
-            # Находим строку возврата из конструктора и вставляем инжект кнопки
-            # Для начала просто проверим, что файл поддается модификации:
-            sed -i '/\.end method/i \    # VOT Injection Point' "$TARGET_SMALI"
-            
-            echo "Модификация Smali успешно завершена."
-          else
-            echo "КРИТИЧЕСКАЯ ОШИБКА: Целевой файл Smali не найден!"
-            exit 1
-          fi
-
-      - name: Generate debug keystore
-        run: |
-          keytool -genkey -v \
-            -keystore debug.keystore \
-            -alias androiddebugkey \
-            -keyalg RSA -keysize 2048 \
-            -validity 10000 \
-            -storepass android \
-            -keypass android \
-            -dname "CN=Android Debug,O=Android,C=US"
-
-      - name: Recompile APK
-        run: |
-          java -jar apktool.jar b apk_out -o tizentube_vot_unsigned.apk
-
-      - name: Zipalign APK
-        run: |
-          zipalign -v 4 tizentube_vot_unsigned.apk tizentube_vot_aligned.apk
-
-      - name: Sign APK (V2/V3 Scheme)
-        run: |
-          apksigner sign \
-            --ks debug.keystore \
-            --ks-pass pass:android \
-            --key-pass pass:android \
-            --ks-key-alias androiddebugkey \
-            --out tizentube_vot.apk \
-            tizentube_vot_aligned.apk
-          echo "Приложение успешно пересобрано и подписано."
-          
-      - name: Verify APK Signature
-        run: |
-          apksigner verify --verbose tizentube_vot.apk
-
-      - name: Upload patched APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: TizenTubeCobalt-VOT
-          path: tizentube_vot.apk
-          retention-days: 30
+          echo "=== 2. Пробуем извлечь строки и JS из cobalt_shell.pak ==="
+          # Пишем простой встроенный скрипт на Python для чтения ресурсов
+          python3 -c "
+          import data_pack
+          try:
+              pack = data_pack.ReadDataPack('apk_out/assets/cobalt_shell.pak')
+              print(f'Успешно прочитано ресурсов: {len(pack.resources)}')
+              # Выведем первые 5 ресурсов для анализа (текстовые ли они)
+              count = 0
+              for res_id, res_data in pack.resources.items():
+                  if count < 10 and b'console' in res_data or b'function' in res_data:
+                      print(f'Ресурс ID {res_id} похож на JS/HTML, размер: {len(res_data)} байт')
+                      count += 1
+          except Exception as e:
+              print('Ошибка чтения PAK:', e)
+          "
