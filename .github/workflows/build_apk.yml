@@ -67,10 +67,11 @@ jobs:
 
       - name: Create VOT script
         run: |
+          # Создаем сам JS-скрипт в assets
           cat > apk_out/assets/vot.js << 'VOTEOF'
-          // Яндекс VOT — перевод видео для TizenTube Cobalt
           (function() {
             'use strict';
+            console.log('[VOT] Скрипт успешно внедрен и запущен!');
 
             const VOT_WORKER = 'https://vot-worker.toil.cc';
             const VOT_STATE = {
@@ -101,8 +102,7 @@ jobs:
                   }),
                 });
                 if (!resp.ok) throw new Error('VOT translate failed: ' + resp.status);
-                const data = await resp.json();
-                return data;
+                return await resp.json();
               } catch (e) {
                 console.error('[VOT] translate error:', e);
                 return null;
@@ -143,18 +143,11 @@ jobs:
               const video = VOT_STATE.videoEl;
               const audio = VOT_STATE.audioEl;
               if (!video || !audio) return;
-              
-              // Если рассинхрон больше 0.5 сек — выравниваем дорожку дорожки
               if (Math.abs(audio.currentTime - video.currentTime) > 0.5) {
                 audio.currentTime = video.currentTime;
               }
-              
-              if (video.paused) {
-                audio.pause();
-              } else {
-                audio.play().catch(() => {});
-              }
-              // Приглушаем оригинальное видео, чтобы слышать перевод
+              if (video.paused) audio.pause();
+              else audio.play().catch(() => {});
               video.volume = 0.1;
             }
 
@@ -162,24 +155,16 @@ jobs:
               const videoId = getVideoId();
               if (!videoId || videoId === VOT_STATE.currentVideoId) return;
 
-              console.log('[VOT] Starting translation for', videoId);
+              console.log('[VOT] Запуск перевода для', videoId);
               VOT_STATE.currentVideoId = videoId;
 
               const translation = await fetchTranslation(videoId);
-              if (!translation || !translation.translationId) {
-                console.warn('[VOT] No translationId received');
-                return;
-              }
+              if (!translation || !translation.translationId) return;
 
               const audioUrl = await fetchAudio(translation.translationId);
-              if (!audioUrl) {
-                console.warn('[VOT] No audio URL received');
-                return;
-              }
+              if (!audioUrl) return;
 
-              console.log('[VOT] Got audio URL:', audioUrl);
               const audio = createAudioElement(audioUrl);
-
               const video = document.querySelector('video');
               if (video) {
                 VOT_STATE.videoEl = video;
@@ -197,11 +182,11 @@ jobs:
               btn.id = 'vot-btn';
               btn.textContent = '🌐 Перевод';
               btn.style.cssText = `
-                position: fixed; bottom: 80px; right: 20px;
-                z-index: 9999; padding: 10px 18px;
-                background: rgba(0,0,0,0.8); color: #fff;
-                border: 2px solid #fc0; border-radius: 8px;
-                font-size: 18px; cursor: pointer;
+                position: fixed; bottom: 40px; left: 40px;
+                z-index: 99999; padding: 12px 24px;
+                background: rgba(0,0,0,0.85); color: #fff;
+                border: 3px solid #fc0; border-radius: 10px;
+                font-size: 20px; font-weight: bold; cursor: pointer;
               `;
               btn.addEventListener('click', () => {
                 VOT_STATE.enabled = !VOT_STATE.enabled;
@@ -221,6 +206,7 @@ jobs:
                 }
               });
               document.body.appendChild(btn);
+              console.log('[VOT] Кнопка успешно добавлена на экран');
             }
 
             function init() {
@@ -232,6 +218,8 @@ jobs:
                   VOT_STATE.currentVideoId = null;
                   if (VOT_STATE.enabled) startTranslation();
                 }
+                // На ТВ элемента интерфейса могут перерисовываться, проверяем кнопку
+                addVOTButton();
               }, 2000);
             }
 
@@ -242,8 +230,27 @@ jobs:
             }
           })();
           VOTEOF
-          echo "VOT script created"
-          ls -lh apk_out/assets/vot.js
+
+      - name: Inject VOT into Cobalt HTML
+        run: |
+          # Ищем главный HTML файл Cobalt (обычно index.html или основной стартовый файл в assets)
+          MAIN_HTML=$(find apk_out/assets -name "index.html" | head -n 1)
+          
+          if [ -z "$MAIN_HTML" ]; then
+            # Если index.html не найден, ищем любой html в корне assets
+            MAIN_HTML=$(find apk_out/assets -name "*.html" | head -n 1)
+          fi
+
+          if [ -n "$MAIN_HTML" ]; then
+            echo "Найден главный HTML файл для инжекта: $MAIN_HTML"
+            # Вставляем подключение vot.js перед закрывающим тегом </body>
+            sed -i 's|</body>|<script src="vot.js"></script></body>|g' "$MAIN_HTML"
+            echo "=== Содержимое измененного HTML (последние 10 строк) ==="
+            tail -n 10 "$MAIN_HTML"
+          else
+            echo "КРИТИЧЕСКАЯ ОШИБКА: Главный HTML-файл приложения не найден в assets!"
+            exit 1
+          fi
 
       - name: Generate debug keystore
         run: |
