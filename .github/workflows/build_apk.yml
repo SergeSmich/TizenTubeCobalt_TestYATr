@@ -21,10 +21,18 @@ jobs:
       # Устанавливаем Android SDK Build-Tools для доступа к zipalign и apksigner
       - name: Setup Android SDK Build-Tools
         run: |
-          sudo mkdir -p /usr/local/lib/android/sdk/cmdline-tools
+          # Используем предустановленный Android SDK на GitHub Actions
+          export ANDROID_SDK_ROOT=$ANDROID_HOME
+          export PATH=$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$ANDROID_SDK_ROOT/platform-tools:$PATH
+          
+          # Принимаем лицензии автоматически
           yes | sdkmanager --licenses > /dev/null
+          
+          # Устанавливаем нужные build-tools
           sdkmanager "build-tools;34.0.0" > /dev/null
-          echo "/usr/local/lib/android/sdk/build-tools/34.0.0" >> $GITHUB_PATH
+          
+          # Экспортируем путь к zipalign и apksigner для следующих шагов workflow
+          echo "$ANDROID_SDK_ROOT/build-tools/34.0.0" >> $GITHUB_PATH
 
       - name: Download apktool
         run: |
