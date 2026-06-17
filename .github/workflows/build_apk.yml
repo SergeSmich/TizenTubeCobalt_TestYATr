@@ -18,6 +18,14 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
+      # Устанавливаем Android SDK Build-Tools для доступа к zipalign и apksigner
+      - name: Setup Android SDK Build-Tools
+        run: |
+          sudo mkdir -p /usr/local/lib/android/sdk/cmdline-tools
+          yes | sdkmanager --licenses > /dev/null
+          sdkmanager "build-tools;34.0.0" > /dev/null
+          echo "/usr/local/lib/android/sdk/build-tools/34.0.0" >> $GITHUB_PATH
+
       - name: Download apktool
         run: |
           curl -Lo apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar
@@ -127,11 +135,18 @@ jobs:
               const video = VOT_STATE.videoEl;
               const audio = VOT_STATE.audioEl;
               if (!video || !audio) return;
+              
+              // Если рассинхрон больше 0.5 сек — выравниваем дорожку дорожки
               if (Math.abs(audio.currentTime - video.currentTime) > 0.5) {
                 audio.currentTime = video.currentTime;
               }
-              if (video.paused) audio.pause();
-              else audio.play().catch(() => {});
+              
+              if (video.paused) {
+                audio.pause();
+              } else {
+                audio.play().catch(() => {});
+              }
+              // Приглушаем оригинальное видео, чтобы слышать перевод
               video.volume = 0.1;
             }
 
@@ -200,10 +215,8 @@ jobs:
               document.body.appendChild(btn);
             }
 
-            // Запуск когда страница готова
             function init() {
               addVOTButton();
-              // Следим за сменой видео
               let lastUrl = location.href;
               setInterval(() => {
                 if (location.href !== lastUrl) {
@@ -241,22 +254,34 @@ jobs:
           echo "Recompiled APK:"
           ls -lh tizentube_vot_unsigned.apk
 
-      - name: Sign APK
+      # Выравнивание пакета (необходимо перед V2 подписью)
+      - name: Zipalign APK
         run: |
-          $JAVA_HOME/bin/jarsigner \
-            -keystore debug.keystore \
-            -storepass android \
-            -keypass android \
-            tizentube_vot_unsigned.apk \
-            androiddebugkey
-          mv tizentube_vot_unsigned.apk tizentube_vot.apk
-          echo "Signed APK:"
+          zipalign -v 4 tizentube_vot_unsigned.apk tizentube_vot_aligned.apk
+          echo "Aligned APK:"
+          ls -lh tizentube_vot_aligned.apk
+
+      # Подпись современного формата через apksigner (V2/V3 подпись)
+      - name: Sign APK (V2/V3 Scheme)
+        run: |
+          apksigner sign \
+            --ks debug.keystore \
+            --ks-pass pass:android \
+            --key-pass pass:android \
+            --ks-key-alias androiddebugkey \
+            --out tizentube_vot.apk \
+            tizentube_vot_aligned.apk
+          echo "Successfully Signed APK with V2 Scheme"
           ls -lh tizentube_vot.apk
+          
+      # Проверка валидности сертификатов подписи
+      - name: Verify APK Signature
+        run: |
+          apksigner verify --verbose tizentube_vot.apk
 
       - name: Upload patched APK
         uses: actions/upload-artifact@v4
         with:
           name: TizenTubeCobalt-VOT
           path: tizentube_vot.apk
-          retention-days: 30
           retention-days: 30
