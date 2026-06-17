@@ -18,6 +18,23 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ninja-build python3-pip curl git \
+            libglib2.0-dev libdbus-1-dev libasound2-dev \
+            libpulse-dev libavcodec-dev libssl-dev
+
+      - name: Install Python packages
+        run: pip3 install requests PyYAML
+
+      - name: Download GN binary
+        run: |
+          curl -Lo gn.zip https://chrome-infra-packages.appspot.com/dl/gn/gn/linux-amd64/+/latest
+          unzip gn.zip gn
+          chmod +x gn
+          sudo mv gn /usr/local/bin/gn
+
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
@@ -26,22 +43,14 @@ jobs:
           sdkmanager "ndk;25.2.9519653"
           echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/25.2.9519653" >> $GITHUB_ENV
 
-      - name: Install dependencies
+      - name: Set environment
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y ninja-build python3-pip curl
+          echo "PYTHONPATH=$PWD:$PYTHONPATH" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> $GITHUB_ENV
 
-      - name: Download depot_tools
+      - name: Generate build files
         run: |
-          git clone --depth=1 https://chromium.googlesource.com/chromium/tools/depot_tools.git
-          echo "$PWD/depot_tools" >> $GITHUB_PATH
-
-      - name: Generate build files (GN)
-        run: |
-          python3 tools/download_from_gcs.py --bucket cobalt-build-dependencies \
-            || true
-          gn gen out/android-arm64_devel \
-            --args='target_os="android" target_cpu="arm64" build_type="devel"'
+          python3 cobalt/build/gn.py -p android-arm64 -C devel
 
       - name: Build APK
         run: |
