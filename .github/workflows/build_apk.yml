@@ -71,24 +71,69 @@ jobs:
         run: |
           java -jar apktool.jar d tizentube.apk -o apk_out -f
 
-      - name: Inspect and Unpack Cobalt Assets
+      - name: Inspect and Unpack Cobalt Assets (Pure Python)
         run: |
-          echo "=== 1. Скачиваем утилиту для работы с Chromium PAK ==="
-          curl -sS https://raw.githubusercontent.com/chromium/chromium/main/tools/grit/grit/format/data_pack.py -o data_pack.py
-          
-          echo "=== 2. Пробуем извлечь строки и JS из cobalt_shell.pak ==="
-          # Пишем простой встроенный скрипт на Python для чтения ресурсов
+          echo "=== Парсинг cobalt_shell.pak на чистом Python ==="
           python3 -c "
-          import data_pack
-          try:
-              pack = data_pack.ReadDataPack('apk_out/assets/cobalt_shell.pak')
-              print(f'Успешно прочитано ресурсов: {len(pack.resources)}')
-              # Выведем первые 5 ресурсов для анализа (текстовые ли они)
-              count = 0
-              for res_id, res_data in pack.resources.items():
-                  if count < 10 and b'console' in res_data or b'function' in res_data:
-                      print(f'Ресурс ID {res_id} похож на JS/HTML, размер: {len(res_data)} байт')
-                      count += 1
-          except Exception as e:
-              print('Ошибка чтения PAK:', e)
+          import struct
+          import os
+
+          pak_path = 'apk_out/assets/cobalt_shell.pak'
+          if not os.path.exists(pak_path):
+              print('Файл не найден!')
+              exit(1)
+
+          with open(pak_path, 'rb') as f:
+              data = f.read()
+              
+          print(f'Размер архива: {len(data)} байт')
+          
+          # Читаем заголовок Chromium PAK v4/v5
+          version = struct.unpack('<I', data[:4])[0]
+          print(f'Версия формата PAK: {version}')
+          
+          # В зависимости от версии читаем количество ресурсов
+          if version in [4, 5]:
+              resource_count = struct.unpack('<I', data[8:12])[0]
+              print(f'Найдено ресурсов внутри архива: {resource_count}')
+              
+              # Смещение до таблицы индексов
+              header_size = 12 if version == 5 else 9
+              
+              # Пробежимся по первым 150 ресурсам и поищем текстовые/JS данные
+              # Структура индекса: 2 байта ID (или 4 в v5) + 4 байта смещения
+              entry_size = 6 if version == 4 else 8
+              
+              print('\n=== Анализ первых текстовых ресурсов ===')
+              printed = 0
+              idx = header_size
+              
+              for _ in range(resource_count):
+                  if idx + entry_size > len(data): break
+                  
+                  if version == 4:
+                      res_id, offset = struct.unpack('<HI', data[idx:idx+6])
+                  else:
+                      res_id, offset = struct.unpack('<II', data[idx:idx+8])
+                      
+                  idx += entry_size
+                  
+                  # Читаем следующее смещение для определения длины
+                  if version == 4:
+                      _, next_offset = struct.unpack('<HI', data[idx:idx+6])
+                  else:
+                      _, next_offset = struct.unpack('<II', data[idx:idx+8])
+                      
+                  res_len = next_offset - offset
+                  
+                  if offset < len(data) and (offset + res_len) <= len(data) and res_len > 0:
+                      res_content = data[offset:offset+res_len]
+                      
+                      # Проверяем, содержит ли ресурс JS/HTML маркеры
+                      if any(x in res_content for x in [b'function', b'window', b'console', b'yt']):
+                          print(f'Ресурс ID: {res_id} | Размер: {res_len} байт | Тип: JS/HTML')
+                          # Выведем начало скрипта для инспекции
+                          print(f'Превью: {res_content[:150]}...\n' + '-'*40)
+                          printed += 1
+                          if printed >= 10: break
           "
