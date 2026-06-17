@@ -51,7 +51,7 @@ jobs:
             | cut -d '"' -f 4)
           echo "Downloaded APK:"
           ls -lh tizentube.apk
-
+          
       - name: Decompile APK
         run: |
           java -jar apktool.jar d tizentube.apk -o apk_out -f
@@ -75,200 +75,12 @@ jobs:
           echo "=== 5. Поиск методов загрузки URL или инжектов ==="
           grep -rn "loadUrl" apk_out/smali* | head -n 20 || echo "loadUrl не найден"
           grep -rn "evaluateJavascript" apk_out/smali* | head -n 20 || echo "evaluateJavascript не найден"
-          
-      - name: Show assets folder
+
+      # Временная заглушка, чтобы сборка не ломалась, пока мы ищем правильное место для интеграции
+      - name: Create Dummy VOT File
         run: |
-          echo "=== assets ==="
-          find apk_out/assets -type f | head -50 || echo "no assets folder"
-          echo "=== unknown ==="
-          find apk_out/unknown -type f 2>/dev/null | head -50 || echo "no unknown folder"
-
-      - name: Create VOT script
-        run: |
-          # Создаем сам JS-скрипт в assets
-          cat > apk_out/assets/vot.js << 'VOTEOF'
-          (function() {
-            'use strict';
-            console.log('[VOT] Скрипт успешно внедрен и запущен!');
-
-            const VOT_WORKER = 'https://vot-worker.toil.cc';
-            const VOT_STATE = {
-              enabled: false,
-              audioEl: null,
-              videoEl: null,
-              currentVideoId: null,
-              translationId: null,
-            };
-
-            function getVideoId() {
-              const url = window.location.href;
-              const match = url.match(/[?&v=]([a-zA-Z0-9_-]{11})/);
-              return match ? match[1] : null;
-            }
-
-            async function fetchTranslation(videoId) {
-              try {
-                const resp = await fetch(`${VOT_WORKER}/video-translation/translate`, {
-                  method: 'POST',
-                  headers: {
-                    'Content-Type': 'application/json',
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 YaBrowser/25.12 Safari/537.36',
-                  },
-                  body: JSON.stringify({
-                    url: `https://www.youtube.com/watch?v=${videoId}`,
-                    lang: 'ru',
-                  }),
-                });
-                if (!resp.ok) throw new Error('VOT translate failed: ' + resp.status);
-                return await resp.json();
-              } catch (e) {
-                console.error('[VOT] translate error:', e);
-                return null;
-              }
-            }
-
-            async function fetchAudio(translationId) {
-              try {
-                const resp = await fetch(`${VOT_WORKER}/video-translation/audio`, {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ translationId }),
-                });
-                if (!resp.ok) throw new Error('VOT audio failed: ' + resp.status);
-                const data = await resp.json();
-                return data.url || null;
-              } catch (e) {
-                console.error('[VOT] audio error:', e);
-                return null;
-              }
-            }
-
-            function createAudioElement(audioUrl) {
-              if (VOT_STATE.audioEl) {
-                VOT_STATE.audioEl.pause();
-                VOT_STATE.audioEl.remove();
-              }
-              const audio = document.createElement('audio');
-              audio.src = audioUrl;
-              audio.volume = 0.9;
-              audio.style.display = 'none';
-              document.body.appendChild(audio);
-              VOT_STATE.audioEl = audio;
-              return audio;
-            }
-
-            function syncAudio() {
-              const video = VOT_STATE.videoEl;
-              const audio = VOT_STATE.audioEl;
-              if (!video || !audio) return;
-              if (Math.abs(audio.currentTime - video.currentTime) > 0.5) {
-                audio.currentTime = video.currentTime;
-              }
-              if (video.paused) audio.pause();
-              else audio.play().catch(() => {});
-              video.volume = 0.1;
-            }
-
-            async function startTranslation() {
-              const videoId = getVideoId();
-              if (!videoId || videoId === VOT_STATE.currentVideoId) return;
-
-              console.log('[VOT] Запуск перевода для', videoId);
-              VOT_STATE.currentVideoId = videoId;
-
-              const translation = await fetchTranslation(videoId);
-              if (!translation || !translation.translationId) return;
-
-              const audioUrl = await fetchAudio(translation.translationId);
-              if (!audioUrl) return;
-
-              const audio = createAudioElement(audioUrl);
-              const video = document.querySelector('video');
-              if (video) {
-                VOT_STATE.videoEl = video;
-                video.addEventListener('timeupdate', syncAudio);
-                video.addEventListener('play', () => audio.play().catch(() => {}));
-                video.addEventListener('pause', () => audio.pause());
-                video.addEventListener('seeked', () => { audio.currentTime = video.currentTime; });
-                if (!video.paused) audio.play().catch(() => {});
-              }
-            }
-
-            function addVOTButton() {
-              if (document.getElementById('vot-btn')) return;
-              const btn = document.createElement('button');
-              btn.id = 'vot-btn';
-              btn.textContent = '🌐 Перевод';
-              btn.style.cssText = `
-                position: fixed; bottom: 40px; left: 40px;
-                z-index: 99999; padding: 12px 24px;
-                background: rgba(0,0,0,0.85); color: #fff;
-                border: 3px solid #fc0; border-radius: 10px;
-                font-size: 20px; font-weight: bold; cursor: pointer;
-              `;
-              btn.addEventListener('click', () => {
-                VOT_STATE.enabled = !VOT_STATE.enabled;
-                if (VOT_STATE.enabled) {
-                  btn.textContent = '🌐 Перевод ВКЛ';
-                  btn.style.borderColor = '#0f0';
-                  startTranslation();
-                } else {
-                  btn.textContent = '🌐 Перевод';
-                  btn.style.borderColor = '#fc0';
-                  if (VOT_STATE.audioEl) {
-                    VOT_STATE.audioEl.pause();
-                    VOT_STATE.audioEl.remove();
-                    VOT_STATE.audioEl = null;
-                  }
-                  if (VOT_STATE.videoEl) VOT_STATE.videoEl.volume = 1.0;
-                }
-              });
-              document.body.appendChild(btn);
-              console.log('[VOT] Кнопка успешно добавлена на экран');
-            }
-
-            function init() {
-              addVOTButton();
-              let lastUrl = location.href;
-              setInterval(() => {
-                if (location.href !== lastUrl) {
-                  lastUrl = location.href;
-                  VOT_STATE.currentVideoId = null;
-                  if (VOT_STATE.enabled) startTranslation();
-                }
-                // На ТВ элемента интерфейса могут перерисовываться, проверяем кнопку
-                addVOTButton();
-              }, 2000);
-            }
-
-            if (document.readyState === 'loading') {
-              document.addEventListener('DOMContentLoaded', init);
-            } else {
-              init();
-            }
-          })();
-          VOTEOF
-
-      - name: Inject VOT into Cobalt HTML
-        run: |
-          # Ищем главный HTML файл Cobalt (обычно index.html или основной стартовый файл в assets)
-          MAIN_HTML=$(find apk_out/assets -name "index.html" | head -n 1)
-          
-          if [ -z "$MAIN_HTML" ]; then
-            # Если index.html не найден, ищем любой html в корне assets
-            MAIN_HTML=$(find apk_out/assets -name "*.html" | head -n 1)
-          fi
-
-          if [ -n "$MAIN_HTML" ]; then
-            echo "Найден главный HTML файл для инжекта: $MAIN_HTML"
-            # Вставляем подключение vot.js перед закрывающим тегом </body>
-            sed -i 's|</body>|<script src="vot.js"></script></body>|g' "$MAIN_HTML"
-            echo "=== Содержимое измененного HTML (последние 10 строк) ==="
-            tail -n 10 "$MAIN_HTML"
-          else
-            echo "КРИТИЧЕСКАЯ ОШИБКА: Главный HTML-файл приложения не найден в assets!"
-            exit 1
-          fi
+          mkdir -p apk_out/assets
+          echo "// Ожидание логов разведки" > apk_out/assets/vot.js
 
       - name: Generate debug keystore
         run: |
@@ -287,14 +99,12 @@ jobs:
           echo "Recompiled APK:"
           ls -lh tizentube_vot_unsigned.apk
 
-      # Выравнивание пакета (необходимо перед V2 подписью)
       - name: Zipalign APK
         run: |
           zipalign -v 4 tizentube_vot_unsigned.apk tizentube_vot_aligned.apk
           echo "Aligned APK:"
           ls -lh tizentube_vot_aligned.apk
 
-      # Подпись современного формата через apksigner (V2/V3 подпись)
       - name: Sign APK (V2/V3 Scheme)
         run: |
           apksigner sign \
@@ -307,7 +117,6 @@ jobs:
           echo "Successfully Signed APK with V2 Scheme"
           ls -lh tizentube_vot.apk
           
-      # Проверка валидности сертификатов подписи
       - name: Verify APK Signature
         run: |
           apksigner verify --verbose tizentube_vot.apk
