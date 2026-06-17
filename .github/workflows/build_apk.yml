@@ -55,19 +55,26 @@ jobs:
       - name: Decompile APK
         run: |
           java -jar apktool.jar d tizentube.apk -o apk_out -f
-          echo "APK structure:"
-          ls apk_out/
-          
-      - name: Explore Smali Structure
+          echo "=== Корневая структура APK ==="
+          ls -F apk_out/
+
+      - name: Deep Exploration (Разведка структуры)
         run: |
-          echo "=== Поиск WebView или Cobalt एक्टिविटी ==="
-          find apk_out/smali* -type f -name "*Activity*.smali" | head -n 50
+          echo "=== 1. Проверка ВСЕХ файлов в assets ==="
+          find apk_out/assets -type f | head -n 100 || echo "Папка assets пуста или отсутствует"
           
-          echo "=== Поиск упоминаний загрузки URL ==="
-          grep -rn "loadUrl" apk_out/smali* | head -n 30 || echo "loadUrl не найден"
+          echo "=== 2. Поиск любых HTML/JS файлов во всем проекте ==="
+          find apk_out/ -type f \( -name "*.html" -o -name "*.js" -o -name "*.json" \) | head -n 50
           
-          echo "=== Проверка структуры папки assets ==="
-          find apk_out/assets -maxdepth 3
+          echo "=== 3. Поиск главного Activity в AndroidManifest ==="
+          grep -oE 'android:name="[^"]+"' apk_out/AndroidManifest.xml | head -n 20
+          
+          echo "=== 4. Поиск WebView или Cobalt компонентов в Smali ==="
+          find apk_out/smali* -type f \( -name "*WebView*" -o -name "*Cobalt*" -o -name "*Client*" \) | head -n 40
+          
+          echo "=== 5. Поиск методов загрузки URL или инжектов ==="
+          grep -rn "loadUrl" apk_out/smali* | head -n 20 || echo "loadUrl не найден"
+          grep -rn "evaluateJavascript" apk_out/smali* | head -n 20 || echo "evaluateJavascript не найден"
           
       - name: Show assets folder
         run: |
