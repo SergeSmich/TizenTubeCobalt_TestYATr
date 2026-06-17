@@ -9,8 +9,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -36,73 +34,55 @@ jobs:
       - name: Decompile APK
         run: |
           java -jar apktool.jar d tizentube.apk -o apk_out -f
-          echo "=== Корневая структура APK ==="
-          ls -F apk_out/
 
-      - name: Deep Exploration (Разведка структуры)
-        run: |
-          echo "=== 1. Проверка ВСЕХ файлов в assets ==="
-          find apk_out/assets -type f | head -n 100 || echo "Папка assets пуста или отсутствует"
-          
-          echo "=== 2. Поиск любых HTML/JS файлов во всем проекте ==="
-          find apk_out/ -type f \( -name "*.html" -o -name "*.js" -o -name "*.json" \) | head -n 50
-          
-          echo "=== 3. Поиск главного Activity в AndroidManifest ==="
-          grep -oE 'android:name="[^"]+"' apk_out/AndroidManifest.xml | head -n 20
-          
-          echo "=== 4. Поиск WebView или Cobalt компонентов в Smali ==="
-          find apk_out/smali* -type f \( -name "*WebView*" -o -name "*Cobalt*" -o -name "*Client*" \) | head -n 40
-          
-          echo "=== 5. Поиск методов загрузки URL или инжектов ==="
-          grep -rn "loadUrl" apk_out/smali* | head -n 20 || echo "loadUrl не найден"
-          grep -rn "evaluateJavascript" apk_out/smali* | head -n 20 || echo "evaluateJavascript не найден"
-
-      # Временная заглушка, чтобы сборка не ломалась, пока мы ищем правильное место для интеграции
-      - name: Create Dummy VOT File
+      - name: Copy VOT script to assets
         run: |
           mkdir -p apk_out/assets
-          echo "// Ожидание логов разведки" > apk_out/assets/vot.js
+          cp vot.js apk_out/assets/vot.js
+          echo "VOT script copied: $(wc -c < apk_out/assets/vot.js) bytes"
 
-      - name: Generate debug keystore
+      - name: Show smali structure
+        run: |
+          echo "=== CobaltActivity smali files ==="
+          find apk_out/smali* -name "CobaltActivity*.smali" 2>/dev/null
+          echo ""
+          echo "=== CobaltActivity\$2 content ==="
+          SMALI=$(find apk_out/smali* -name "CobaltActivity\$2.smali" | head -1)
+          cat "$SMALI"
+
+      - name: Patch smali
+        run: |
+          SMALI=$(find apk_out/smali* -name "CobaltActivity\$2.smali" | head -1)
+          echo "Patching: $SMALI"
+          python3 patch_smali.py "$SMALI"
+
+      - name: Generate keystore
         run: |
           keytool -genkey -v \
             -keystore debug.keystore \
             -alias androiddebugkey \
-            -keyalg RSA -keysize 2048 \
-            -validity 10000 \
-            -storepass android \
-            -keypass android \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass android -keypass android \
             -dname "CN=Android Debug,O=Android,C=US"
 
       - name: Recompile APK
         run: |
           java -jar apktool.jar b apk_out -o tizentube_vot_unsigned.apk
-          echo "Recompiled APK:"
           ls -lh tizentube_vot_unsigned.apk
 
-      - name: Zipalign APK
+      - name: Align and sign APK
         run: |
-          zipalign -v 4 tizentube_vot_unsigned.apk tizentube_vot_aligned.apk
-          echo "Aligned APK:"
-          ls -lh tizentube_vot_aligned.apk
-
-      - name: Sign APK (V2/V3 Scheme)
-        run: |
-          apksigner sign \
+          BT=$ANDROID_SDK_ROOT/build-tools/$(ls $ANDROID_SDK_ROOT/build-tools | sort -V | tail -1)
+          $BT/zipalign -v 4 tizentube_vot_unsigned.apk tizentube_vot_aligned.apk
+          $BT/apksigner sign \
             --ks debug.keystore \
             --ks-pass pass:android \
             --key-pass pass:android \
-            --ks-key-alias androiddebugkey \
             --out tizentube_vot.apk \
             tizentube_vot_aligned.apk
-          echo "Successfully Signed APK with V2 Scheme"
           ls -lh tizentube_vot.apk
-          
-      - name: Verify APK Signature
-        run: |
-          apksigner verify --verbose tizentube_vot.apk
 
-      - name: Upload patched APK
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: TizenTubeCobalt-VOT
