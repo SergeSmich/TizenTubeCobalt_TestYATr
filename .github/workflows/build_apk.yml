@@ -1,460 +1,166 @@
-name: Patch TizenTube APK with VOT
-
-on:
-  workflow_dispatch:
-
-jobs:
-  patch:
-    runs-on: ubuntu-22.04
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          java-version: '17'
-          distribution: 'temurin'
-
-      - name: Download apktool
+- name: Inject VOT into Cobalt Pak Resource
         run: |
-          curl -Lo apktool.jar \
-            https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar
+          echo "=== Внедрение финального JS-моста перевода в cobalt_shell.pak ==="
+          python3 -c "
+          import struct
+          import os
 
-      - name: Download latest TizenTubeCobalt APK
-        run: |
-          APK_URL=$(curl -s https://api.github.com/repos/reisxd/TizenTubeCobalt/releases/latest \
-            | grep "browser_download_url.*apk" \
-            | head -1 \
-            | cut -d '"' -f 4)
-          echo "Downloading: $APK_URL"
-          curl -Lo tizentube.apk "$APK_URL"
-          ls -lh tizentube.apk
+          pak_path = 'apk_out/assets/cobalt_shell.pak'
+          
+          # Настоящий рабочий JS-код (VOT Bridge для Cobalt)
+          vot_js = b'''
+          (function(){
+              console.log('=== VOT COBALT ENGINE STARTED ===');
+              
+              // Функция ручной сборки Protobuf (Тег 3: URL видео)
+              function buildVotProto(videoUrl) {
+                  var encoder = new TextEncoder();
+                  var urlBytes = encoder.encode(videoUrl);
+                  var proto = [];
+                  
+                  // Пишем тег 3 (wire type 2 - length delimited) -> (3 << 3) | 2 = 26
+                  proto.push(26);
+                  
+                  // Пишем длину строки (Varint32)
+                  var len = urlBytes.length;
+                  while (len > 127) {
+                      proto.push((len & 127) | 128);
+                      len >>>= 7;
+                  }
+                  proto.push(len);
+                  
+                  // Пишем саму строку URL
+                  for (var i = 0; i < urlBytes.length; i++) {
+                      proto.push(urlBytes[i]);
+                  }
+                  return new Uint8Array(proto);
+              }
 
-      - name: Decompile APK
-        run: |
-          java -jar apktool.jar d tizentube.apk -o apk_out -f
-          echo "=== Root structure ==="
-          ls apk_out/
-          echo "=== Assets ==="
-          find apk_out/assets -type f 2>/dev/null | head -30 || echo "no assets"
-          echo "=== Smali CobaltActivity ==="
-          find apk_out/smali* -name "CobaltActivity.smali" 2>/dev/null
+              // Основная функция запроса перевода через публичный воркер
+              async function requestTranslation(videoUrl) {
+                  var workerUrl = 'https://vot-worker.kload.workers.dev/video-translation/translate';
+                  var bodyData = buildVotProto(videoUrl);
+                  
+                  try {
+                      var response = await fetch(workerUrl, {
+                          method: 'POST',
+                          headers: {
+                              'Content-Type': 'application/x-protobuf',
+                              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                          },
+                          body: bodyData
+                      });
+                      
+                      if (!response.ok) return null;
+                      
+                      // Читаем бинарный ответ от воркера (в нем ссылка на MP3 от Яндекса)
+                      var buffer = await response.arrayBuffer();
+                      var resBytes = new Uint8Array(buffer);
+                      
+                      // Легковесный парсинг ссылки на MP3 (ищем http/https маркер в бинарнике)
+                      var resStr = new TextDecoder().decode(resBytes);
+                      var urlMatch = resStr.match(/https:\\/\\/[^\\\\s\\\"\\']+\\.mp3/);
+                      
+                      return urlMatch ? urlMatch[0] : null;
+                  } catch (e) {
+                      console.error('VOT Fetch Error:', e);
+                      return null;
+                  }
+              }
 
-      - name: Create VOT JavaScript
-        run: |
-          mkdir -p apk_out/assets
-          cat > apk_out/assets/vot.js << 'VOTEOF'
-(function() {
-  'use strict';
+              // Кастомный плеер для наложения звука перевода поверх YouTube
+              var votAudio = new Audio();
+              votAudio.volume = 1.0;
 
-  // ── Конфигурация ──────────────────────────────────────────────
-  const VOT_WORKER = 'https://vot-worker.kload.workers.dev';
-  const POLL_INTERVAL_MS = 3000;
-  const SYNC_THRESHOLD  = 0.8;
-
-  // ── Protobuf утилиты (порт VotProtoUtils.java) ────────────────
-  function writeVarint(buf, val) {
-    let v = val >>> 0;
-    while (v > 0x7F) {
-      buf.push((v & 0x7F) | 0x80);
-      v >>>= 7;
-    }
-    buf.push(v);
-  }
-  function writeTag(buf, field, type) { writeVarint(buf, (field << 3) | type); }
-  function writeString(buf, field, str) {
-    const enc = new TextEncoder().encode(str);
-    writeTag(buf, field, 2);
-    writeVarint(buf, enc.length);
-    enc.forEach(b => buf.push(b));
-  }
-  function writeBool(buf, field, val) {
-    writeTag(buf, field, 0); writeVarint(buf, val ? 1 : 0);
-  }
-  function writeDouble(buf, field, val) {
-    writeTag(buf, field, 1);
-    const tmp = new ArrayBuffer(8);
-    new DataView(tmp).setFloat64(0, val, true);
-    new Uint8Array(tmp).forEach(b => buf.push(b));
-  }
-  function writeInt32(buf, field, val) {
-    writeTag(buf, field, 0); writeVarint(buf, val);
-  }
-  function writeMessage(buf, field, inner) {
-    writeTag(buf, field, 2);
-    writeVarint(buf, inner.length);
-    inner.forEach(b => buf.push(b));
-  }
-
-  // encodeTranslationRequest — порт Java метода
-  function buildTranslateProto(videoUrl, duration, fromLang, toLang) {
-    const buf = [];
-    writeString(buf, 3, videoUrl);
-    writeBool  (buf, 5, false);
-    writeDouble(buf, 6, duration || 0);
-    writeInt32 (buf, 7, 1);
-    writeString(buf, 8, fromLang || 'auto');
-    writeString(buf, 14, toLang  || 'ru');
-    writeInt32 (buf, 15, 1);
-    writeInt32 (buf, 16, 2);
-    writeBool  (buf, 18, false);
-    return new Uint8Array(buf);
-  }
-
-  // Простой protobuf-ридер
-  function readProto(buf) {
-    const view = new DataView(buf instanceof ArrayBuffer ? buf : buf.buffer);
-    let pos = 0, result = {};
-    while (pos < view.byteLength) {
-      let tag = 0, shift = 0, b;
-      do { b = view.getUint8(pos++); tag |= (b & 0x7F) << shift; shift += 7; } while (b & 0x80);
-      const field = tag >>> 3, wire = tag & 7;
-      if (wire === 0) {
-        let v = 0; shift = 0;
-        do { b = view.getUint8(pos++); v |= (b & 0x7F) << shift; shift += 7; } while (b & 0x80);
-        result[field] = v;
-      } else if (wire === 2) {
-        let len = 0; shift = 0;
-        do { b = view.getUint8(pos++); len |= (b & 0x7F) << shift; shift += 7; } while (b & 0x80);
-        const bytes = new Uint8Array(view.buffer, pos, len);
-        try { result[field] = new TextDecoder().decode(bytes); } catch(e) { result[field] = bytes; }
-        pos += len;
-      } else if (wire === 1) { pos += 8; }
-        else if (wire === 5) { pos += 4; }
-    }
-    return result;
-  }
-
-  // ── API запросы ───────────────────────────────────────────────
-  async function requestTranslation(videoUrl, duration) {
-    const body = buildTranslateProto(videoUrl, duration, 'auto', 'ru');
-    const resp = await fetch(`${VOT_WORKER}/video-translation/translate`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-protobuf',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 YaBrowser/24.6.0.0 Safari/537.36',
-        'Sec-Vtrans-Sk': '',
-      },
-      body,
-    });
-    if (!resp.ok) throw new Error('translate ' + resp.status);
-    return readProto(await resp.arrayBuffer());
-    // field 4 = status, field 7 = translationId, field 1 = url
-  }
-
-  async function requestAudio(translationId, audioToken) {
-    const buf = [];
-    writeString(buf, 1, translationId);
-    if (audioToken) writeString(buf, 2, audioToken);
-    const resp = await fetch(`${VOT_WORKER}/video-translation/audio`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-protobuf' },
-      body: new Uint8Array(buf),
-    });
-    if (!resp.ok) throw new Error('audio ' + resp.status);
-    return readProto(await resp.arrayBuffer());
-    // field 1 = audioUrl
-  }
-
-  // ── Состояние ─────────────────────────────────────────────────
-  const S = {
-    on: false,
-    videoId: null,
-    translationId: null,
-    audioEl: null,
-    pollTimer: null,
-    syncTimer: null,
-  };
-
-  function getVideoEl() { return document.querySelector('video'); }
-
-  function getVideoId() {
-    const m = location.href.match(/[?&]v=([a-zA-Z0-9_-]{11})/);
-    return m ? m[1] : null;
-  }
-
-  // ── Синхронизация аудио ───────────────────────────────────────
-  function syncAudio() {
-    const video = getVideoEl();
-    if (!video || !S.audioEl || !S.on) return;
-    if (Math.abs(S.audioEl.currentTime - video.currentTime) > SYNC_THRESHOLD) {
-      S.audioEl.currentTime = video.currentTime;
-    }
-    if (video.paused) { S.audioEl.pause(); }
-    else { S.audioEl.play().catch(()=>{}); }
-    video.volume = 0.10;
-  }
-
-  function attachAudio(url) {
-    if (S.audioEl) { S.audioEl.pause(); S.audioEl.remove(); }
-    const a = document.createElement('audio');
-    a.src = url; a.volume = 0.90; a.style.display = 'none';
-    document.body.appendChild(a);
-    S.audioEl = a;
-    const video = getVideoEl();
-    if (video && !video.paused) a.play().catch(()=>{});
-    clearInterval(S.syncTimer);
-    S.syncTimer = setInterval(syncAudio, 300);
-  }
-
-  // ── Polling: ждём готовности перевода ─────────────────────────
-  async function pollTranslation(videoUrl, duration) {
-    clearInterval(S.pollTimer);
-    setStatus('⏳ запрос...');
-    try {
-      const resp = await requestTranslation(videoUrl, duration);
-      const status = resp[4];   // int status
-      const tid    = resp[7];   // string translationId
-      const url    = resp[1];   // string audioUrl (если сразу готов)
-
-      // STATUS: 1=FINISHED, 2=WAITING, 3=LONG_WAITING, 5=PART_CONTENT, 6=AUDIO_REQUESTED
-      if (status === 1 && url) {
-        setStatus('✅ переводим');
-        attachAudio(url);
-        return;
-      }
-      if (status === 6 && tid) {
-        // нужно запросить аудио отдельно
-        S.translationId = tid;
-        const aResp = await requestAudio(tid, '');
-        if (aResp[1]) { setStatus('✅ переводим'); attachAudio(aResp[1]); return; }
-      }
-      if (tid) S.translationId = tid;
-      const remaining = resp[5] || 0;
-      setStatus(`⏳ ${remaining}с...`);
-      S.pollTimer = setTimeout(() => pollTranslation(videoUrl, duration), POLL_INTERVAL_MS);
-    } catch(e) {
-      setStatus('❌ ' + e.message);
-      console.error('[VOT]', e);
-    }
-  }
-
-  function startVOT() {
-    const vid = getVideoId();
-    if (!vid) { setStatus('❌ нет видео'); return; }
-    const video = getVideoEl();
-    const duration = video ? video.duration : 0;
-    const videoUrl = `https://www.youtube.com/watch?v=${vid}`;
-    S.videoId = vid;
-    pollTranslation(videoUrl, duration);
-  }
-
-  function stopVOT() {
-    clearInterval(S.pollTimer);
-    clearInterval(S.syncTimer);
-    if (S.audioEl) { S.audioEl.pause(); S.audioEl.remove(); S.audioEl = null; }
-    const video = getVideoEl();
-    if (video) video.volume = 1.0;
-    S.videoId = null;
-    S.translationId = null;
-  }
-
-  // ── UI ────────────────────────────────────────────────────────
-  function setStatus(text) {
-    const el = document.getElementById('vot-status');
-    if (el) el.textContent = text;
-  }
-
-  function buildUI() {
-    if (document.getElementById('vot-btn')) return;
-    const wrap = document.createElement('div');
-    wrap.id = 'vot-wrap';
-    wrap.style.cssText = `
-      position:fixed; bottom:70px; right:16px; z-index:99999;
-      display:flex; flex-direction:column; align-items:flex-end; gap:6px;
-    `;
-    const btn = document.createElement('button');
-    btn.id = 'vot-btn';
-    btn.textContent = '🌐 Перевод ВЫКЛ';
-    btn.style.cssText = `
-      padding:10px 20px; font-size:17px; font-weight:bold;
-      background:rgba(0,0,0,0.85); color:#fff;
-      border:2px solid #f90; border-radius:10px; cursor:pointer;
-      outline:none;
-    `;
-    const status = document.createElement('div');
-    status.id = 'vot-status';
-    status.style.cssText = `
-      font-size:13px; color:#ccc; background:rgba(0,0,0,0.7);
-      padding:3px 10px; border-radius:6px; display:none;
-    `;
-    btn.addEventListener('click', () => {
-      S.on = !S.on;
-      if (S.on) {
-        btn.textContent = '🌐 Перевод ВКЛ';
-        btn.style.borderColor = '#0f0';
-        status.style.display = 'block';
-        startVOT();
-      } else {
-        btn.textContent = '🌐 Перевод ВЫКЛ';
-        btn.style.borderColor = '#f90';
-        status.style.display = 'none';
-        setStatus('');
-        stopVOT();
-      }
-    });
-    wrap.appendChild(status);
-    wrap.appendChild(btn);
-    document.body.appendChild(wrap);
-  }
-
-  // ── Слежение за сменой видео ──────────────────────────────────
-  let lastUrl = location.href;
-  setInterval(() => {
-    if (location.href === lastUrl) return;
-    lastUrl = location.href;
-    if (S.on) { stopVOT(); setTimeout(startVOT, 1500); }
-  }, 1500);
-
-  // ── Старт ─────────────────────────────────────────────────────
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', buildUI);
-  } else {
-    buildUI();
-  }
-})();
-VOTEOF
-          echo "VOT script size: $(wc -c < apk_out/assets/vot.js) bytes"
-
-      - name: Patch smali — inject VOT loader into CobaltActivity
-        run: |
-          # Найдём smali файл CobaltActivity
-          SMALI=$(find apk_out/smali* -name "CobaltActivity.smali" | head -1)
-          echo "Found smali: $SMALI"
-
-          # Найдём метод onWebContentsReady (анонимный класс CobaltActivity$2)
-          SMALI2=$(find apk_out/smali* -name "CobaltActivity\$2.smali" | head -1)
-          echo "Found inner class smali: $SMALI2"
-
-          # Читаем vot.js и экранируем для smali строки
-          VOT_CODE=$(cat apk_out/assets/vot.js | python3 -c "
-          import sys, json
-          code = sys.stdin.read()
-          # Экранируем для Java строки в smali
-          code = code.replace('\\\\', '\\\\\\\\').replace('\"', '\\\\\"').replace('\n', '\\\\n')
-          print(code)
-          ")
-
-          # Создаём Python скрипт для патча smali
-          python3 << 'PYEOF'
-          import re
-
-          smali_path = "$(find apk_out/smali* -name 'CobaltActivity\$2.smali' | head -1)"
-
-          with open(smali_path, 'r') as f:
-              content = f.read()
-
-          # Ищем метод onWebContentsReady и добавляем вызов loadUrl после loadUrl mStartupUrl
-          # Инжектируем вызов evaluateJavaScript с загрузкой vot.js из assets
-
-          vot_inject = '''
-              # VOT injection — читаем vot.js из assets и выполняем
-              const-string v10, "vot.js"
-              invoke-virtual {p0, v10}, Ldev/cobalt/coat/CobaltActivity;->evaluateJavaScript(Ljava/lang/String;)V
+              // Интервал для отслеживания смены видео в интерфейсе YouTube TV
+              setInterval(async function() {
+                  var currentUrl = window.location.href;
+                  if (currentUrl.includes('watch?v=') && window.lastVotUrl !== currentUrl) {
+                      window.lastVotUrl = currentUrl;
+                      console.log('Обнаружено новое видео:', currentUrl);
+                      
+                      var audioUrl = await requestTranslation(currentUrl);
+                      if (audioUrl) {
+                          console.log('Перевод найден, запускаем дорожку:', audioUrl);
+                          votAudio.src = audioUrl;
+                          
+                          // Синхронизируем старт с основным видео плеером YouTube
+                          var ytVideo = document.querySelector('video');
+                          if (ytVideo) {
+                              votAudio.currentTime = ytVideo.currentTime;
+                              if (!ytVideo.paused) votAudio.play();
+                              
+                              ytVideo.onplay = () => votAudio.play();
+                              ytVideo.onpause = () => votAudio.pause();
+                              ytVideo.onseeking = () => votAudio.currentTime = ytVideo.currentTime;
+                          }
+                      }
+                  }
+              }, 3000);
+          })();
           '''
 
-          # Находим место после loadUrl
-          pattern = r'(invoke-virtual \{[^}]+\}, Ldev/cobalt/shell/Shell;->loadUrl\(Ljava/lang/String;\)V)'
-          replacement = r'\1' + '\n' + vot_inject
+          if not os.path.exists(pak_path):
+              print('Ошибка: cobalt_shell.pak не найден!')
+              exit(1)
 
-          new_content = re.sub(pattern, replacement, content, count=1)
+          with open(pak_path, 'rb') as f:
+              data = f.read()
 
-          if new_content != content:
-              print("Smali patched successfully")
+          version = struct.unpack('<I', data[:4])[0]
+          resource_count = struct.unpack('<I', data[8:12])[0]
+          header_size = 12 if version == 5 else 9
+          entry_size = 6 if version == 4 else 8
+
+          # Ищем смещения для ресурса 31000
+          target_offset = None
+          target_len = None
+          idx = header_size
+
+          for _ in range(resource_count):
+              if version == 4:
+                  res_id, offset = struct.unpack('<HI', data[idx:idx+6])
+              else:
+                  res_id, offset = struct.unpack('<II', data[idx:idx+8])
+              
+              if res_id == 31000:
+                  idx_next = idx + entry_size
+                  if version == 4:
+                      _, next_offset = struct.unpack('<HI', data[idx_next:idx_next+6])
+                  else:
+                      _, next_offset = struct.unpack('<II', data[idx_next:idx_next+8])
+                  
+                  target_offset = offset
+                  target_len = next_offset - offset
+                  break
+              idx += entry_size
+
+          if target_offset and target_len:
+              print(f'Ресурс 31000 успешно локализован. Смещение: {target_offset}, Длина: {target_len}')
+              
+              orig_js = data[target_offset:target_offset+target_len]
+              patched_js = orig_js + vot_js
+              delta = len(patched_js) - target_len
+
+              new_data = bytearray(data[:target_offset]) + patched_js + data[target_offset+target_len:]
+              
+              # Пересчитываем указатели смещений в заголовке PAK
+              idx = header_size
+              for _ in range(resource_count + 1):
+                  if version == 4:
+                      res_id, offset = struct.unpack('<HI', new_data[idx:idx+6])
+                      if offset > target_offset:
+                          new_data[idx+2:idx+6] = struct.pack('<I', offset + delta)
+                  else:
+                      res_id, offset = struct.unpack('<II', new_data[idx:idx+8])
+                      if offset > target_offset:
+                          new_data[idx+4:idx+8] = struct.pack('<I', offset + delta)
+                  idx += entry_size
+
+              with open(pak_path, 'wb') as f:
+                  f.write(new_data)
+              print('=== cobalt_shell.pak успешно модифицирован и собран! ===')
           else:
-              print("Pattern not found, trying alternative...")
-
-          with open(smali_path, 'w') as f:
-              f.write(new_content)
-          PYEOF
-
-      - name: Inject VOT via evaluateJavaScript in smali
-        run: |
-          # Альтернативный подход — создаём отдельный smali хелпер
-          # и патчим через добавление загрузки скрипта
-
-          SMALI2=$(find apk_out/smali* -name "CobaltActivity\$2.smali" | head -1)
-          echo "=== Current onWebContentsReady method ==="
-          grep -A 50 "onWebContentsReady" "$SMALI2" | head -60
-
-      - name: Apply smali patch
-        run: |
-          SMALI2=$(find apk_out/smali* -name "CobaltActivity\$2.smali" | head -1)
-
-          python3 << PYEOF
-          smali_path = "$SMALI2"
-
-          with open(smali_path, 'r') as f:
-              content = f.read()
-
-          # Читаем VOT JS
-          with open('apk_out/assets/vot.js', 'r') as f:
-              vot_code = f.read()
-
-          # Экранируем для smali строки (Java string literal)
-          vot_escaped = vot_code.replace('\\\\', '\\\\\\\\').replace('"', '\\\\"').replace('\n', '\\\\n').replace('\r', '')
-
-          # Вставляем после последнего loadUrl вызова в onWebContentsReady
-          inject = f'''
-
-              # === VOT JavaScript Injection ===
-              const-string/jumbo v11, "{vot_escaped}"
-              invoke-virtual {{v3, v11}}, Ldev/cobalt/coat/CobaltActivity;->evaluateJavaScript(Ljava/lang/String;)V
-              # === End VOT Injection ===
-          '''
-
-          # Находим место для вставки — после loadSplashScreenWebContents
-          target = 'invoke-virtual {v4}, Ldev/cobalt/shell/Shell;->loadSplashScreenWebContents()V'
-          if target in content:
-              content = content.replace(target, target + inject)
-              print("✅ Injected after loadSplashScreenWebContents")
-          else:
-              # Попробуем найти return-void в onWebContentsReady
-              print("Target not found, dumping method:")
-              idx = content.find('onWebContentsReady')
-              print(content[idx:idx+1000])
-
-          with open(smali_path, 'w') as f:
-              f.write(content)
-          PYEOF
-
-      - name: Generate keystore
-        run: |
-          keytool -genkey -v \
-            -keystore debug.keystore \
-            -alias androiddebugkey \
-            -keyalg RSA -keysize 2048 -validity 10000 \
-            -storepass android -keypass android \
-            -dname "CN=Android Debug,O=Android,C=US"
-
-      - name: Recompile APK
-        run: |
-          java -jar apktool.jar b apk_out -o tizentube_vot_unsigned.apk
-          ls -lh tizentube_vot_unsigned.apk
-
-      - name: Align and sign APK
-        run: |
-          BUILD_TOOLS=$ANDROID_SDK_ROOT/build-tools/$(ls $ANDROID_SDK_ROOT/build-tools | sort -V | tail -1)
-          echo "Using build tools: $BUILD_TOOLS"
-
-          $BUILD_TOOLS/zipalign -v 4 tizentube_vot_unsigned.apk tizentube_vot_aligned.apk
-
-          $BUILD_TOOLS/apksigner sign \
-            --ks debug.keystore \
-            --ks-pass pass:android \
-            --key-pass pass:android \
-            --out tizentube_vot.apk \
-            tizentube_vot_aligned.apk
-
-          echo "Final APK:"
-          ls -lh tizentube_vot.apk
-
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: TizenTubeCobalt-VOT
-          path: tizentube_vot.apk
-          retention-days: 30
+              print('Ресурс 31000 не найден в таблице индексов архива!')
+              exit(1)
+          "
