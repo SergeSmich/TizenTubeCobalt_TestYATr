@@ -1,166 +1,110 @@
-- name: Inject VOT into Cobalt Pak Resource
+name: Patch TizenTube APK with VOT
+
+on:
+  workflow_dispatch:
+
+jobs:
+  patch:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Download apktool
         run: |
-          echo "=== Внедрение финального JS-моста перевода в cobalt_shell.pak ==="
-          python3 -c "
-          import struct
-          import os
+          curl -Lo apktool.jar \
+            https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar
 
-          pak_path = 'apk_out/assets/cobalt_shell.pak'
+      - name: Download latest TizenTubeCobalt APK
+        run: |
+          APK_URL=$(curl -s https://api.github.com/repos/reisxd/TizenTubeCobalt/releases/latest \
+            | grep "browser_download_url.*apk" \
+            | head -1 \
+            | cut -d '"' -f 4)
+          echo "Downloading: $APK_URL"
+          curl -Lo tizentube.apk "$APK_URL"
+          ls -lh tizentube.apk
+
+      - name: Decompile APK
+        run: |
+          java -jar apktool.jar d tizentube.apk -o apk_out -f
+          echo "=== Корневая структура APK ==="
+          ls -F apk_out/
+
+      - name: Deep Exploration (Разведка структуры)
+        run: |
+          echo "=== 1. Проверка ВСЕХ файлов в assets ==="
+          find apk_out/assets -type f | head -n 100 || echo "Папка assets пуста или отсутствует"
           
-          # Настоящий рабочий JS-код (VOT Bridge для Cobalt)
-          vot_js = b'''
-          (function(){
-              console.log('=== VOT COBALT ENGINE STARTED ===');
-              
-              // Функция ручной сборки Protobuf (Тег 3: URL видео)
-              function buildVotProto(videoUrl) {
-                  var encoder = new TextEncoder();
-                  var urlBytes = encoder.encode(videoUrl);
-                  var proto = [];
-                  
-                  // Пишем тег 3 (wire type 2 - length delimited) -> (3 << 3) | 2 = 26
-                  proto.push(26);
-                  
-                  // Пишем длину строки (Varint32)
-                  var len = urlBytes.length;
-                  while (len > 127) {
-                      proto.push((len & 127) | 128);
-                      len >>>= 7;
-                  }
-                  proto.push(len);
-                  
-                  // Пишем саму строку URL
-                  for (var i = 0; i < urlBytes.length; i++) {
-                      proto.push(urlBytes[i]);
-                  }
-                  return new Uint8Array(proto);
-              }
+          echo "=== 2. Поиск любых HTML/JS файлов во всем проекте ==="
+          find apk_out/ -type f \( -name "*.html" -o -name "*.js" -o -name "*.json" \) | head -n 50
+          
+          echo "=== 3. Поиск главного Activity в AndroidManifest ==="
+          grep -oE 'android:name="[^"]+"' apk_out/AndroidManifest.xml | head -n 20
+          
+          echo "=== 4. Поиск WebView или Cobalt компонентов в Smali ==="
+          find apk_out/smali* -type f \( -name "*WebView*" -o -name "*Cobalt*" -o -name "*Client*" \) | head -n 40
+          
+          echo "=== 5. Поиск методов загрузки URL или инжектов ==="
+          grep -rn "loadUrl" apk_out/smali* | head -n 20 || echo "loadUrl не найден"
+          grep -rn "evaluateJavascript" apk_out/smali* | head -n 20 || echo "evaluateJavascript не найден"
 
-              // Основная функция запроса перевода через публичный воркер
-              async function requestTranslation(videoUrl) {
-                  var workerUrl = 'https://vot-worker.kload.workers.dev/video-translation/translate';
-                  var bodyData = buildVotProto(videoUrl);
-                  
-                  try {
-                      var response = await fetch(workerUrl, {
-                          method: 'POST',
-                          headers: {
-                              'Content-Type': 'application/x-protobuf',
-                              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-                          },
-                          body: bodyData
-                      });
-                      
-                      if (!response.ok) return null;
-                      
-                      // Читаем бинарный ответ от воркера (в нем ссылка на MP3 от Яндекса)
-                      var buffer = await response.arrayBuffer();
-                      var resBytes = new Uint8Array(buffer);
-                      
-                      // Легковесный парсинг ссылки на MP3 (ищем http/https маркер в бинарнике)
-                      var resStr = new TextDecoder().decode(resBytes);
-                      var urlMatch = resStr.match(/https:\\/\\/[^\\\\s\\\"\\']+\\.mp3/);
-                      
-                      return urlMatch ? urlMatch[0] : null;
-                  } catch (e) {
-                      console.error('VOT Fetch Error:', e);
-                      return null;
-                  }
-              }
+      # Временная заглушка, чтобы сборка не ломалась, пока мы ищем правильное место для интеграции
+      - name: Create Dummy VOT File
+        run: |
+          mkdir -p apk_out/assets
+          echo "// Ожидание логов разведки" > apk_out/assets/vot.js
 
-              // Кастомный плеер для наложения звука перевода поверх YouTube
-              var votAudio = new Audio();
-              votAudio.volume = 1.0;
+      - name: Generate debug keystore
+        run: |
+          keytool -genkey -v \
+            -keystore debug.keystore \
+            -alias androiddebugkey \
+            -keyalg RSA -keysize 2048 \
+            -validity 10000 \
+            -storepass android \
+            -keypass android \
+            -dname "CN=Android Debug,O=Android,C=US"
 
-              // Интервал для отслеживания смены видео в интерфейсе YouTube TV
-              setInterval(async function() {
-                  var currentUrl = window.location.href;
-                  if (currentUrl.includes('watch?v=') && window.lastVotUrl !== currentUrl) {
-                      window.lastVotUrl = currentUrl;
-                      console.log('Обнаружено новое видео:', currentUrl);
-                      
-                      var audioUrl = await requestTranslation(currentUrl);
-                      if (audioUrl) {
-                          console.log('Перевод найден, запускаем дорожку:', audioUrl);
-                          votAudio.src = audioUrl;
-                          
-                          // Синхронизируем старт с основным видео плеером YouTube
-                          var ytVideo = document.querySelector('video');
-                          if (ytVideo) {
-                              votAudio.currentTime = ytVideo.currentTime;
-                              if (!ytVideo.paused) votAudio.play();
-                              
-                              ytVideo.onplay = () => votAudio.play();
-                              ytVideo.onpause = () => votAudio.pause();
-                              ytVideo.onseeking = () => votAudio.currentTime = ytVideo.currentTime;
-                          }
-                      }
-                  }
-              }, 3000);
-          })();
-          '''
+      - name: Recompile APK
+        run: |
+          java -jar apktool.jar b apk_out -o tizentube_vot_unsigned.apk
+          echo "Recompiled APK:"
+          ls -lh tizentube_vot_unsigned.apk
 
-          if not os.path.exists(pak_path):
-              print('Ошибка: cobalt_shell.pak не найден!')
-              exit(1)
+      - name: Zipalign APK
+        run: |
+          zipalign -v 4 tizentube_vot_unsigned.apk tizentube_vot_aligned.apk
+          echo "Aligned APK:"
+          ls -lh tizentube_vot_aligned.apk
 
-          with open(pak_path, 'rb') as f:
-              data = f.read()
+      - name: Sign APK (V2/V3 Scheme)
+        run: |
+          apksigner sign \
+            --ks debug.keystore \
+            --ks-pass pass:android \
+            --key-pass pass:android \
+            --ks-key-alias androiddebugkey \
+            --out tizentube_vot.apk \
+            tizentube_vot_aligned.apk
+          echo "Successfully Signed APK with V2 Scheme"
+          ls -lh tizentube_vot.apk
+          
+      - name: Verify APK Signature
+        run: |
+          apksigner verify --verbose tizentube_vot.apk
 
-          version = struct.unpack('<I', data[:4])[0]
-          resource_count = struct.unpack('<I', data[8:12])[0]
-          header_size = 12 if version == 5 else 9
-          entry_size = 6 if version == 4 else 8
-
-          # Ищем смещения для ресурса 31000
-          target_offset = None
-          target_len = None
-          idx = header_size
-
-          for _ in range(resource_count):
-              if version == 4:
-                  res_id, offset = struct.unpack('<HI', data[idx:idx+6])
-              else:
-                  res_id, offset = struct.unpack('<II', data[idx:idx+8])
-              
-              if res_id == 31000:
-                  idx_next = idx + entry_size
-                  if version == 4:
-                      _, next_offset = struct.unpack('<HI', data[idx_next:idx_next+6])
-                  else:
-                      _, next_offset = struct.unpack('<II', data[idx_next:idx_next+8])
-                  
-                  target_offset = offset
-                  target_len = next_offset - offset
-                  break
-              idx += entry_size
-
-          if target_offset and target_len:
-              print(f'Ресурс 31000 успешно локализован. Смещение: {target_offset}, Длина: {target_len}')
-              
-              orig_js = data[target_offset:target_offset+target_len]
-              patched_js = orig_js + vot_js
-              delta = len(patched_js) - target_len
-
-              new_data = bytearray(data[:target_offset]) + patched_js + data[target_offset+target_len:]
-              
-              # Пересчитываем указатели смещений в заголовке PAK
-              idx = header_size
-              for _ in range(resource_count + 1):
-                  if version == 4:
-                      res_id, offset = struct.unpack('<HI', new_data[idx:idx+6])
-                      if offset > target_offset:
-                          new_data[idx+2:idx+6] = struct.pack('<I', offset + delta)
-                  else:
-                      res_id, offset = struct.unpack('<II', new_data[idx:idx+8])
-                      if offset > target_offset:
-                          new_data[idx+4:idx+8] = struct.pack('<I', offset + delta)
-                  idx += entry_size
-
-              with open(pak_path, 'wb') as f:
-                  f.write(new_data)
-              print('=== cobalt_shell.pak успешно модифицирован и собран! ===')
-          else:
-              print('Ресурс 31000 не найден в таблице индексов архива!')
-              exit(1)
-          "
+      - name: Upload patched APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: TizenTubeCobalt-VOT
+          path: tizentube_vot.apk
+          retention-days: 30
