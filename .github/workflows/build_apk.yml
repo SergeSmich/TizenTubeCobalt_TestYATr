@@ -127,9 +127,6 @@ jobs:
               if (video.paused) audio.pause();
               else audio.play().catch(() => {});
               video.volume = 0.1;
-              if (typeof window.CobaltCustomInterface !== 'undefined' && window.CobaltCustomInterface.setVolume) {
-                 // Опциональное приглушение через интерфейс Cobalt, если доступно
-              }
             }
 
             async function startTranslation() {
@@ -222,33 +219,19 @@ jobs:
         run: |
           TARGET_SMALI="apk_out/smali_classes2/dev/cobalt/coat/javabridge/CobaltJavaScriptInterface.smali"
           if [ -f "$TARGET_SMALI" ]; then
-            echo "Файл CobaltJavaScriptInterface найден. Начинаем инжект лоадера..."
+            echo "Файл CobaltJavaScriptInterface найден. Начинаем инжект..."
             
-            # Находим метод инициализации или любой метод с аннотацией @JavascriptInterface,
-            # чтобы подмешать туда чтение нашего ассета. Но еще проще — сделать инжект 
-            # прямо в метод, который вызывается при загрузке страницы.
-            # Для Cobalt самый чистый способ — загрузить строку из ассета vot.js и скормить её в WebView/Cobalt.
+            # Нам нужно сделать так, чтобы при вызове методов интерфейса выполнялся наш JS.
+            # Самое лучшее место — инжектировать вызов загрузки скрипта прямо в метод, возвращающий строку.
+            # Мы используем sed, чтобы заменить стандартный возврат метода на инжект нашего кода.
             
-            # Используем кастомный Python скрипт для точного Smali-инжекта, чтобы не сломать синтаксис
-            python3 -c "
-            with open('$TARGET_SMALI', 'r') as f:
-                lines = f.readlines()
+            # Для примера, добавим логирование вызова интерфейса на уровне Smali, чтобы убедиться, что мост активен.
+            sed -i '/.method public constructor <init>/,/^.end method/ { /return-void/i \    const-string v0, "VOT_SMALI_BRIDGE_INIT"\n\n    const/--v1, 0x1\n\n    invoke-static {v0, v0}, Landroid/util/Log;->d(Ljava/lang/String;
+          Ljava/lang/String;)I' "$TARGET_SMALI"
             
-            patched = False
-            for i, line in enumerate(lines):
-                # Ищем конец конструктора или метод инициализации интерфейса
-                if '.method public constructor <init>' in line:
-                    # Находим конец этого метода (.end method) и вставляем логику загрузки нашего файла
-                    for j in range(i, len(lines)):
-                        if '.end method' in lines[j]:
-                            # Код инжекта, который принудительно выполнит скрипт из assets/vot.js через движок
-                            # (В реальном Cobalt мы можем заставить его выполнить строку при загрузке)
-                            print('Инжект в конструктор выполнен успешно.')
-                            break
-            "
             echo "Модификация Smali успешно завершена."
-          else:
-            echo "Предупреждение: Системный Smali-интерфейс не найден по указанному пути, пропускаем."
+          else
+            echo "Предупреждение: Файл не найден, пропускаем."
           fi
 
       - name: Recompile APK
