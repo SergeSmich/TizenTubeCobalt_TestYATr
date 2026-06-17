@@ -57,6 +57,7 @@ jobs:
           java -jar apktool.jar d tizentube.apk -o apk_out -f
           echo "APK structure:"
           ls apk_out/
+          
       - name: Explore Smali Structure
         run: |
           echo "=== Поиск WebView или Cobalt एक्टिविटी ==="
@@ -67,6 +68,7 @@ jobs:
           
           echo "=== Проверка структуры папки assets ==="
           find apk_out/assets -maxdepth 3
+          
       - name: Show assets folder
         run: |
           echo "=== assets ==="
