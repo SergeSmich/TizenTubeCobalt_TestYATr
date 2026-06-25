@@ -120,15 +120,23 @@ def inject_into_cobalt_pak(vot_text: str, assets_dir: pathlib.Path) -> bool:
             continue
         if b"\x00" in blob[:4096]:
             continue
-        low = blob[:65536].lower()
-        if any(t in low for t in (b"function", b"window", b"document", b"const ", b"let ")):
-            candidates.append((rid, blob))
+        probe = blob[:65536]
+        ascii_ratio = sum(1 for b in probe if b in b"\t\n\r" or 32 <= b <= 126) / max(1, len(probe))
+        if ascii_ratio < 0.7:
+            continue
+        low = probe.lower()
+        score = 1
+        if any(t in low for t in (b"function", b"window", b"document", b"const ", b"let ", b"class ")):
+            score += 5
+        if b";" in low and b"{" in low:
+            score += 2
+        candidates.append((score, rid, blob))
 
     if not candidates:
         return False
 
-    candidates.sort(key=lambda x: len(x[1]), reverse=True)
-    rid, blob = candidates[0]
+    candidates.sort(key=lambda x: (x[0], len(x[2])), reverse=True)
+    _score, rid, blob = candidates[0]
     text = blob.decode("utf-8", errors="replace")
     if MARKER_BEGIN in text:
         print(f"VOT marker already present in cobalt_shell.pak resource {rid}, skipping.")
