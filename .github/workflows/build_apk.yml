@@ -41,20 +41,14 @@ jobs:
           cp vot.js apk_out/assets/vot.js
           echo "VOT script copied: $(wc -c < apk_out/assets/vot.js) bytes"
 
-      - name: Show smali structure
+      - name: Show JS bundle candidates
         run: |
-          echo "=== CobaltActivity smali files ==="
-          find apk_out/smali* -name "CobaltActivity*.smali" 2>/dev/null
-          echo ""
-          echo "=== CobaltActivity\$2 content ==="
-          SMALI=$(find apk_out/smali* -name "CobaltActivity\$2.smali" | head -1)
-          cat "$SMALI"
+          echo "=== JavaScript files under assets ==="
+          find apk_out/assets -type f -name "*.js" -printf "%s %p\n" | sort -nr | head -20
 
-      - name: Patch smali
+      - name: Inject VOT into runtime JS bundle
         run: |
-          SMALI=$(find apk_out/smali* -name "CobaltActivity\$2.smali" | head -1)
-          echo "Patching: $SMALI"
-          python3 patch_smali.py "$SMALI"
+          python3 inject_vot_bundle.py apk_out/assets/vot.js apk_out/assets
 
       - name: Generate keystore
         run: |
