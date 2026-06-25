@@ -41,8 +41,11 @@ jobs:
           cp vot.js apk_out/assets/vot.js
           echo "VOT script copied: $(wc -c < apk_out/assets/vot.js) bytes"
 
-      - name: Show JS bundle candidates
+      - name: Show assets candidates
         run: |
+          echo "=== Largest files under assets ==="
+          find apk_out/assets -type f -printf "%s %p\n" | sort -nr | head -40
+          echo ""
           echo "=== JavaScript files under assets ==="
           find apk_out/assets -type f -name "*.js" -printf "%s %p\n" | sort -nr | head -20
 
