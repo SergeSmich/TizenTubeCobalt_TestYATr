@@ -1,0 +1,269 @@
+name: Patch TizenTube APK with VOT
+
+on:
+  workflow_dispatch:
+
+jobs:
+  patch:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: "temurin"
+
+      - name: Setup Android SDK Build-Tools (for apksigner)
+        uses: android-actions/setup-android@v3
+
+      - name: Download apktool
+        run: |
+          curl -Lo apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar
+          chmod +x apktool.jar
+
+      - name: Download latest TizenTubeCobalt APK
+        run: |
+          RELEASE_JSON=$(curl -s https://api.github.com/repos/reisxd/TizenTubeCobalt/releases/latest)
+          APK_URL=$(echo "$RELEASE_JSON" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          for a in data.get('assets', []):
+              if a['name'].endswith('.apk'):
+                  print(a['browser_download_url'])
+                  break
+          ")
+
+          if [ -z "$APK_URL" ]; then
+            echo "No APK URL found in latest release assets"
+            exit 1
+          fi
+
+          echo "Downloading: $APK_URL"
+          curl -L -o tizentube.apk "$APK_URL"
+          ls -lh tizentube.apk
+
+      - name: Decompile APK
+        run: |
+          java -jar apktool.jar d tizentube.apk -o apk_out -f
+          echo "APK decompiled."
+
+      - name: Create VOT script
+        run: |
+          mkdir -p apk_out/assets
+          cat > apk_out/assets/vot.js << 'VOTEOF'
+          (function () {
+            "use strict";
+            if (window.__VOT_BOOTSTRAPPED__) return;
+            window.__VOT_BOOTSTRAPPED__ = true;
+
+            const VOT_WORKER = "https://vot-worker.toil.cc";
+            const VOT_STATE = {
+              enabled: false,
+              audioEl: null,
+              videoEl: null,
+              currentVideoId: null,
+            };
+
+            function getVideoId() {
+              const m = location.href.match(/[?&]v=([a-zA-Z0-9_-]{11})/);
+              return m ? m[1] : null;
+            }
+
+            async function fetchTranslation(videoId) {
+              const resp = await fetch(`${VOT_WORKER}/video-translation/translate`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  url: `https://www.youtube.com/watch?v=${videoId}`,
+                  lang: "ru",
+                }),
+              });
+              if (!resp.ok) throw new Error(`translate failed: ${resp.status}`);
+              return resp.json();
+            }
+
+            async function fetchAudio(translationId) {
+              const resp = await fetch(`${VOT_WORKER}/video-translation/audio`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ translationId }),
+              });
+              if (!resp.ok) throw new Error(`audio failed: ${resp.status}`);
+              const data = await resp.json();
+              return data.url || null;
+            }
+
+            function getVideo() {
+              return document.querySelector("video");
+            }
+
+            function ensureButton() {
+              if (document.getElementById("vot-btn")) return;
+              const btn = document.createElement("button");
+              btn.id = "vot-btn";
+              btn.textContent = "🌐 Перевод";
+              btn.style.cssText = [
+                "position:fixed",
+                "bottom:80px",
+                "right:20px",
+                "z-index:9999",
+                "padding:10px 18px",
+                "background:rgba(0,0,0,.8)",
+                "color:#fff",
+                "border:2px solid #fc0",
+                "border-radius:8px",
+                "font-size:18px",
+                "cursor:pointer",
+              ].join(";");
+
+              btn.addEventListener("click", async () => {
+                VOT_STATE.enabled = !VOT_STATE.enabled;
+                if (!VOT_STATE.enabled) {
+                  btn.textContent = "🌐 Перевод";
+                  btn.style.borderColor = "#fc0";
+                  if (VOT_STATE.audioEl) {
+                    VOT_STATE.audioEl.pause();
+                    VOT_STATE.audioEl.remove();
+                    VOT_STATE.audioEl = null;
+                  }
+                  if (VOT_STATE.videoEl) VOT_STATE.videoEl.volume = 1;
+                  return;
+                }
+
+                btn.textContent = "🌐 Перевод ВКЛ";
+                btn.style.borderColor = "#0f0";
+                const videoId = getVideoId();
+                if (!videoId) return;
+                if (videoId === VOT_STATE.currentVideoId && VOT_STATE.audioEl) return;
+                VOT_STATE.currentVideoId = videoId;
+
+                try {
+                  const tr = await fetchTranslation(videoId);
+                  if (!tr || !tr.translationId) return;
+                  const audioUrl = await fetchAudio(tr.translationId);
+                  if (!audioUrl) return;
+
+                  if (VOT_STATE.audioEl) {
+                    VOT_STATE.audioEl.pause();
+                    VOT_STATE.audioEl.remove();
+                  }
+
+                  const audio = document.createElement("audio");
+                  audio.src = audioUrl;
+                  audio.style.display = "none";
+                  document.body.appendChild(audio);
+                  VOT_STATE.audioEl = audio;
+
+                  const video = getVideo();
+                  if (!video) return;
+                  VOT_STATE.videoEl = video;
+                  video.volume = 0.1;
+
+                  const sync = () => {
+                    if (!VOT_STATE.audioEl || !VOT_STATE.videoEl) return;
+                    if (Math.abs(audio.currentTime - video.currentTime) > 0.5) {
+                      audio.currentTime = video.currentTime;
+                    }
+                    if (video.paused) audio.pause();
+                    else audio.play().catch(() => {});
+                  };
+
+                  video.addEventListener("timeupdate", sync);
+                  video.addEventListener("play", sync);
+                  video.addEventListener("pause", () => audio.pause());
+                  video.addEventListener("seeked", () => {
+                    if (VOT_STATE.audioEl) VOT_STATE.audioEl.currentTime = video.currentTime;
+                  });
+                  if (!video.paused) audio.play().catch(() => {});
+                } catch (e) {
+                  console.error("[VOT] error", e);
+                }
+              });
+
+              document.body.appendChild(btn);
+            }
+
+            function init() {
+              ensureButton();
+              let last = location.href;
+              setInterval(() => {
+                if (location.href !== last) {
+                  last = location.href;
+                  VOT_STATE.currentVideoId = null;
+                }
+              }, 2000);
+            }
+
+            if (document.readyState === "loading") {
+              document.addEventListener("DOMContentLoaded", init);
+            } else {
+              init();
+            }
+          })();
+          VOTEOF
+          echo "VOT script generated."
+
+      - name: Inject VOT into runtime bundle (real injection)
+        run: |
+          TARGET_JS=$(find apk_out/assets -type f -name "*.js" -printf "%s %p\n" | sort -nr | head -n1 | cut -d' ' -f2-)
+          if [ -z "$TARGET_JS" ]; then
+            echo "No JS bundle found under apk_out/assets"
+            exit 1
+          fi
+
+          echo "Target JS bundle: $TARGET_JS"
+          cp "$TARGET_JS" "${TARGET_JS}.bak"
+          printf "\n\n/* === VOT injected === */\n" >> "$TARGET_JS"
+          cat apk_out/assets/vot.js >> "$TARGET_JS"
+          echo "Injected VOT code into JS bundle."
+
+      - name: Generate debug keystore
+        run: |
+          keytool -genkey -v \
+            -keystore debug.keystore \
+            -alias androiddebugkey \
+            -keyalg RSA -keysize 2048 \
+            -validity 10000 \
+            -storepass android \
+            -keypass android \
+            -dname "CN=Android Debug,O=Android,C=US"
+
+      - name: Recompile APK
+        run: |
+          java -jar apktool.jar b apk_out -o tizentube_vot_unsigned.apk
+          ls -lh tizentube_vot_unsigned.apk
+
+      - name: Align and sign APK
+        run: |
+          SDK_DIR=${ANDROID_SDK_ROOT:-$ANDROID_HOME}
+          ZIPALIGN=$(find "$SDK_DIR/build-tools" -name zipalign | sort -V | tail -n 1)
+          APKSIGNER=$(find "$SDK_DIR/build-tools" -name apksigner | sort -V | tail -n 1)
+
+          if [ -z "$ZIPALIGN" ] || [ -z "$APKSIGNER" ]; then
+            echo "zipalign/apksigner not found"
+            exit 1
+          fi
+
+          "$ZIPALIGN" -v 4 tizentube_vot_unsigned.apk tizentube_vot_aligned.apk
+          "$APKSIGNER" sign \
+            --ks debug.keystore \
+            --ks-pass pass:android \
+            --key-pass pass:android \
+            --ks-key-alias androiddebugkey \
+            --out tizentube_vot.apk \
+            tizentube_vot_aligned.apk
+
+          "$APKSIGNER" verify --verbose tizentube_vot.apk
+          ls -lh tizentube_vot.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: TizenTubeCobalt-VOT
+          path: tizentube_vot.apk
+          retention-days: 30
