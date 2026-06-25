@@ -21,13 +21,13 @@ jobs:
           curl -Lo apktool.jar \
             https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar
 
-     - name: Download latest TizenTubeCobalt APK
-       run: |
-         API_JSON=$(curl -fsSL https://api.github.com/repos/reisxd/TizenTubeCobalt/releases/latest)
-         APK_URL=$(python3 -c "import json,sys; d=json.loads(sys.argv[1]); urls=[a['browser_download_url'] for a in d.get('assets',[]) if a.get('name','').endswith('.apk')]; pref=[u for u in urls if u.endswith('cobalt-arm.apk')]; print((pref or urls)[0])" "$API_JSON")
-         echo "Downloading: $APK_URL"
-         curl -fL --retry 5 --retry-delay 2 -o tizentube.apk "$APK_URL"
-         unzip -tq tizentube.apk
+      - name: Download latest TizenTubeCobalt APK
+        run: |
+          API_JSON=$(curl -fsSL https://api.github.com/repos/reisxd/TizenTubeCobalt/releases/latest)
+          APK_URL=$(python3 -c "import json,sys; d=json.loads(sys.argv[1]); urls=[a['browser_download_url'] for a in d.get('assets',[]) if a.get('name','').endswith('.apk')]; pref=[u for u in urls if u.endswith('cobalt-arm.apk')]; print((pref or urls)[0])" "$API_JSON")
+          echo "Downloading: $APK_URL"
+          curl -fL --retry 5 --retry-delay 2 -o tizentube.apk "$APK_URL"
+          unzip -tq tizentube.apk
           ls -lh tizentube.apk
 
       - name: Decompile APK
