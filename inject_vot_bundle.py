@@ -6,16 +6,46 @@ MARKER_BEGIN = "/* VOT_INJECTION_BEGIN */"
 MARKER_END = "/* VOT_INJECTION_END */"
 
 
+def looks_like_js_text(path: pathlib.Path) -> bool:
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return False
+
+    if not data or b"\x00" in data[:4096]:
+        return False
+
+    probe = data[:32768]
+    ascii_ratio = sum(1 for b in probe if b in b"\t\n\r" or 32 <= b <= 126) / max(1, len(probe))
+    if ascii_ratio < 0.8:
+        return False
+
+    low = probe.lower()
+    js_tokens = [b"function", b"window", b"document", b"var ", b"const ", b"let "]
+    return any(t in low for t in js_tokens)
+
+
 def select_main_bundle(assets_dir: pathlib.Path) -> pathlib.Path:
-    js_files = [p for p in assets_dir.rglob("*.js") if p.is_file()]
-    if not js_files:
-        raise RuntimeError(f"No JavaScript files found in {assets_dir}")
+    js_files = [p for p in assets_dir.rglob("*.js") if p.is_file() and p.name.lower() != "vot.js"]
+    if js_files:
+        js_files.sort(key=lambda p: p.stat().st_size, reverse=True)
+        return js_files[0]
 
-    candidates = [p for p in js_files if p.name.lower() != "vot.js"]
+    # Fallback: some builds keep runtime JS in non-.js asset blobs.
+    candidates = []
+    for p in assets_dir.rglob("*"):
+        if not p.is_file():
+            continue
+        if p.name.lower() == "vot.js":
+            continue
+        if p.stat().st_size < 2048:
+            continue
+        if looks_like_js_text(p):
+            candidates.append(p)
+
     if not candidates:
-        raise RuntimeError("Only vot.js exists, no runtime bundle to patch")
+        raise RuntimeError("No runtime JS bundle candidate found under assets")
 
-    # Main runtime bundle is typically the largest JS asset.
     candidates.sort(key=lambda p: p.stat().st_size, reverse=True)
     return candidates[0]
 
