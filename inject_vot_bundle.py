@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import pathlib
 import struct
+import gzip
 import sys
 
 MARKER_BEGIN = "/* VOT_INJECTION_BEGIN */"
@@ -118,26 +119,35 @@ def inject_into_cobalt_pak(vot_text: str, assets_dir: pathlib.Path) -> bool:
     for rid, blob in resources.items():
         if len(blob) < 2048:
             continue
-        if b"\x00" in blob[:4096]:
-            continue
-        probe = blob[:65536]
-        ascii_ratio = sum(1 for b in probe if b in b"\t\n\r" or 32 <= b <= 126) / max(1, len(probe))
-        if ascii_ratio < 0.7:
-            continue
-        low = probe.lower()
-        score = 1
-        if any(t in low for t in (b"function", b"window", b"document", b"const ", b"let ", b"class ")):
-            score += 5
-        if b";" in low and b"{" in low:
-            score += 2
-        candidates.append((score, rid, blob))
+        variants = [("plain", blob)]
+        if blob.startswith(b"\x1f\x8b"):
+            try:
+                variants.append(("gzip", gzip.decompress(blob)))
+            except OSError:
+                pass
+
+        for enc, data in variants:
+            if b"\x00" in data[:4096]:
+                continue
+            probe = data[:65536]
+            ascii_ratio = sum(1 for b in probe if b in b"\t\n\r" or 32 <= b <= 126) / max(1, len(probe))
+            if ascii_ratio < 0.7:
+                continue
+            low = probe.lower()
+            score = 1
+            if any(t in low for t in (b"function", b"window", b"document", b"const ", b"let ", b"class ")):
+                score += 5
+            if b";" in low and b"{" in low:
+                score += 2
+            candidates.append((score, rid, data, enc))
 
     if not candidates:
         return False
 
     candidates.sort(key=lambda x: (x[0], len(x[2])), reverse=True)
-    _score, rid, blob = candidates[0]
-    text = blob.decode("utf-8", errors="replace")
+    _score, rid, data, enc = candidates[0]
+    print(f"cobalt_shell.pak candidate count: {len(candidates)}; selected id={rid} encoding={enc}")
+    text = data.decode("utf-8", errors="replace")
     if MARKER_BEGIN in text:
         print(f"VOT marker already present in cobalt_shell.pak resource {rid}, skipping.")
         return True
@@ -152,7 +162,10 @@ def inject_into_cobalt_pak(vot_text: str, assets_dir: pathlib.Path) -> bool:
         + MARKER_END
         + "\n"
     )
-    resources[rid] = injected.encode("utf-8")
+    out = injected.encode("utf-8")
+    if enc == "gzip":
+        out = gzip.compress(out)
+    resources[rid] = out
     write_data_pack(pak, resources, encoding)
     print(f"Injected vot.js into cobalt_shell.pak resource id {rid}")
     return True
