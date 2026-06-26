@@ -23,12 +23,11 @@ jobs:
 
       - name: Download latest TizenTubeCobalt APK
         run: |
-          APK_URL=$(curl -s https://api.github.com/repos/reisxd/TizenTubeCobalt/releases/latest \
-            | grep "browser_download_url.*apk" \
-            | head -1 \
-            | cut -d '"' -f 4)
+          API_JSON=$(curl -fsSL https://api.github.com/repos/reisxd/TizenTubeCobalt/releases/latest)
+          APK_URL=$(python3 -c "import json,sys; d=json.loads(sys.argv[1]); urls=[a['browser_download_url'] for a in d.get('assets',[]) if a.get('name','').endswith('.apk')]; pref=[u for u in urls if u.endswith('cobalt-arm.apk')]; print((pref or urls)[0])" "$API_JSON")
           echo "Downloading: $APK_URL"
-          curl -Lo tizentube.apk "$APK_URL"
+          curl -fL --retry 5 --retry-delay 2 -o tizentube.apk "$APK_URL"
+          unzip -tq tizentube.apk
           ls -lh tizentube.apk
 
       - name: Decompile APK
@@ -41,20 +40,17 @@ jobs:
           cp vot.js apk_out/assets/vot.js
           echo "VOT script copied: $(wc -c < apk_out/assets/vot.js) bytes"
 
-      - name: Show smali structure
+      - name: Show assets candidates
         run: |
-          echo "=== CobaltActivity smali files ==="
-          find apk_out/smali* -name "CobaltActivity*.smali" 2>/dev/null
+          echo "=== Largest files under assets ==="
+          find apk_out/assets -type f -printf "%s %p\n" | sort -nr | head -40
           echo ""
-          echo "=== CobaltActivity\$2 content ==="
-          SMALI=$(find apk_out/smali* -name "CobaltActivity\$2.smali" | head -1)
-          cat "$SMALI"
+          echo "=== JavaScript files under assets ==="
+          find apk_out/assets -type f -name "*.js" -printf "%s %p\n" | sort -nr | head -20
 
-      - name: Patch smali
+      - name: Inject VOT into runtime JS bundle
         run: |
-          SMALI=$(find apk_out/smali* -name "CobaltActivity\$2.smali" | head -1)
-          echo "Patching: $SMALI"
-          python3 patch_smali.py "$SMALI"
+          python3 inject_vot_bundle.py apk_out/assets/vot.js apk_out/assets
 
       - name: Generate keystore
         run: |
