@@ -5,6 +5,37 @@
   var POLL_INTERVAL_MS = 3000;
   var SYNC_THRESHOLD = 0.8;
 
+  // This file REPLACES the native "userScript" URL that io.gh.reisxd's
+  // TizenTube patch fetches on every page load (splash + main YouTube TV
+  // page). That native fetch mechanism is the ONLY proven way to run custom
+  // JS in the live youtube.com/tv page context (Cobalt's cobalt_shell.pak is
+  // a native UI resource bundle, unrelated to the network-loaded page, and
+  // injecting into it has zero effect on the live page).
+  //
+  // To preserve 100% of the original functionality (device-support patches:
+  // SetUserAgent/GetArchitecture/GetBrandAndModel via h5vcc_tizentube, i18n,
+  // etc.) we synchronously fetch and eval the REAL upstream userScript.js
+  // first, exactly mirroring the original native fetch+eval timing, and only
+  // THEN add the Yandex VOT translation overlay on top.
+  var ORIGINAL_USERSCRIPT_URL =
+    'https://cdn.jsdelivr.net/npm/@foxreis/tizentube/dist/userScript.js?v=' +
+    Date.now() + '.' + Math.floor(Math.random() * 1e6);
+
+  (function loadOriginalUserScript() {
+    try {
+      var xhr = new XMLHttpRequest();
+      xhr.open('GET', ORIGINAL_USERSCRIPT_URL, false); // synchronous, matches original timing
+      xhr.send(null);
+      if (xhr.status >= 200 && xhr.status < 300 && xhr.responseText) {
+        (0, eval)(xhr.responseText);
+      } else {
+        console.warn('[VOT] original userScript fetch failed, status=' + xhr.status);
+      }
+    } catch (e) {
+      console.warn('[VOT] failed to load original userScript', e);
+    }
+  })();
+
   // Protobuf utils (port of VotProtoUtils.java)
   function writeVarint(buf, val) {
     var v = val >>> 0;
@@ -161,7 +192,21 @@
   }
 
   function getVideoId() {
-    var m = location.href.match(/[?&]v=([a-zA-Z0-9_-]{11})/);
+    try {
+      var u = new URL(location.href);
+      var v = u.searchParams.get('v');
+      if (v && /^[a-zA-Z0-9_-]{11}$/.test(v)) return v;
+
+      if (u.hostname.indexOf('youtu.be') !== -1) {
+        var shortId = u.pathname.replace(/^\/+/, '').split('/')[0];
+        if (/^[a-zA-Z0-9_-]{11}$/.test(shortId)) return shortId;
+      }
+
+      var pathMatch = u.pathname.match(/\/(shorts|live|watch)\/([a-zA-Z0-9_-]{11})/);
+      if (pathMatch) return pathMatch[2];
+    } catch (e) {}
+
+    var m = location.href.match(/(?:[?&]v=|\/(?:shorts|live)\/)([a-zA-Z0-9_-]{11})/);
     return m ? m[1] : null;
   }
 
@@ -187,7 +232,7 @@
     }
     var a = document.createElement('audio');
     a.src = url;
-    a.volume = 0.90;
+    a.volume = 1.0;
     a.style.display = 'none';
     document.body.appendChild(a);
     S.audioEl = a;
@@ -271,6 +316,7 @@
   // UI
   function buildUI() {
     if (document.getElementById('vot-btn')) return;
+    if (!document.body) return;
 
     var wrap = document.createElement('div');
     wrap.id = 'vot-wrap';
@@ -328,17 +374,36 @@
   setInterval(function() {
     if (location.href === lastUrl) return;
     lastUrl = location.href;
+
+    // Cobalt/TV apps can rebuild layout during SPA navigation.
+    ensureUI();
+
     if (S.on) {
       stopVOT();
       setTimeout(startVOT, 1500);
     }
   }, 1500);
 
-  // Init
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', buildUI);
-  } else {
+  function ensureUI() {
+    if (document.getElementById('vot-btn')) return true;
+    if (!document.body) return false;
     buildUI();
+    return !!document.getElementById('vot-btn');
   }
+
+  // Init: retry for apps where body/overlay root appears after DOMContentLoaded.
+  var initTry = 0;
+  var initTimer = setInterval(function() {
+    if (ensureUI() || initTry++ > 20) {
+      clearInterval(initTimer);
+    }
+  }, 500);
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', ensureUI);
+  } else {
+    ensureUI();
+  }
+
 
 })();
