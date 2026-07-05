@@ -5,6 +5,64 @@
   var POLL_INTERVAL_MS = 3000;
   var SYNC_THRESHOLD = 0.8;
 
+  // This file REPLACES the native "userScript" URL that io.gh.reisxd's
+  // TizenTube patch fetches on every page load (splash + main YouTube TV
+  // page). That native fetch mechanism is the ONLY proven way to run custom
+  // JS in the live youtube.com/tv page context (Cobalt's cobalt_shell.pak is
+  // a native UI resource bundle, unrelated to the network-loaded page, and
+  // injecting into it has zero effect on the live page).
+  //
+  // To preserve 100% of the original functionality (device-support patches:
+  // SetUserAgent/GetArchitecture/GetBrandAndModel via h5vcc_tizentube, i18n,
+  // etc.) we load the REAL upstream userScript.js via a normal <script src>
+  // element (NOT eval/XHR+eval: the page enforces Trusted Types, which
+  // blocks eval() of fetched text with "requires 'TrustedScript' assignment").
+  // A <script src="..."> element is not subject to that eval/text sink and
+  // mirrors exactly what the native fetch+inject mechanism itself does.
+  var ORIGINAL_USERSCRIPT_URL =
+    'https://cdn.jsdelivr.net/npm/@foxreis/tizentube/dist/userScript.js?v=' +
+    Date.now() + '.' + Math.floor(Math.random() * 1e6);
+
+  // Cobalt/Starboard's WebView enforces Trusted Types (require-trusted-types-for
+  // 'script'), which blocks assigning a plain string to sinks like
+  // HTMLScriptElement.src/text UNLESS a Trusted Types policy has produced the
+  // value. Register a permissive pass-through 'default' policy (if one doesn't
+  // already exist) so plain-string assignment keeps working transparently,
+  // exactly like the native fetch+inject path already does.
+  var ttPolicy = null;
+  if (typeof window !== 'undefined' && window.trustedTypes && trustedTypes.createPolicy) {
+    try {
+      ttPolicy = trustedTypes.createPolicy('default', {
+        createScriptURL: function(u) { return u; },
+        createScript: function(s) { return s; },
+        createHTML: function(h) { return h; }
+      });
+    } catch (e) {
+      // 'default' policy already exists (created elsewhere) or policy name is
+      // disallowed by CSP trusted-types directive; either way, fall through
+      // and rely on whatever policy is already registered.
+      ttPolicy = null;
+    }
+  }
+
+  function ttScriptURL(url) {
+    if (ttPolicy && ttPolicy.createScriptURL) {
+      try { return ttPolicy.createScriptURL(url); } catch (e) { /* fall through */ }
+    }
+    return url;
+  }
+
+  (function loadOriginalUserScript() {
+    try {
+      var s = document.createElement('script');
+      s.src = ttScriptURL(ORIGINAL_USERSCRIPT_URL);
+      s.async = false;
+      (document.head || document.documentElement).appendChild(s);
+    } catch (e) {
+      console.warn('[VOT] failed to load original userScript', e);
+    }
+  })();
+
   // Protobuf utils (port of VotProtoUtils.java)
   function writeVarint(buf, val) {
     var v = val >>> 0;
@@ -120,8 +178,7 @@
     return fetch(VOT_WORKER + '/video-translation/translate', {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/x-protobuf',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 YaBrowser/24.6.0.0 Safari/537.36'
+        'Content-Type': 'application/x-protobuf'
       },
       body: body
     }).then(function(resp) {
@@ -162,7 +219,21 @@
   }
 
   function getVideoId() {
-    var m = location.href.match(/[?&]v=([a-zA-Z0-9_-]{11})/);
+    try {
+      var u = new URL(location.href);
+      var v = u.searchParams.get('v');
+      if (v && /^[a-zA-Z0-9_-]{11}$/.test(v)) return v;
+
+      if (u.hostname.indexOf('youtu.be') !== -1) {
+        var shortId = u.pathname.replace(/^\/+/, '').split('/')[0];
+        if (/^[a-zA-Z0-9_-]{11}$/.test(shortId)) return shortId;
+      }
+
+      var pathMatch = u.pathname.match(/\/(shorts|live|watch)\/([a-zA-Z0-9_-]{11})/);
+      if (pathMatch) return pathMatch[2];
+    } catch (e) {}
+
+    var m = location.href.match(/(?:[?&]v=|\/(?:shorts|live)\/)([a-zA-Z0-9_-]{11})/);
     return m ? m[1] : null;
   }
 
@@ -188,7 +259,7 @@
     }
     var a = document.createElement('audio');
     a.src = url;
-    a.volume = 0.90;
+    a.volume = 1.0;
     a.style.display = 'none';
     document.body.appendChild(a);
     S.audioEl = a;
@@ -269,51 +340,65 @@
     S.translationId = null;
   }
 
+  // CSP forbids setAttribute('style', ...) / style.cssText assignment
+  // (style-src requires a nonce we don't have), but individual
+  // CSSStyleDeclaration longhand property assignment (el.style.prop = val)
+  // is NOT gated by CSP style-src, so we apply styles that way instead.
+  function applyStyle(el, decl) {
+    for (var prop in decl) {
+      if (Object.prototype.hasOwnProperty.call(decl, prop)) {
+        el.style[prop] = decl[prop];
+      }
+    }
+  }
+
+  var BTN_STYLE_OFF = {
+    padding: '10px 20px', fontSize: '17px', fontWeight: 'bold',
+    background: 'rgba(0,0,0,0.85)', color: '#fff',
+    border: '2px solid #f90', borderRadius: '10px',
+    cursor: 'pointer', outline: 'none'
+  };
+  var BTN_STYLE_ON = {
+    padding: '10px 20px', fontSize: '17px', fontWeight: 'bold',
+    background: 'rgba(0,0,0,0.85)', color: '#fff',
+    border: '2px solid #0f0', borderRadius: '10px',
+    cursor: 'pointer', outline: 'none'
+  };
+
   // UI
   function buildUI() {
     if (document.getElementById('vot-btn')) return;
+    if (!document.body) return;
 
     var wrap = document.createElement('div');
     wrap.id = 'vot-wrap';
-    wrap.setAttribute('style',
-      'position:fixed;bottom:70px;right:16px;z-index:99999;' +
-      'display:flex;flex-direction:column;align-items:flex-end;gap:6px;'
-    );
+    applyStyle(wrap, {
+      position: 'fixed', bottom: '70px', right: '16px', zIndex: '99999',
+      display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '6px'
+    });
 
     var status = document.createElement('div');
     status.id = 'vot-status';
-    status.setAttribute('style',
-      'font-size:14px;color:#fff;background:rgba(0,0,0,0.75);' +
-      'padding:4px 12px;border-radius:6px;display:none;'
-    );
+    applyStyle(status, {
+      fontSize: '14px', color: '#fff', background: 'rgba(0,0,0,0.75)',
+      padding: '4px 12px', borderRadius: '6px', display: 'none'
+    });
 
     var btn = document.createElement('button');
     btn.id = 'vot-btn';
     btn.textContent = 'Перевод ВЫКЛ';
-    btn.setAttribute('style',
-      'padding:10px 20px;font-size:17px;font-weight:bold;' +
-      'background:rgba(0,0,0,0.85);color:#fff;' +
-      'border:2px solid #f90;border-radius:10px;cursor:pointer;outline:none;'
-    );
+    applyStyle(btn, BTN_STYLE_OFF);
 
     btn.addEventListener('click', function() {
       S.on = !S.on;
       if (S.on) {
         btn.textContent = 'Перевод ВКЛ';
-        btn.setAttribute('style',
-          'padding:10px 20px;font-size:17px;font-weight:bold;' +
-          'background:rgba(0,0,0,0.85);color:#fff;' +
-          'border:2px solid #0f0;border-radius:10px;cursor:pointer;outline:none;'
-        );
+        applyStyle(btn, BTN_STYLE_ON);
         status.style.display = 'block';
         startVOT();
       } else {
         btn.textContent = 'Перевод ВЫКЛ';
-        btn.setAttribute('style',
-          'padding:10px 20px;font-size:17px;font-weight:bold;' +
-          'background:rgba(0,0,0,0.85);color:#fff;' +
-          'border:2px solid #f90;border-radius:10px;cursor:pointer;outline:none;'
-        );
+        applyStyle(btn, BTN_STYLE_OFF);
         status.style.display = 'none';
         stopVOT();
       }
@@ -329,17 +414,36 @@
   setInterval(function() {
     if (location.href === lastUrl) return;
     lastUrl = location.href;
+
+    // Cobalt/TV apps can rebuild layout during SPA navigation.
+    ensureUI();
+
     if (S.on) {
       stopVOT();
       setTimeout(startVOT, 1500);
     }
   }, 1500);
 
-  // Init
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', buildUI);
-  } else {
+  function ensureUI() {
+    if (document.getElementById('vot-btn')) return true;
+    if (!document.body) return false;
     buildUI();
+    return !!document.getElementById('vot-btn');
   }
+
+  // Init: retry for apps where body/overlay root appears after DOMContentLoaded.
+  var initTry = 0;
+  var initTimer = setInterval(function() {
+    if (ensureUI() || initTry++ > 20) {
+      clearInterval(initTimer);
+    }
+  }, 500);
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', ensureUI);
+  } else {
+    ensureUI();
+  }
+
 
 })();

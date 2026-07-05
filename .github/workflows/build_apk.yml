@@ -23,38 +23,34 @@ jobs:
 
       - name: Download latest TizenTubeCobalt APK
         run: |
-          APK_URL=$(curl -s https://api.github.com/repos/reisxd/TizenTubeCobalt/releases/latest \
-            | grep "browser_download_url.*apk" \
-            | head -1 \
-            | cut -d '"' -f 4)
+          API_JSON=$(curl -fsSL https://api.github.com/repos/reisxd/TizenTubeCobalt/releases/latest)
+          APK_URL=$(python3 -c "import json,sys; d=json.loads(sys.argv[1]); urls=[a['browser_download_url'] for a in d.get('assets',[]) if a.get('name','').endswith('.apk')]; pref=[u for u in urls if u.endswith('cobalt-arm.apk')]; print((pref or urls)[0])" "$API_JSON")
           echo "Downloading: $APK_URL"
-          curl -Lo tizentube.apk "$APK_URL"
+          curl -fL --retry 5 --retry-delay 2 -o tizentube.apk "$APK_URL"
+          unzip -tq tizentube.apk
           ls -lh tizentube.apk
 
       - name: Decompile APK
         run: |
           java -jar apktool.jar d tizentube.apk -o apk_out -f
 
-      - name: Copy VOT script to assets
+      # The live YouTube TV page (https://www.youtube.com/tv/...) is loaded
+      # over the network, NOT from local assets/cobalt_shell.pak. The ONLY
+      # proven mechanism to run custom JS inside that live page is the
+      # native "userScript" URL fetch baked into libchrobalt.so, which the
+      # app calls on every page load (splash + main page). We redirect that
+      # URL to our own hosted vot.js, which itself synchronously loads the
+      # REAL upstream userScript.js first (preserving 100% of original
+      # device-support patches: SetUserAgent/GetArchitecture/GetBrandAndModel
+      # via h5vcc_tizentube), then adds the Yandex VOT translation overlay.
+      #
+      # IMPORTANT: the replacement URL must be a real http(s) URL (native
+      # fetcher does not support file:// or android_asset:// schemes) and
+      # must fit within the original string's byte length, since the native
+      # code appends a cache-busting suffix by plain concatenation.
+      - name: Patch embedded userScript URL to load vot.js (preserves device patches)
         run: |
-          mkdir -p apk_out/assets
-          cp vot.js apk_out/assets/vot.js
-          echo "VOT script copied: $(wc -c < apk_out/assets/vot.js) bytes"
-
-      - name: Show smali structure
-        run: |
-          echo "=== CobaltActivity smali files ==="
-          find apk_out/smali* -name "CobaltActivity*.smali" 2>/dev/null
-          echo ""
-          echo "=== CobaltActivity\$2 content ==="
-          SMALI=$(find apk_out/smali* -name "CobaltActivity\$2.smali" | head -1)
-          cat "$SMALI"
-
-      - name: Patch smali
-        run: |
-          SMALI=$(find apk_out/smali* -name "CobaltActivity\$2.smali" | head -1)
-          echo "Patching: $SMALI"
-          python3 patch_smali.py "$SMALI"
+          python3 patch_tizentube_userscript_url.py apk_out
 
       - name: Generate keystore
         run: |
