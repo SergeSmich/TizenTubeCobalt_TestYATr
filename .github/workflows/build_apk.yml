@@ -34,23 +34,13 @@ jobs:
         run: |
           java -jar apktool.jar d tizentube.apk -o apk_out -f
 
-      # The live YouTube TV page (https://www.youtube.com/tv/...) is loaded
-      # over the network, NOT from local assets/cobalt_shell.pak. The ONLY
-      # proven mechanism to run custom JS inside that live page is the
-      # native "userScript" URL fetch baked into libchrobalt.so, which the
-      # app calls on every page load (splash + main page). We redirect that
-      # URL to our own hosted vot.js, which itself synchronously loads the
-      # REAL upstream userScript.js first (preserving 100% of original
-      # device-support patches: SetUserAgent/GetArchitecture/GetBrandAndModel
-      # via h5vcc_tizentube), then adds the Yandex VOT translation overlay.
-      #
-      # IMPORTANT: the replacement URL must be a real http(s) URL (native
-      # fetcher does not support file:// or android_asset:// schemes) and
-      # must fit within the original string's byte length, since the native
-      # code appends a cache-busting suffix by plain concatenation.
       - name: Patch embedded userScript URL to load vot.js (preserves device patches)
         run: |
           python3 patch_tizentube_userscript_url.py apk_out
+
+      - name: Patch CSP connect-src allowlist to permit the VOT worker
+        run: |
+          python3 patch_csp_connect_src.py apk_out
 
       - name: Generate keystore
         run: |
