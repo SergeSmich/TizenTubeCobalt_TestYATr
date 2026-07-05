@@ -36,7 +36,7 @@ import sys
 # 22 + 1 + 13 + 1 = 37 bytes total.
 OLD_BLOCK = b"dearrow-thumb.ajay.app\x00tizentube.app\x00"
 
-WORKER_HOST = b"vot-worker.kload.workers.dev"  # 28 bytes
+WORKER_HOST = b"vot.sormat1.workers.dev"  # 23 bytes
 
 # Rebuild a same-length block: worker host, NUL terminator, then NUL padding.
 # The pointer that used to reference `dearrow-thumb.ajay.app` now reads
