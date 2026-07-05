@@ -24,7 +24,7 @@ OLD_URL = b"https://cdn.jsdelivr.net/npm/@foxreis/tizentube/dist/userScript.js?v
 # (https://cdn.jsdelivr.net/gh/<owner>/<repo>@<ref>/<path>). A dedicated,
 # short-named public repo (SergeSmich/v) is used so the full URL still
 # fits within len(OLD_URL) bytes.
-NEW_URL = b"https://cdn.jsdelivr.net/gh/SergeSmich/v@main/vot.js?v="
+NEW_URL = b"https://cdn.jsdelivr.net/gh/SergeSmich/v@2a0e952/vot.js?v="
 
 
 def patch_lib(path: pathlib.Path) -> int:
