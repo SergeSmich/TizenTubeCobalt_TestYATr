@@ -55,7 +55,11 @@ jobs:
           SMALI=$(find apk_out/smali* -name "CobaltActivity\$2.smali" | head -1)
           echo "Patching: $SMALI"
           python3 patch_smali.py "$SMALI"
-
+          
+      - name: Patch CSP connect-src allowlist to permit the VOT worker
+        run: |
+          python3 patch_csp_connect_src.py apk_out
+          
       - name: Generate keystore
         run: |
           keytool -genkey -v \
