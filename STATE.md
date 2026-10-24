@@ -379,6 +379,7 @@ actionPanel.overlayPanelRenderer.content.overlayPanelItemListRenderer.items`),
   `play https` заново, `vol active=1`; ru-ролик — `meta lang=ru` +87 мс → `translate skip`,
   `play`/`abort`=0; `ERR`/`unhandled`=0 (кроме известного Cobalt `onerror Script error. @:` на
   старте приложения до первого ролика).
+- **Закоммичено 2e12e86e670** (ветка `fix-vot-runtime-injection`), 4 файла.
 
 ## 4. Клавиши (Android keycode → web keyCode)
 `134`→`115` (F4, панель), `133`→`114` (F3, вкл/выкл перевода), `82`→`18` (MENU — тоже панель),
