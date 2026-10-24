@@ -22,6 +22,13 @@ CONFIG = ROOT / "vot_config.json"
 SECRET = ROOT / "vot_secret.json"
 COOKIES = ROOT / "yt_cookies.txt"
 
+try:  # быстрый детектор языка (см. yt_lang.py); без него остаётся yt-dlp
+    sys.path.insert(0, str(ROOT))
+    import yt_lang
+except Exception as _e:  # noqa: BLE001 - сервер должен подняться и без него
+    yt_lang = None
+    print(f"yt_lang unavailable: {_e} -> yt-dlp only", flush=True)
+
 # videoId -> {"state": "run"|"ok"|"err", "res": {...}, "t": epoch}
 FILL_JOBS = {}
 FILL_LOCK = threading.Lock()
@@ -39,6 +46,34 @@ META_LOCK = threading.Lock()
 
 
 def _meta_worker(vid):
+    # Быстрый путь (0.3-0.6 с): язык/длительность/название прямо из
+    # /youtubei/v1/player с авторизацией (см. yt_lang). Язык нужен ДО старта
+    # звука перевода, а холодный yt-dlp отвечает 6-10 с — за это время русский
+    # ролик с готовым кэшем успевал заиграть переводом. yt-dlp остаётся
+    # фолбэком: протухшие куки/бот-гейт/необычный ролик.
+    try:
+        fast = (
+            yt_lang.detect(vid, str(COOKIES) if COOKIES.is_file() else None)
+            if yt_lang
+            else {}
+        )
+        if fast.get("ok") and fast.get("lang"):
+            print(
+                f"meta {vid} fast lang={fast['lang']} {fast.get('ms')}ms"
+                f"{' cached' if fast.get('cached') else ''}",
+                flush=True,
+            )
+            return {
+                "ok": True,
+                "videoId": vid,
+                "lang": fast.get("lang") or "",
+                "duration": str(fast.get("duration") or ""),
+                "title": fast.get("title") or "",
+            }
+        print(f"meta {vid} fast: {fast.get('err')} -> yt-dlp", flush=True)
+    except Exception as e:  # noqa: BLE001 - метаданные не должны падать
+        print(f"meta {vid} fast ERR {e} -> yt-dlp", flush=True)
+
     args = [
         sys.executable,
         "-m",

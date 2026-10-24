@@ -31,6 +31,15 @@
   // How long we wait for the page player to actually land on 0:00 when we
   // rewind the video as the translation starts.
   var RESTART_MAX_WAIT = 4000;
+  // Сколько ждём язык оригинала, когда перевод уже готов, а язык ещё неизвестен
+  // (перевод не запускаем, пока не знаем, что ролик не на исключённом языке).
+  // Быстрый детектор на ПК отвечает за ~0.4-1 с, yt-dlp-фолбэк — до 10 с;
+  // таймаут ограничивает худший случай, чтобы перевод не потерялся навсегда.
+  var LANG_GATE_MS = 6000;
+  // Паузы между опросами языка оригинала: первый ответ ПК отдаёт за 0.4-1 с
+  // (быстрый детектор), поэтому первые попытки частые — иначе язык приезжал
+  // только через 2.5 с и гейт старта зря тормозил.
+  var META_GAPS = [400, 600, 900, 1500, 2500, 2500, 2500, 2500, 2500];
   var MARK = 'VOT-OVERLAY-V14';
 
   var state = {
@@ -80,6 +89,9 @@
     paintOn: null,
     // URL перевода, готового к запуску: ролик был на паузе, стартуем вместе с ним.
     pendingPlay: null,
+    // Перевод уже готов, но язык оригинала ещё неизвестен: держим звук, пока
+    // не выясним, что ролик не на исключённом языке (см. gateReady).
+    gate: null,
     // id ролика, для которого пользователь включил перевод кнопкой: подсветка
     // кнопки должна стать белой СРАЗУ по нажатию, ещё до ответа Яндекса.
     wantOn: null,
@@ -123,6 +135,8 @@
   } catch (e) { }
 
   // ---- on-screen status pill (styled via CSSOM — inline style attr is CSP-blocked)
+  var barEl = null, barFill = null, barTimer = null, barStart = 0, barRem = 0;
+
   function ensureStatus() {
     if (statusEl) return statusEl;
     try {
@@ -145,20 +159,82 @@
       s.pointerEvents = 'none';
       s.whiteSpace = 'pre-wrap';
       s.wordBreak = 'break-word';
-      el.textContent = MARK + ' — ожидание видео';
+      // Шкала ожидания перевода живёт отдельным узлом: textContent у контейнера
+      // стёр бы её, поэтому текст пишем в дочерний <div>.
+      var txt = document.createElement('div');
+      txt.id = 'vot-status-text';
+      txt.textContent = MARK + ' — ожидание видео';
+      el.appendChild(txt);
+      var bar = document.createElement('div');
+      var bs = bar.style;
+      bs.height = '4px';
+      bs.marginTop = '8px';
+      bs.borderRadius = '2px';
+      bs.background = 'rgba(255,255,255,0.18)';
+      bs.overflow = 'hidden';
+      bs.display = 'none';
+      var fill = document.createElement('div');
+      var fs = fill.style;
+      fs.height = '100%';
+      fs.width = '0%';
+      fs.background = '#f5a623';
+      bar.appendChild(fill);
+      el.appendChild(bar);
       (document.body || document.documentElement).appendChild(el);
       statusEl = el;
+      barEl = bar;
+      barFill = fill;
     } catch (e) { }
     return statusEl;
   }
 
-  function setStatus(text, color) {
+  // CSS-анимации в Cobalt не запускаются (проверено), поэтому шкалу двигаем
+  // покадрово из JS: 12 кадров/с хватает и почти не грузит ТВ.
+  function barTick() {
+    if (!barFill) return;
+    var t = (Date.now() - barStart) / 1000;
+    if (t < 0) t = 0;
+    if (barRem > 0) {
+      // Доля = сколько ждём / (сколько ждём + сколько осталось). Оценка Яндекса
+      // завышена в ~3 раза, но шкала честная: только растёт и не доходит до
+      // 100%, пока сервер не отдаст перевод.
+      barFill.style.marginLeft = '0%';
+      barFill.style.width = Math.min(92, (t / (t + barRem)) * 100).toFixed(1) + '%';
+    } else {
+      // Подсказки remaining нет — бегущий сегмент: видно, что процесс живой.
+      barFill.style.width = '26%';
+      barFill.style.marginLeft = (((Date.now() - barStart) % 1400) / 1400 * 74).toFixed(1) + '%';
+    }
+    barTimer = setTimeout(barTick, 80);
+  }
+
+  // prog: число (осталось секунд, шкала растёт) | 'wait' (бегущий сегмент) |
+  // undefined (прячем шкалу — перевод готов/ошибка).
+  function setProgress(prog) {
+    if (!barEl) return;
+    if (prog === undefined || prog === null || prog === false) {
+      if (barTimer) { clearTimeout(barTimer); barTimer = null; }
+      barStart = 0;
+      barRem = 0;
+      barEl.style.display = 'none';
+      return;
+    }
+    if (!barStart) barStart = Date.now();
+    barRem = (typeof prog === 'number' && isFinite(prog) && prog > 0) ? prog : 0;
+    barEl.style.display = 'block';
+    if (!barTimer) barTimer = setTimeout(barTick, 0);
+  }
+
+  function setStatus(text, color, prog) {
     try { state.uiStatus = String(text || ''); } catch (e0) { }
     try {
       var el = ensureStatus();
       if (!el) return;
-      el.textContent = text;
+      var txt = el.firstChild;
+      if (txt && txt.nodeType === 1) txt.textContent = text;
+      else el.textContent = text;
       el.style.borderLeft = '4px solid ' + (color || '#90a4ae');
+      setProgress(prog);
     } catch (e) { }
   }
 
@@ -519,7 +595,7 @@
         log('failaudio ok ' + JSON.stringify(r));
         if (r && r.skipped) {
           // Config says "skip": keep polling and let Yandex decide.
-          setStatus('Перевод: жду решения сервера…', '#f5a623');
+          setStatus('Перевод: жду решения сервера…', '#f5a623', 'wait');
           poll(id, dur, 60);
           return;
         }
@@ -543,18 +619,18 @@
     if (state.audioUploaded) { poll(id, dur, 30); return; }
     state.uploading = true;
     state.translationId = tid;
-    setStatus('Перевод: ищу исходный звук…', '#f5a623');
+    setStatus('Перевод: ищу исходный звук…', '#f5a623', 'wait');
     log('audio lookup id=' + id + ' tid=' + tid);
     innertubeAudio(id, function (a) {
       log('audio src itag=' + a.itag + ' url=' + String(a.url).slice(0, 60));
-      setStatus('Перевод: скачиваю и загружаю звук…\nitag=' + a.itag, '#f5a623');
+      setStatus('Перевод: скачиваю и загружаю звук…\nitag=' + a.itag, '#f5a623', 'wait');
       http('POST', '/audio',
         { videoUrl: watchUrl(id), translationId: tid, audioUrl: a.url, itag: a.itag },
         function (r) {
           state.uploading = false;
           state.audioUploaded = true;
           log('audio upload ok size=' + r.size);
-          setStatus('Перевод: звук загружен, жду перевод…', '#f5a623');
+          setStatus('Перевод: звук загружен, жду перевод…', '#f5a623', 'wait');
           poll(id, dur, 5);
         },
         function (e) { state.uploading = false; state.busy = false; setStatus('Перевод: не удалось загрузить звук\n' + e, '#e53935'); log('audio upload ERR ' + e); });
@@ -576,7 +652,7 @@
     state.busy = false;
     var tidPc = String((r && r.translationId) || state.translationId || '');
     log(why + ' -> pc fill id=' + id + ' tid=' + tidPc + ' lang=' + state.lang);
-    setStatus('Перевод: ПК готовит звук…\nобычно до минуты', '#f5a623');
+    setStatus('Перевод: ПК готовит звук…\nобычно до минуты', '#f5a623', 'wait');
     http('POST', '/fill',
       { videoId: id, duration: dur, tid: tidPc, lang: state.lang },
       function (fr) {
@@ -608,7 +684,7 @@
       var alt = (state.lang === 'en') ? 'auto' : 'en';
       state.busy = false;
       log(why + ' -> other shard lang=' + alt);
-      setStatus('Перевод: ищу в другом кэше…', '#f5a623');
+      setStatus('Перевод: ищу в другом кэше…', '#f5a623', 'wait');
       setTimeout(function () { if (state.curId === id) startTranslation(id, dur, alt); }, 200);
       return true;
     }
@@ -642,13 +718,13 @@
       maybeSkipNow(id, rl);
       if (state.skipLangBlock === id) { state.busy = false; return; }
     }
-    if (r.status === 1 && r.audioUrl) { state.busy = false; onReady(r.audioUrl); return; }
+    if (r.status === 1 && r.audioUrl) { state.busy = false; gateReady(id, r.audioUrl, false); return; }
     // status 5 = partial_ready: the audio URL already works, only the tail of
     // the video is still being translated. Start playing right away instead
     // of waiting for the full file (~20 s later).
     if (r.status === 5 && r.audioUrl) {
       state.busy = false;
-      onPartial(r.audioUrl);
+      gateReady(id, r.audioUrl, true);
       poll(id, dur, r.remaining != null ? r.remaining : fallbackRem);
       return;
     }
@@ -719,7 +795,7 @@
       // poll() sets its own status text, so set ours after it to keep the
       // "PC is preparing the audio" message visible during the whole wait.
       poll(id, dur, 2);
-      setStatus('Перевод: ПК готовит звук…\nещё до ' + left + 'с', '#f5a623');
+      setStatus('Перевод: ПК готовит звук…\nещё до ' + left + 'с', '#f5a623', left > 0 ? left : 'wait');
       return;
     }
     if (r.status === 0) {
@@ -753,7 +829,7 @@
       if (!state.retried && r.shouldRetry !== false && /позже|later|try/i.test(msg)) {
         state.retried = true;
         log('retry after status=0 msg=' + msg);
-        setStatus('Перевод: повторяю запрос…', '#f5a623');
+        setStatus('Перевод: повторяю запрос…', '#f5a623', 'wait');
         setTimeout(function () { if (state.curId === id) startTranslation(id, dur); }, 2000);
         return;
       }
@@ -1102,7 +1178,7 @@
       delay = Math.min(Math.max(POLL_BASE, rem * 1000), POLL_MAX);
     }
     setStatus((state.active ? 'Перевод: играю, доготовится…' : 'Перевод: в очереди/переводится…') +
-      (rem > 0 ? ' (~' + rem + 'с)' : ''), '#f5a623');
+      (rem > 0 ? ' (~' + rem + 'с)' : ''), '#f5a623', rem > 0 ? rem : 'wait');
     log('poll in ' + (delay / 1000).toFixed(0) + 's rem=' + rem + ' n=' + state.polls);
     setTimeout(function () {
       // За время ожидания перевод мог быть отменён (пришёл язык из skipLang).
@@ -1213,6 +1289,62 @@
     });
   }
 
+  // Перевод готов, но язык оригинала ещё не известен. Раньше звук стартовал
+  // сразу, и русский ролик, у которого уже был готовый перевод в кэше Яндекса,
+  // успевал заиграть переводом на несколько секунд — пока с ПК не приезжал язык
+  // и «исключённый язык» не гасил звук. Теперь держим запуск, пока язык не
+  // придёт (быстрый детектор на ПК ~0.4-1 с), но не дольше LANG_GATE_MS:
+  // оригинал при этом продолжает играть, паузы нет.
+  function gateReady(id, url, partial) {
+    var skip = langBase(uiPref('skipLang', 'ru'));
+    // Правило выключено или язык уже известен — обычный путь без задержки.
+    if (!skip || state.origLang || state.forceTranslate === id) {
+      if (partial) onPartial(url); else onReady(url);
+      return;
+    }
+    var gateMs = Number((state.cfg && state.cfg.langGateMs) || LANG_GATE_MS);
+    if (!(gateMs > 0)) gateMs = LANG_GATE_MS;
+    state.gate = { id: id, url: url, partial: !!partial, until: Date.now() + gateMs };
+    setStatus('Перевод: готов, проверяю язык ролика…', '#f5a623', 'wait');
+    log('lang gate wait id=' + id + ' url=' + String(url).slice(0, 40) +
+      ' max=' + Math.round(gateMs) + 'ms');
+
+    function deliver(g) {
+      state.gate = null;
+      if (state.curId !== id) return;
+      if (g.partial) onPartial(g.url); else onReady(g.url);
+    }
+
+    function tick() {
+      var g = state.gate;
+      if (!g || g.id !== id) return; // гейт снят (новый ролик/новый ответ)
+      if (state.curId !== id) { state.gate = null; return; }
+      if (state.skipLangBlock === id) {
+        state.gate = null;
+        log('lang gate: lang excluded -> no audio');
+        return;
+      }
+      if (state.offForId === id || uiPref('translate.enabled', true) === false) {
+        state.gate = null;
+        log('lang gate: translate disabled -> drop');
+        return;
+      }
+      if (state.origLang) {
+        log('lang gate: lang=' + state.origLang + ' -> play');
+        deliver(g);
+        return;
+      }
+      if (Date.now() >= g.until) {
+        log('lang gate: lang unknown -> start anyway');
+        deliver(g);
+        return;
+      }
+      setTimeout(tick, 200);
+    }
+
+    setTimeout(tick, 200);
+  }
+
   function onPartial(url) {
     if (state.curUrl === url) return;
     state.partial = true;
@@ -1241,6 +1373,9 @@
 
   // Stop the bridge player (used on pause/ended/leave) and forget the session.
   function stopAudio(clearTranslation) {
+    // Гейт держит готовый перевод до прихода языка: если звука ещё нет
+    // (state.active=false), ранний return ниже не должен оставлять его живым.
+    if (clearTranslation) state.gate = null;
     if (!state.active && !state.audioPaused) return;
     state.active = false;
     state.audioPaused = false;
@@ -1275,7 +1410,7 @@
         state.audioPaused = true;
         http('POST', '/pause', { }, function () { }, function () { });
       }
-      if (pageGone) { stopAudio(false); return; }
+      if (pageGone) { state.gate = null; stopAudio(false); return; }
       setTimeout(syncLoop, SYNC_INTERVAL);
       return;
     }
@@ -1361,6 +1496,7 @@
     state.offForId = null;
     state.wantOn = null;
     state.pendingPlay = null;
+    state.gate = null;
     state.loop = false;
     state.partial = false;
     state.curUrl = null;
@@ -1523,17 +1659,19 @@
       + lang + ' matches skipLang=' + skip + ' id=' + id);
     state.busy = false;
     state.pendingPlay = null;
+    state.gate = null;
     if (wasRunning) stopAudio(true);
     setStatus('Перевод: ролик на языке «' + langLabel(lang) + '»\n(исключён в настройках)', '#90a4ae');
     schedulePaint();
   }
 
   // Язык оригинала: на ТВ-сборке ytInitialPlayerResponse нет, поэтому язык
-  // спрашиваем у ПК (yt-dlp metadata); нужен для пункта «не переводить с языка».
-  // Прямой запрос к ПК (http://192.168.1.186) из HTTPS-страницы блокируется как
-  // mixed content, поэтому идём через мост: /fill_status он уже проксирует на ПК,
-  // а ПК дописывает в ответ lang/title (с кэшем и фоновой догрузкой yt-dlp).
-  // Пока ПК не успел — повторяем опрос.
+  // спрашиваем у ПК; нужен для правила «не переводить с языка» и для гейта
+  // запуска звука (gateReady). Прямой запрос к ПК (http://192.168.1.186) из
+  // HTTPS-страницы блокируется как mixed content, поэтому идём через мост:
+  // /fill_status он уже проксирует на ПК, а ПК дописывает в ответ lang/title
+  // (быстрый детектор /youtubei/v1/player ~0.4-1 с, yt-dlp — фолбэк).
+  // Пока ПК не успел — повторяем опрос по META_GAPS.
   function fetchMeta(id, tries) {
     var n = tries || 0;
     http('GET', '/fill_status?videoId=' + encodeURIComponent(id), null, function (j) {
@@ -1548,14 +1686,19 @@
         }
         return;
       }
-      if (n < 8) setTimeout(function () { fetchMeta(id, n + 1); }, 2500);
-      else log('meta id=' + id + ' lang unknown (pc meta timeout)');
+      if (n < META_GAPS.length) {
+        setTimeout(function () { fetchMeta(id, n + 1); }, META_GAPS[n]);
+      } else {
+        log('meta id=' + id + ' lang unknown (pc meta timeout)');
+      }
     }, function (e) {
       // Сетевая ошибка (ПК перезапускается) — это не «языка нет»: повторяем,
       // иначе ролик навсегда останется без определения языка.
       if (state.curId !== id) return;
       log('meta ERR ' + (e && e.message) + ' try=' + (n + 1));
-      if (n < 8) setTimeout(function () { fetchMeta(id, n + 1); }, 2500);
+      if (n < META_GAPS.length) {
+        setTimeout(function () { fetchMeta(id, n + 1); }, META_GAPS[n]);
+      }
     });
   }
 

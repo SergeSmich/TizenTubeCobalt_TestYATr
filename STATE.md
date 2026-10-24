@@ -315,6 +315,71 @@ actionPanel.overlayPanelRenderer.content.overlayPanelItemListRenderer.items`),
 (0 blocker/major), смоук после чистки: `vol tr=100 orig=10 active=1` → `audio volume 100%`,
 `paint on` на двух роликах подряд, `unhandled`=0, `vol ERR`=0.
 
+## 3zw. Шкала ожидания + быстрый язык оригинала (24.10 22:0x, НА ТВ ПРОВЕРЕНО)
+По просьбе пользователя: пауз нет (оригинал играет), вместо «~224с» — прогресс-шкала;
+и русский ролик с готовым кэшем больше не должен заиграть переводом.
+- `dev_server/vot.js`: в `ensureStatus()` текст вынесен в `#vot-status-text`, добавлены
+  track/fill; `setProgress(prog)`/`barTick()` — покадровый JS-таймер 80 мс (CSS-анимации в
+  Cobalt не идут): ширина = `t/(t+rem)` с кэпом 92 %, без `rem` — бегущий сегмент 26 %.
+  `setStatus(text,color,prog)`; `prog` передан из `poll()` (`rem>0?rem:'wait'`), «ищу/скачиваю
+  звук», «ПК готовит звук», «жду решения сервера», «повторяю запрос», «ищу в другом кэше».
+- **Новый `dev_server/yt_lang.py`** — язык оригинала за 0.4–0.5 с: POST
+  `/youtubei/v1/player` клиентом **WEB** + `Cookie` (мастер-jar, только чтение) +
+  `Authorization: SAPISIDHASH <ts>_<sha1>`; язык = `defaultAudioTrackIndex` →
+  `audioTracks[i].audioTrackId` (`ru`, `en-US.4`), фолбэк `captionTracks[0].languageCode`.
+  Кэш в памяти 6 ч (ошибки 2 мин). Проверено на ПК: `3d02_HVUY7w`→ru (449 мс),
+  `jVpn7jDNzZI`→en-US (466 мс), `dQw4w9WgXcQ`→en (406 мс).
+  Почему так: Яндекс язык в ответе не отдаёт **никогда** (проверено: поле 8 пусто при
+  `""`/`auto`/`en`; полей языка в ответе нет вообще), ANDROID_VR/IOS/ANDROID и голые куки
+  упираются в бот-гейт (1/14 успехов), только `WEB`+`SAPISIDHASH` = 24/24 OK.
+- `dev_server/serve_vot.py::_meta_worker`: сначала `yt_lang.detect()`, при успехе сразу
+  возвращает `lang/duration/title` (0.4 с вместо 6–10 с yt-dlp), иначе — прежний yt-dlp.
+  Мост/протокол не менялись: язык по-прежнему приходит в `/fill_status`.
+- `dev_server/vot.js`: `gateReady(id,url,partial)` — если `skipLang` задан, а язык ещё
+  неизвестен, готовый перевод НЕ играет до прихода языка (статус «готов, проверяю язык
+  ролика…» + бегущая шкала), максимум `LANG_GATE_MS=6000`/`cfg.langGateMs`; при исключённом
+  языке звук не стартует вовсе, при неизвестном по таймауту — `lang unknown -> start anyway`.
+  Гейт снимается при смене ролика, `skipLangBlock`, выключении кнопкой. `META_GAPS`
+  `[400,600,900,1500,2500,2500,2500,2500]` — первые опросы меты частые (язык к ~0.8 с).
+
+**Прогон 24.10 21:56–22:02 (overlay 157 776 B, мост не пересобирался)**:
+- ПК: `meta 3d02_HVUY7w fast lang=ru 506ms`, `meta jVpn7jDNzZI fast lang=en-US 533ms`;
+  `/fill_status` первый раз отдаёт JSON без `lang` (фон), через 1.2 с — `"lang":"ru"`.
+- **Русский `3d02_HVUY7w`**: `watch detected` → `meta lang=ru` **+125 мс** → `translate skip
+  (late meta)` +131 мс; `translate req`/`resp`/`play` = **0**, `translate abort` = **0**.
+  Ролик вообще не попадает в перевод (баг закрыт). Повторный прогон: +131 мс, так же.
+- **Английский `dQw4w9WgXcQ`**: `resp status=1` → `lang gate wait … max=6000ms` → `meta lang=en`
+  через 0.87 с → `play` → `lang gate: lang=en -> play`; gate→play **1.12 с**, watch→play 1.93 с,
+  `vol tr=100 orig=10 active=1`, `audio volume 100%`, `lang unknown -> start anyway` = 0.
+- **Шкала** (`DaeWIAqoEfI`, кэша нет): `status=6 -> pc fill` → `fill queued` → `resp status=2
+  rem=171…144`, подпись «(~171с)» → «(~153с)», полоса **47 px → 88 px** (13 % → 26 %) за 20 с.
+  Скриншоты `%TEMP%\opencode\vot_bar.png` / `vot_bar2.png`.
+- Аномалии (не блокеры): `translate: source lang unknown, starting anyway` для иностранных
+  роликов остаётся (запрос уходит за ~0.14 с до языка — звук всё равно держит гейт);
+  `paint: node not found` один раз сразу после `watch detected`; `btn injected` дважды
+  (дедуп только внутри массива — известное); `unhandled`/`ERR`/`abort` = 0.
+- Заметка: `adb exec-out screencap > file` из PowerShell пишет UTF‑16 (битый PNG) — снимать
+  через `cmd /c "… > file"`.
+- Правки по ревью (minor): `yt_lang.py` — bool-guard для `defaultAudioTrackIndex` и точное
+  совпадение домена куки (`youtube.com` / `*.youtube.com`, ведущая точка срезается);
+  `vot.js` — `state.gate` сбрасывается в начале `stopAudio(true)` (до раннего return) и на
+  `pageGone` (иначе отложенный запуск мог сработать после ухода со страницы);
+  `META_GAPS` = 9 шагов (сумма 15.9 с);
+  `serve_vot.py` — `import yt_lang` наверх в `try/except` (+`sys.path`), без него сервер
+  поднимается и работает на yt-dlp.
+- Смоук после правок 22:26 (overlay 157 960 B): ПК `meta 3d02_HVUY7w fast lang=ru 474ms`,
+  `jVpn7jDNzZI en-US 501ms`, `yt_lang unavailable`/трейсбеков нет; ru-ролик — `translate skip
+  (late meta)` + `meta lang=ru`, `play`/`abort` = 0; en `dQw4w9WgXcQ` — watch→meta 0.53 с,
+  `play https` на 2.13 с, `audio volume 100%`; переключения вперёд/назад через BACK — перевод
+  возвращается (`vol active=1`), `gate wait` живьём не воспроизвёлся (язык приходит раньше
+  готовности перевода, это и есть цель); `unhandled`/`ERR`/`abort` = 0.
+- Смоук 22:33 после переноса сброса гейта (overlay 158 088 B): пауза/снятие — `POST /pause` →
+  `sync pause reason=paused(ev)` → `POST /resume` → звук продолжает играть (переигровки нет);
+  BACK → `watch left -> stop`, `vol orig=100 active=0`; повторный вход без deep link —
+  `play https` заново, `vol active=1`; ru-ролик — `meta lang=ru` +87 мс → `translate skip`,
+  `play`/`abort`=0; `ERR`/`unhandled`=0 (кроме известного Cobalt `onerror Script error. @:` на
+  старте приложения до первого ролика).
+
 ## 4. Клавиши (Android keycode → web keyCode)
 `134`→`115` (F4, панель), `133`→`114` (F3, вкл/выкл перевода), `82`→`18` (MENU — тоже панель),
 `23`→`13` (OK), `4`→`27` (BACK), `21/22/19/20`→`37/39/38/40`. `115`/`114` в `input keyevent` —
