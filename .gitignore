@@ -341,3 +341,37 @@ third_party/rust/target/
 
 # Extensions: Generated DNR e.g. /_metadata/generated_indexed_rulesets/_ruleset1
 **/_metadata/generated_indexed_rulesets/
+
+# ===========================================================================
+# TizenTubeCobalt + Yandex VOT: local artefacts, secrets and scratch files.
+# Added by the VOT work (kept separate from the Cobalt/Chromium rules above).
+# ===========================================================================
+# local secrets and machine-specific state (never commit)
+dev_server/vot_secret.json
+dev_server/yt_cookies.txt
+vot_bridge/logs/
+# scratch dumps / stray root artefacts
+*.log
+/0
+_v_repo/
+_vhost/
+# build artifacts (APK / dex / signing / smali tooling kept locally only)
+/apk_out/
+/apk_203/
+/ci_artifact.zip
+/ci_artifact_out/
+/*.apk
+/*.apk.idsig
+/*.dex
+/*.jar
+/*.keystore
+# decompiled Yandex classes used as protocol reference (not built here)
+/Vot*.java
+# IDE / OS
+/.idea/
+/.vscode/
+/*.iml
+Thumbs.db
+desktop.ini
+vot_bridge/classes/
+vot_bridge/*.dex

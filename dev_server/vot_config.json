@@ -1,0 +1,11 @@
+{
+  "lively": true,
+  "worker": "",
+  "mediaProxy": "",
+  "proxyMode": "off",
+  "faMode": "skip",
+  "pcFill": true,
+  "fillLang": "en",
+  "fillFormat": "140/bestaudio[ext=m4a]",
+  "fillMaxWait": 240
+}

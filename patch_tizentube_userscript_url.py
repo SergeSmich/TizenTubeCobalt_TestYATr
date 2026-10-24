@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
+import os
 import pathlib
 import sys
 
 OLD_URL = b"https://cdn.jsdelivr.net/npm/@foxreis/tizentube/dist/userScript.js?v="
+
+# Override for local dev iterations (LAN server = no APK rebuild per JS edit):
+#   $env:VOT_SCRIPT_URL = "http://192.168.1.186:8013/vot.js?v="   (PowerShell)
+#   VOT_SCRIPT_URL="http://192.168.1.186:8013/vot.js?v=" python ...  (bash)
+DEV_URL_ENV = "VOT_SCRIPT_URL"
 
 # Must be a real http(s) URL (the native fetcher does not support file://
 # or android_asset:// schemes - pointing there breaks device-support
@@ -24,7 +30,10 @@ OLD_URL = b"https://cdn.jsdelivr.net/npm/@foxreis/tizentube/dist/userScript.js?v
 # (https://cdn.jsdelivr.net/gh/<owner>/<repo>@<ref>/<path>). A dedicated,
 # short-named public repo (SergeSmich/v) is used so the full URL still
 # fits within len(OLD_URL) bytes.
-NEW_URL = b"https://cdn.jsdelivr.net/gh/SergeSmich/v@6543a34/vot.js?v="
+NEW_URL = os.environ.get(
+    DEV_URL_ENV,
+    "https://cdn.jsdelivr.net/gh/SergeSmich/v@6543a34/vot.js?v=",
+).encode()
 
 
 def patch_lib(path: pathlib.Path) -> int:
