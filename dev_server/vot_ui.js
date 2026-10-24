@@ -67,6 +67,16 @@
     '.vot-sl-knob{position:absolute;top:-8px;width:26px;height:26px;border-radius:13px;',
     'background:#fff;margin-left:-13px;}',
     '.vot-hint{font-size:20px;color:rgba(255,255,255,.48);margin-top:18px;}',
+    // Кнопка «Перевод» в баре плеера: включённое состояние = белый кружок с
+    // тёмным иероглифом (как у включённых субтитров), смена цвета плавная.
+    // Кружок на 5% меньше прежнего (scale .95), подпись всегда белая.
+    '[data-vot-toggle]{transition:background-color .18s ease,color .18s ease,fill .18s ease,transform .18s ease;}',
+    '[data-vot-toggle="1"]{color:#fff !important;}',
+    '[data-vot-toggle="1"][data-vot-on="1"]{background-color:#fff !important;',
+    'border-radius:50% !important;transform:scale(.95) !important;transform-origin:50% 50%;}',
+    '[data-vot-toggle="1"][data-vot-on="1"] [data-vot-ic="1"],',
+    '[data-vot-toggle="1"][data-vot-on="1"] [data-vot-all="1"]{color:#0f0f0f !important;fill:#0f0f0f !important;',
+    'stroke:#0f0f0f !important;}',
     '#vot-toast{position:fixed;right:44px;bottom:64px;z-index:2147483100;background:rgba(0,0,0,.86);',
     'border-left:6px solid #ffb300;border-radius:12px;padding:16px 26px;font-size:24px;color:#fff;',
     'max-width:900px;display:none;line-height:1.3;}'

@@ -60,6 +60,21 @@
     // id ролика, перевод которого отменён навсегда: язык оригинала оказался
     // исключённым (skipLang). Сбрасывается при смене ролика.
     skipLangBlock: null,
+    // id ролика, для которого пользователь вручную включил перевод кнопкой:
+    // ручное включение обходит правило skipLang.
+    forceTranslate: null,
+    // id ролика, для которого пользователь ВЫКЛЮЧИЛ перевод кнопкой в баре:
+    // выключение действует только на текущий ролик, следующий переводится сам
+    // (глобально перевод гасит prefs «translate.enabled»).
+    offForId: null,
+    // Последнее вычисленное состояние кнопки: пока идёт переход между роликами
+    // (curId = null), подсветку не дёргаем — кнопка не должна мигать «выкл».
+    paintOn: null,
+    // URL перевода, готового к запуску: ролик был на паузе, стартуем вместе с ним.
+    pendingPlay: null,
+    // id ролика, для которого пользователь включил перевод кнопкой: подсветка
+    // кнопки должна стать белой СРАЗУ по нажатию, ещё до ответа Яндекса.
+    wantOn: null,
     pcTried: false,
     pcDeadline: 0,
     pcFailed: false,
@@ -72,6 +87,17 @@
   function log(m) {
     try { console.log('[VOT] ' + m); } catch (e) { }
     bridgeLog('[VOT] ' + m);
+  }
+
+  // Кириллица в logcat приходит мусором, поэтому всё не-ASCII экранируем:
+  // такие строки можно прочитать и сравнить глазами (`\u041d\u0430...`).
+  function escAscii(s, max) {
+    var out = '', src = String(s == null ? '' : s);
+    for (var i = 0; i < src.length && out.length < (max || 80); i++) {
+      var c = src.charCodeAt(i);
+      out += (c >= 32 && c < 127) ? src.charAt(i) : '\\u' + ('000' + c.toString(16)).slice(-4);
+    }
+    return out;
   }
 
   function bridgeLog(m) {
@@ -164,7 +190,40 @@
       var d = v.duration > 0 ? v.duration : 0;
       if (!best || d > (best.duration > 0 ? best.duration : 0)) best = v;
     }
-    return best || (vs.length ? vs[0] : null);
+    var res = best || (vs.length ? vs[0] : null);
+    if (res) { try { hookVideoEvents(res); } catch (e) { } }
+    return res;
+  }
+
+  // Ролик поставили на паузу или запустили — реагируем сразу, не ожидая тика
+  // синхронизации, иначе звук перевода отстаёт от картинки до секунды.
+  function hookVideoEvents(v) {
+    if (!v || v.__votEv) return;
+    v.__votEv = 1;
+    try {
+      v.addEventListener('pause', function () {
+        if (state.active && !state.audioPaused) {
+          state.audioPaused = true;
+          log('sync pause reason=paused(ev)');
+          http('POST', '/pause', { }, function () { }, function () { });
+        }
+        schedulePaint();
+      });
+      v.addEventListener('play', function () {
+        if (state.active && state.audioPaused) {
+          state.audioPaused = false;
+          log('sync resume(ev)');
+          http('POST', '/resume', { }, function () { }, function () { });
+        }
+        if (state.pendingPlay) {
+          var u = state.pendingPlay;
+          state.pendingPlay = null;
+          log('deferred play -> start');
+          beginPlayback(u, null);
+        }
+        schedulePaint();
+      });
+    } catch (e) { log('video events ERR ' + (e && e.message)); }
   }
 
   function currentVideoTime() {
@@ -917,15 +976,18 @@
   function startTranslation(id, dur, lang, metaTries) {
     if (state.busy) return;
     if (state.skipLangBlock === id) { state.busy = false; return; }
+    // Пользователь выключил перевод кнопкой в баре именно для этого ролика.
+    if (state.offForId === id) { state.busy = false; log('translate skipped: off by button id=' + id); return; }
     if (uiPref('translate.enabled', true) === false) {
       state.busy = false;
-      log('translate skipped: disabled in prefs id=' + id);
-      setStatus('Перевод выключен в настройках\nвключить: F4 → «Перевод включён»', '#90a4ae');
+      log('translate skipped: disabled by button id=' + id);
+      setStatus('Перевод выключен\nвключить: кнопка 文A в баре (или F4)', '#90a4ae');
       return;
     }
     // Перевод нужен «с иностранного на русский», поэтому по умолчанию
-    // исключён русский: ролик на русском переводить не надо.
-    var skip = String(uiPref('skipLang', 'ru') || '').toLowerCase();
+    // исключён русский: ролик на русском переводить не надо. Ручное нажатие
+    // кнопки «Перевод: выкл» (state.forceTranslate) правило игнорирует.
+    var skip = (state.forceTranslate === id) ? '' : String(uiPref('skipLang', 'ru') || '').toLowerCase();
     var orig = String(state.origLang || '').toLowerCase();
     // Язык оригинала приходит с ПК асинхронно (yt-dlp, холодный кэш ~10 с).
     // Если решить сразу, русский ролик успеет уехать в перевод — ждём метаданные.
@@ -1041,6 +1103,18 @@
 
   // Start or re-point the bridge player at `url`, keeping the video position.
   function beginPlayback(url, done) {
+    // Ролик стоит на паузе: перевод не должен звучать сам по себе. Запоминаем
+    // ссылку и стартуем ровно в момент, когда пользователь включит ролик.
+    var v0 = findVideo();
+    if (v0 && v0.paused) {
+      state.pendingPlay = url;
+      state.busy = false;
+      log('play deferred (video paused) ' + String(url).slice(0, 40));
+      setStatus('Перевод: готов, включится вместе с роликом', '#90a4ae');
+      schedulePaint();
+      return;
+    }
+    state.pendingPlay = null;
     muteVideo();
     if (!state.playedOnce) {
       restartVideo(function () { startBridgePlayer(url, done); });
@@ -1201,6 +1275,7 @@
         stopAudio(true);
         state.curId = null;
         state.busy = false;
+        state.wantOn = null;
         setStatus('Перевод: ожидание видео…', '#90a4ae');
       }
       return;
@@ -1214,6 +1289,10 @@
     // значение (например ru) применится к новому видео и оно будет пропущено.
     state.origLang = '';
     state.skipLangBlock = null;
+    state.forceTranslate = null;
+    state.offForId = null;
+    state.wantOn = null;
+    state.pendingPlay = null;
     state.loop = false;
     state.partial = false;
     state.curUrl = null;
@@ -1237,6 +1316,9 @@
     http('POST', '/stop', { }, function () { }, function () { });
     setStatus('Перевод: видео найдено, жду плеер…\nvideo=' + id, '#90a4ae');
     log('watch detected id=' + id);
+    // Ряд кнопок перерисовывается под новый ролик: подсветку ставим сразу,
+    // не дожидаясь тика (иначе кнопка на секунду гаснет).
+    try { schedulePaint(); } catch (ep) { }
     fetchMeta(id);
     var tries = 0;
     (function wait() {
@@ -1340,8 +1422,10 @@
     log((wasRunning ? 'translate abort: source lang=' : 'translate skip (late meta): source lang=')
       + lang + ' matches skipLang=' + skip + ' id=' + id);
     state.busy = false;
+    state.pendingPlay = null;
     if (wasRunning) stopAudio(true);
     setStatus('Перевод: ролик на языке «' + langLabel(lang) + '»\n(исключён в настройках)', '#90a4ae');
+    schedulePaint();
   }
 
   // Язык оригинала: на ТВ-сборке ytInitialPlayerResponse нет, поэтому язык
@@ -1395,7 +1479,9 @@
     var items = [
       { title: 'Перевод включён', type: 'toggle',
         value: function () { return uiPref('translate.enabled', true) !== false; },
-        onSelect: function () { uiSet('translate.enabled', uiPref('translate.enabled', true) === false); } },
+        // Тот же выключатель, что и кнопка в баре: выключение останавливает
+        // звук и запрещает автоперевод следующих роликов.
+        onSelect: function () { toggleTranslate(); } },
       { title: 'Шард запроса', type: 'choice',
         value: function () { return String(uiPref('shard', 'auto')); },
         options: function () { return [{ label: 'auto (как на ТВ)', value: 'auto' }, { label: 'en', value: 'en' }]; },
@@ -1442,16 +1528,49 @@
     window.addEventListener('keydown', function (e) {
       if (dbgKeys >= 80) return;
       dbgKeys++;
-      var a = document.activeElement, t = '', al = '', hit = 0;
+      var a = document.activeElement, al = '', hit = 0;
       try {
         if (a.getAttribute) al = String(a.getAttribute('aria-label') || '');
         var raw = String((a && a.textContent) || '').replace(/\s+/g, ' ');
-        t = raw.slice(0, 16);
         hit = (raw.indexOf('Перевод') >= 0 || al.indexOf('Перевод') >= 0) ? 1 : 0;
       } catch (x) { }
       log('K kc=' + e.keyCode + ' fa=' + (a ? String(a.tagName).toLowerCase().slice(0, 16) : '-')
-        + ' hit=' + hit + ' t=' + t);
+        + ' hit=' + hit + ' al=' + escAscii(al, 48));
     }, true);
+  }
+
+  // Кнопка в ряду с лайками/комментариями — главный выключатель перевода.
+  // Выключение сохраняется (translate.enabled=false), поэтому при переключении
+  // на другой ролик перевод САМ не включается. Включение сразу переводит
+  // текущий ролик и разрешает автоперевод следующих. Явное нажатие важнее
+  // авто-исключения по языку (state.forceTranslate).
+  function toggleTranslate() {
+    var v = findVideo(), id = state.curId || getVideoId();
+    if (isTranslateOn()) {
+      state.busy = false;
+      state.pendingPlay = null;
+      state.wantOn = null;
+      state.offForId = id || state.curId;
+      uiSet('translate.enabled', false);
+      stopAudio(true);
+      setStatus('Перевод: выключен для этого ролика', '#90a4ae');
+      uiToast('Перевод выключен');
+      log('toggle: off id=' + id);
+      try { paintToggleBtn(); } catch (e0) { }
+      schedulePaint();
+      return;
+    }
+    uiSet('translate.enabled', true);
+    uiToast('Перевод включён');
+    if (!id) { setStatus('Перевод: включён, откройте видео', '#90a4ae'); return; }
+    state.offForId = null;
+    state.skipLangBlock = null;
+    state.forceTranslate = id;
+    state.wantOn = id;
+    log('toggle: on id=' + id);
+    try { paintToggleBtn(); } catch (e1) { }
+    startTranslation(id, (v && v.duration) ? v.duration : 0, state.lang || '');
+    schedulePaint();
   }
 
   function setupUI() {
@@ -1469,11 +1588,7 @@
     VOTUI.on('menu.toggle', function () {
       if (VOTUI.isOpen()) VOTUI.close(); else openTranslatePanel();
     });
-    VOTUI.on('translate.toggle', function () {
-      var on = uiPref('translate.enabled', true) !== false;
-      uiSet('translate.enabled', !on);
-      uiToast(on ? 'Перевод выключен' : 'Перевод включён');
-    });
+    VOTUI.on('translate.toggle', function () { toggleTranslate(); });
     VOTUI.on('pref.vol.translate', applyVolume);
     VOTUI.on('pref.vol.original', applyVolume);
     log('ui ready v=' + String(VOTUI.version));
@@ -1486,39 +1601,371 @@
   // Тип берём из известных энумов плеера: неизвестный тип рендерер молча
   // выбрасывает (проверено на ТВ — кнопка не появлялась).
   var VOT_BTN_TYPE = 'TRANSPORT_CONTROLS_BUTTON_TYPE_PIP';
+  // Два ряда кнопок плеера. В ряду с лайками/комментариями/шарингом — только
+  // включение-выключение перевода, в ряду с настройками/PiP — панель настроек.
   var VOT_ACTION = 'VOT_PANEL_SHOW';
+  var VOT_TOGGLE_ACTION = 'VOT_TRANSLATE_TOGGLE';
   var btnLog = 0;
+  var popupLog = 0;
+  var hookLog = 0;
 
-  function votBtnItem() {
+  function votBtnItem(action, title, selected) {
     return {
       type: VOT_BTN_TYPE,
       button: {
         buttonRenderer: {
           isDisabled: false,
-          text: { runs: [{ text: 'Перевод' }] },
+          // Родной рендерер рисует включённое состояние сам (как у субтитров).
+          // Если поле игнорируется — подсветку всё равно даёт CSS ниже.
+          isSelected: !!selected,
+          style: 'STYLE_DEFAULT',
+          text: { runs: [{ text: title }] },
           icon: { iconType: 'TRANSLATE' },
-          command: { customAction: { action: VOT_ACTION } },
+          command: { customAction: { action: action } },
           trackingParams: null
         }
       }
     };
   }
 
+  // «Перевод включён» — отсюда и подпись кнопки, и подсветка. Кнопка белая всё
+  // время, пока перевод разрешён для текущего ролика, а не только когда звук уже
+  // играет: плеер, язык оригинала и аудио готовятся несколько секунд (до ~4.5 с),
+  // и кнопка не должна в это время гаснуть.
+  function isTranslateOn() {
+    if (uiPref('translate.enabled', true) === false) { state.paintOn = false; return false; }
+    var id = state.curId;
+    if (!id) {
+      // Вне watch-страницы (переход между роликами) держим прежнюю подсветку.
+      return state.paintOn === true;
+    }
+    if (state.offForId === id) { state.paintOn = false; return false; }
+    if (state.skipLangBlock === id) { state.paintOn = false; return false; }
+    state.paintOn = true;
+    return true;
+  }
+
+  // ---- подсветка кнопки «Перевод» -------------------------------------------
+  // Кнопка в баре — родной узел YouTube, который перерисовывается на каждое
+  // открытие панели, поэтому: (1) ищем узел по подписи, (2) ставим на него
+  // data-vot-toggle/data-vot-on, (3) цвет рисует CSS из vot_ui.js через
+  // transition — получается такая же плавная смена, как у кнопки субтитров.
+  var paintTimer = null, paintChain = [], paintProbe = 0, paintLog = '', paintMiss = 0, paintMissAt = 0, paintStale = 0;
+
+  function elInfo(el) {
+    try {
+      var cs = getComputedStyle(el), r = el.getBoundingClientRect();
+      var cls = String(el.className || '').replace(/\s+/g, '.').slice(0, 30);
+      return String(el.tagName || '?').toLowerCase() + (cls ? '.' + cls : '')
+        + ' bg=' + cs.backgroundColor + ' f=' + cs.fill + '/' + cs.color
+        + ' ' + Math.round(r.width) + 'x' + Math.round(r.height);
+    } catch (e) { return '?'; }
+  }
+
+  function labelOf(el) {
+    try {
+      return String(el.getAttribute('aria-label') || '') + '|' + String(el.getAttribute('title') || '');
+    } catch (e) { return ''; }
+  }
+
+  // Наша кнопка — «Перевод: вкл/выкл»; у пункта меню подпись просто «Перевод»
+  // (без состояния), поэтому двоеточие в подписи обязательно, иначе подсветка
+  // уезжала бы на пункт меню «Перевод» в настройках.
+  function isToggleLabel(s) {
+    return s.indexOf('Перевод') >= 0 && s.indexOf('Перевод:') >= 0 && s.indexOf('Яндекс') < 0;
+  }
+
+  // Кнопки нет в DOM: панель ещё не отрисована либо рендерер подписал её иначе.
+  // Печатаем, что реально лежит в aria-label (V = «Перевод», S = субтитры).
+  function dumpLabels() {
+    var out = [], a = null, i, cnt = 0, btn = 0, lb = '';
+    try { a = document.querySelectorAll('[aria-label]'); } catch (e) { a = null; }
+    if (a) {
+      for (i = 0; i < a.length; i++) {
+        lb = '';
+        try { lb = String(a[i].getAttribute('aria-label') || ''); } catch (e2) { continue; }
+        if (!lb) continue;
+        cnt++;
+        if (out.length < 14) {
+          out.push(String(a[i].tagName || '?').toLowerCase().slice(0, 12) + ':' + lb.length
+            + (lb.indexOf('Перевод') >= 0 ? 'V' : '') + (lb.indexOf('Субтитр') >= 0 ? 'S' : ''));
+        }
+      }
+    }
+    try { btn = document.querySelectorAll('yt-button-container').length; } catch (e3) { }
+    log('paint: node not found labels=' + cnt + ' btnc=' + btn + ' [' + out.join(' ') + ']');
+  }
+
+  // Пункт «Перевод», который мы вставляем в меню настроек, подписан так же, как
+  // кнопка в баре (aria-label «Перевод»), поэтому кнопку ищем только ВНЕ оверлеев
+  // и попапов — иначе белый кружок красит пункт меню.
+  function inOverlay(el) {
+    var cur = el, i;
+    for (i = 0; i < 9 && cur && cur.tagName; i++) {
+      var tag = String(cur.tagName).toLowerCase(), cls = '';
+      // Ряд кнопок плеера — точно не оверлей, проверяем его первым.
+      if (tag === 'ytlr-player-actions-container') return false;
+      try { cls = String(cur.className || '').toLowerCase(); } catch (e0) { cls = ''; }
+      if (tag.indexOf('overlay') >= 0 || tag.indexOf('popup') >= 0) return true;
+      if (cls.indexOf('overlay') >= 0 || cls.indexOf('popup') >= 0) return true;
+      cur = cur.parentNode;
+    }
+    return false;
+  }
+
+  // От иконки поднимаемся к контейнеру кнопки, но не выше: ряд кнопок шире
+  // и красить его нельзя (белая плашка на пол-экрана).
+  function btnRoot(el) {
+    var cur = el, i;
+    for (i = 0; i < 4; i++) {
+      var up = cur.parentNode;
+      if (!up || !up.tagName) break;
+      var tag = String(up.tagName).toLowerCase();
+      if (tag === 'body' || tag === 'html') break;
+      try {
+        var r0 = el.getBoundingClientRect(), r1 = up.getBoundingClientRect();
+        if (!r0.width || !r1.width) break;
+        if (r1.width > 130 || r1.height > 130) break;
+        if (r1.width > r0.width * 2.6 || r1.height > r0.height * 2.6) break;
+        if (up.querySelectorAll('[aria-label]').length > 2) break;
+      } catch (e) { break; }
+      cur = up;
+    }
+    return cur;
+  }
+
+  function findToggleNode() {
+    var n = null, i, a = null, t = '';
+    // Кэш по data-vot-toggle использовать НЕЛЬЗЯ: YouTube переиспользует DOM-узлы
+    // кнопок, и наша метка «переезжает» на соседнюю кнопку (на ТВ подсветка
+    // уезжала на «Комментарии»). Поэтому каждый раз ищем по подписи.
+
+    // 1) Подпись: рендерер кладёт text.runs[0].text в aria-label/title.
+    try { a = document.querySelectorAll('[aria-label],[title]'); } catch (e2) { a = null; }
+    if (a) {
+      for (i = 0; i < a.length && i < 900; i++) {
+        if (inOverlay(a[i])) continue;
+        if (!isToggleLabel(labelOf(a[i]))) continue;
+        var r = btnRoot(a[i]);
+        // Скрытые/ещё не отрисованные копии кнопки (0×0) не красим.
+        try {
+          var rr0 = r.getBoundingClientRect();
+          if (rr0.width < 8 || rr0.height < 8) continue;
+        } catch (e7) { }
+        r.__votHow = 'label';
+        return r;
+      }
+    }
+    // 2) Подпись отрисована текстом: ищем текстовые узлы (XPath точнее перебора).
+    try {
+      if (document.evaluate) {
+        var x = document.evaluate(".//*[text()[contains(.,'Перевод')]]",
+          document, null, 6, null), k = 0, e5 = null;
+        while ((e5 = x.iterateNext()) && k < 6) {
+          k++;
+          if (inOverlay(e5)) continue;
+          if (!isToggleLabel(String(e5.textContent || ''))) continue;
+          var rr = btnRoot(e5);
+          rr.__votHow = 'xpath';
+          return rr;
+        }
+      }
+    } catch (e3) { }
+    // 3) Запасной путь: перебор контейнеров кнопок по textContent.
+    try { a = document.querySelectorAll('yt-button-container, ytlr-button, ytlr-icon-button, button'); } catch (e4) { return null; }
+    for (i = 0; i < a.length && i < 900; i++) {
+      t = '';
+      try { t = String(a[i].textContent || ''); } catch (e6) { continue; }
+      if (inOverlay(a[i])) continue;
+      if (isToggleLabel(t)) { a[i].__votHow = 'text'; return a[i]; }
+    }
+    return null;
+  }
+
+  // Один раз за запуск: структура узла кнопки и подписи соседей по ряду —
+  // по этому логу видно, что именно рисует кружок (нужно для доводки CSS).
+  function probeDom(el) {
+    if (paintProbe) return;
+    paintProbe = 1;
+    var out = ['probe how=' + (el.__votHow || '?') + ' ' + elInfo(el)], i, up = el;
+    try {
+      for (i = 0; i < 3 && up.parentNode && up.parentNode.tagName; i++) {
+        up = up.parentNode;
+        out.push('up' + (i + 1) + '=' + elInfo(up));
+      }
+    } catch (e) { }
+    var names = [];
+    try {
+      var ch = el.parentNode ? el.parentNode.children : null;
+      for (i = 0; ch && i < ch.length && i < 16; i++) {
+        var lb = '';
+        try { lb = String(ch[i].getAttribute('aria-label') || ''); } catch (e2) { }
+        if (!lb) {
+          try {
+            var d = ch[i].querySelector('[aria-label]');
+            if (d) lb = String(d.getAttribute('aria-label') || '');
+          } catch (e3) { }
+        }
+        var sz = elInfo(ch[i]);
+        names.push((ch[i] === el ? '*' : '') + 'len' + lb.length
+          + (lb.indexOf('Перевод') >= 0 ? 'RU' : '') + ':' + sz.slice(sz.lastIndexOf(' ') + 1));
+      }
+    } catch (e4) { }
+    out.push('row=' + names.join(' '));
+    log(out.join(' | '));
+  }
+
+  // Иероглиф на белом кружке — тёмный, подписи (элементы с текстом) — белые.
+  // Помечаем иконки атрибутом data-vot-ic; если иконку распознать не удалось
+  // (рендерер рисует символ текстом), красим всё содержимое (data-vot-all).
+  function markInside(el) {
+    var all = null, i, icons = 0, n = null, tag = '', cls = '', txt = '';
+    try { all = el.querySelectorAll('*'); } catch (e) { return; }
+    for (i = 0; i < all.length && i < 40; i++) {
+      n = all[i];
+      try {
+        tag = String(n.tagName || '').toLowerCase();
+        cls = String(n.getAttribute('class') || '');
+        txt = String(n.textContent || '').replace(/\s+/g, '');
+      } catch (e2) { continue; }
+      var icon = (tag === 'svg' || tag === 'path' || tag === 'use' || tag === 'ytlr-icon')
+        || cls.indexOf('icon') >= 0;
+      if (icon) icons++;
+      if (icon || !txt) {
+        try { n.setAttribute('data-vot-ic', '1'); } catch (e3) { }
+      } else {
+        try { n.removeAttribute('data-vot-ic'); } catch (e4) { }
+      }
+    }
+    for (i = 0; i < all.length && i < 40; i++) {
+      try {
+        if (icons) all[i].removeAttribute('data-vot-all');
+        else all[i].setAttribute('data-vot-all', '1');
+      } catch (e5) { }
+    }
+  }
+
+  // Длина подписи узла (своей или у потомка) — в лог, чтобы видеть, что красим
+  // именно нашу кнопку («Перевод: вкл/выкл» = 12–13 символов).
+  function deepLabelLen(el) {
+    var s = '';
+    try { s = labelOf(el); } catch (e) { }
+    if (s.replace('|', '')) return s.length;
+    try {
+      var d = el.querySelector('[aria-label]');
+      if (d) s = labelOf(d);
+    } catch (e2) { }
+    return s.length;
+  }
+
+  function paintToggleBtn() {
+    var el = findToggleNode();
+    if (!el) {
+      // Диагностика не чаще 1 раза в 8 с и не больше 4 раз: видно, появилась ли
+      // панель позже и какие подписи вообще есть в DOM.
+      var now = Date.now();
+      if (paintMiss < 4 && (!paintMissAt || now - paintMissAt > 8000)) {
+        paintMiss++;
+        paintMissAt = now;
+        paintLog = 'none';
+        dumpLabels();
+      }
+      return;
+    }
+    var on = isTranslateOn() ? '1' : '0';
+    // Снимаем метки со ВСЕХ чужих узлов: узел, который был нашим, рендерер может
+    // занять под другую кнопку — тогда белый кружок рисуется у соседа.
+    try {
+      var stale = document.querySelectorAll('[data-vot-toggle]');
+      if (stale.length > 1 || (stale.length === 1 && stale[0] !== el)) {
+        for (var j = 0; j < stale.length; j++) {
+          if (stale[j] === el) continue;
+          stale[j].removeAttribute('data-vot-on');
+          stale[j].removeAttribute('data-vot-toggle');
+        }
+        if (paintStale < 5) {
+          paintStale++;
+          log('paint stale cleared n=' + stale.length + ' keep=' + (el.__votHow || '?'));
+        }
+      }
+    } catch (e1) { }
+    try {
+      if (el.getAttribute('data-vot-on') !== on) el.setAttribute('data-vot-on', on);
+      el.setAttribute('data-vot-toggle', '1');
+    } catch (e2) { }
+    // Наследие первой версии (инлайн-стили) убираем: цвет теперь из CSS.
+    try {
+      var s = el.style;
+      if (s && (s.backgroundColor || s.color || s.fill || s.borderRadius)) {
+        s.backgroundColor = ''; s.color = ''; s.fill = ''; s.borderRadius = '';
+      }
+    } catch (e3) { }
+    paintChain = [el];
+    try { markInside(el); } catch (e4) { }
+    if (paintLog !== on) {
+      paintLog = on;
+      log('paint ' + (on === '1' ? 'on' : 'off') + ' via ' + (el.__votHow || '?')
+        + ' lb=' + deepLabelLen(el) + ' ' + elInfo(el));
+      probeDom(el);
+    }
+    verifyPaint(el, on);
+  }
+
+  // Узел могли занять под другую кнопку уже после покраски: если через 260 мс
+  // подписи нашей на нём нет — снимаем метки и ищем заново.
+  function verifyPaint(el, on) {
+    setTimeout(function () {
+      try {
+        if (!document.body || !document.body.contains(el)) { paintLog = ''; schedulePaint(); return; }
+        var lb = labelOf(el);
+        if (lb.replace('|', '') && !isToggleLabel(lb)) {
+          if (paintStale < 8) { paintStale++; log('paint wrong node (lb=' + lb.length + ') cleared'); }
+          el.removeAttribute('data-vot-on');
+          el.removeAttribute('data-vot-toggle');
+          paintLog = '';
+          schedulePaint();
+          return;
+        }
+        if (el.getAttribute('data-vot-on') !== on) schedulePaint();
+      } catch (e) { }
+    }, 260);
+  }
+
+  // Панель управления строится заново на каждое открытие, поэтому подсветку
+  // переставляем после вставки кнопки (двумя тиками: до и после отрисовки).
+  function schedulePaint() {
+    if (paintTimer) return;
+    paintTimer = setTimeout(function () {
+      paintTimer = null;
+      try { paintToggleBtn(); } catch (e) { }
+      setTimeout(function () { try { paintToggleBtn(); } catch (e) { } }, 700);
+    }, 350);
+  }
+
   function injectVotBtn(res) {
     if (!res || typeof res.length !== 'number' || !res.length) return res;
-    var types = [], have = false, at = -1, i;
+    var types = [], at = -1, i;
     for (i = 0; i < res.length; i++) {
       var it = res[i];
       if (!it || typeof it !== 'object' || typeof it.type !== 'string') return res;
       types.push(String(it.type).replace('TRANSPORT_CONTROLS_BUTTON_TYPE_', ''));
-      var bc = it.button && it.button.buttonRenderer && it.button.buttonRenderer.command;
-      if (it.type === VOT_BTN_TYPE && actionOf(bc) === VOT_ACTION) have = true;
       if (at < 0 && it.type.indexOf('PLAYBACK_SETTINGS') >= 0) at = i;
     }
-    if (have) return res;
-    var btn = votBtnItem();
-    if (at >= 0) res.splice(at, 0, btn); else res.push(btn);
-    if (btnLog < 4) { btnLog++; log('btn injected [' + types.join('|') + '] ' + (at < 0 ? 'end' : 'at ' + at)); }
+    // Ряд с шестерёнкой не трогаем: панель открывается пунктом «Перевод» в меню
+    // настроек. Вторая кнопка в баре (дубль) не нужна.
+    if (at >= 0) return res;
+    var act = VOT_TOGGLE_ACTION;
+    for (i = 0; i < res.length; i++) {
+      var bc = res[i] && res[i].button && res[i].button.buttonRenderer && res[i].button.buttonRenderer.command;
+      if (actionOf(bc) === act) return res;
+    }
+    var on = isTranslateOn();
+    res.push(votBtnItem(act, on ? 'Перевод: вкл' : 'Перевод: выкл', on));
+    schedulePaint();
+    if (btnLog < 6) {
+      btnLog++;
+      log('btn injected [' + types.join('|') + '] end act=' + act);
+    }
     return res;
   }
 
@@ -1590,55 +2037,114 @@
     return out;
   }
 
-  function popupInsert(cmd) {
-    if (!cmd || typeof cmd !== 'object' || !cmd.openPopupAction) return 0;
-    var lists = collectItemLists(cmd, [], 0), done = 0;
-    for (var i = 0; i < lists.length && !done; i++) {
-      var arr = lists[i], looks = false, have = false, j;
-      for (j = 0; j < arr.length; j++) {
-        var it = arr[j];
-        if (!it || !it.compactLinkRenderer) continue;
-        looks = true;
-        var ic = it.compactLinkRenderer.serviceEndpoint
-          && it.compactLinkRenderer.serviceEndpoint.commandExecutorCommand
-          && it.compactLinkRenderer.serviceEndpoint.commandExecutorCommand.commands;
-        if (ic) for (var q = 0; q < ic.length; q++) if (actionOf(ic[q]) === VOT_ACTION) have = true;
-      }
-      if (!looks || have) continue;
-      arr.splice(Math.min(1, arr.length), 0, votPopupItem());
-      done = 1;
-      log('popup item inserted n=' + arr.length);
-    }
-    return done;
+  // «Перевод» должен быть только в КОРНЕ меню настроек. Признак корня — его
+  // uniqueId (`playback-settings`), как в TizenTube: по вложенности отличить
+  // корень от подменю нельзя (в подменю тоже есть openPopupAction).
+
+  function linkTitle(it) {
+    try {
+      var t = it && it.compactLinkRenderer && it.compactLinkRenderer.title;
+      if (!t) return '?';
+      return String(t.simpleText || (t.runs && t.runs[0] && t.runs[0].text) || '?').slice(0, 22);
+    } catch (e) { return '?'; }
   }
 
-  function hookResolve(inst, where) {
-    if (!inst || typeof inst.resolveCommand !== 'function') return 0;
-    var rc = inst.resolveCommand;
-    if (rc.__votHooked) return 0;
+  // Список пунктов корня меню настроек: сначала пробуем известный путь
+  // TizenTube (overlayPanelItemListRenderer.items), иначе — любой список.
+  function popupItemLists(cmd) {
+    var res = [], oa = cmd && cmd.openPopupAction, arr = null;
+    try {
+      var o = oa.popup, s = o && o.overlaySectionRenderer, ov = s && s.overlay;
+      var tp = ov && ov.overlayTwoPanelRenderer;
+      var ap = tp && tp.actionPanel, pan = ap && ap.overlayPanelRenderer;
+      var ct = pan && pan.content, lst = ct && ct.overlayPanelItemListRenderer;
+      arr = lst && lst.items;
+    } catch (e) { arr = null; }
+    if (arr && arr.length) res.push(arr);
+    else res = collectItemLists(cmd, [], 0);
+    return res;
+  }
+
+  function popupHasOurs(arr) {
+    for (var j = 0; j < arr.length; j++) {
+      var it = arr[j];
+      if (!it || !it.compactLinkRenderer) continue;
+      var ic = it.compactLinkRenderer.serviceEndpoint
+        && it.compactLinkRenderer.serviceEndpoint.commandExecutorCommand
+        && it.compactLinkRenderer.serviceEndpoint.commandExecutorCommand.commands;
+      if (!ic) continue;
+      for (var q = 0; q < ic.length; q++) if (actionOf(ic[q]) === VOT_ACTION) return true;
+    }
+    return false;
+  }
+
+  // Пункт «Перевод» вставляем ТОЛЬКО в корень меню настроек (uniqueId
+  // `playback-settings`): в подменю/спойлерах он не нужен — иначе дублируется.
+  // Вызывается до и после оригинала: попап может собираться внутри вызова,
+  // повторная вставка безопасна (проверка popupHasOurs).
+  function popupInsert(cmd) {
+    if (!cmd || typeof cmd !== 'object' || !cmd.openPopupAction) return 0;
+    if (String(cmd.openPopupAction.uniqueId || '') !== 'playback-settings') return 0;
+    var lists = popupItemLists(cmd), i;
+    for (i = 0; i < lists.length; i++) {
+      var arr = lists[i];
+      if (!arr || !arr.length) continue;
+      if (popupHasOurs(arr)) continue;
+      arr.splice(Math.min(2, arr.length), 0, votPopupItem());
+      if (popupLog < 12) {
+        popupLog++;
+        var tt = [];
+        for (var j = 0; j < arr.length && j < 6; j++) tt.push(linkTitle(arr[j]));
+        log('popup item inserted n=' + arr.length + ' [' + tt.join(' / ') + ']');
+      }
+      return 1;
+    }
+    return 0;
+  }
+
+  // Перехват диспетчера команд. Помимо своего действия (кнопка/пункт панели)
+  // вставляем пункт «Перевод» в попап: до вызова оригинала (как TizenTube —
+  // данные уже готовы к рендеру) и после (если попап собирается внутри).
+  function hookMethod(inst, where, name, doPopup) {
+    if (!inst) return 0;
+    var rc = inst[name];
+    if (typeof rc !== 'function' || rc.__votHooked) return 0;
     var h = function (cmd) {
       try {
         var act = actionOf(cmd);
+        if (act === VOT_TOGGLE_ACTION) { log('btn TOGGLE'); toggleTranslate(); return true; }
         if (act === VOT_ACTION) { log('btn PRESSED'); openTranslatePanel(); return true; }
         var cc = cmd && cmd.commandExecutorCommand && cmd.commandExecutorCommand.commands;
         if (cc && cc.length) {
           for (var i = 0; i < cc.length; i++) {
-            if (actionOf(cc[i]) === VOT_ACTION) { log('btn PRESSED exec'); openTranslatePanel(); return true; }
+            var a2 = actionOf(cc[i]);
+            if (a2 === VOT_TOGGLE_ACTION) { log('btn TOGGLE exec'); toggleTranslate(); return true; }
+            if (a2 === VOT_ACTION) { log('btn PRESSED exec'); openTranslatePanel(); return true; }
           }
         }
       } catch (e) { }
-      // Даём отработать TizenTube (она сдвигает индексы в списке), затем вставляем
-      // свой пункт в уже готовый список настроек плеера.
+      if (doPopup && cmd && cmd.openPopupAction) {
+        try { popupInsert(cmd); } catch (e1) { log('popup pre ERR ' + (e1 && e1.message)); }
+      }
       var r = rc.apply(this, arguments);
-      if (cmd && cmd.openPopupAction) {
+      if (doPopup && cmd && cmd.openPopupAction) {
         try { popupInsert(cmd); } catch (e2) { log('popup ERR ' + (e2 && e2.message)); }
       }
       return r;
     };
     h.__votHooked = 1;
-    inst.resolveCommand = h;
-    log('resolve hooked via ' + where);
+    try { inst[name] = h; } catch (e3) { return 0; }
+    if (hookLog < 24) { hookLog++; log(name + ' hooked via ' + where); }
     return 1;
+  }
+
+  function hookResolve(inst, where) {
+    if (!inst) return 0;
+    var n = hookMethod(inst, where, 'resolveCommand', true);
+    // Часть команд (в т.ч. меню настроек) идёт мимо resolveCommand.
+    n += hookMethod(inst, where, 'dispatchCommand', true);
+    n += hookMethod(inst, where, 'executeCommand', true);
+    return n;
   }
 
   function hookAllInstances() {
@@ -1649,7 +2155,7 @@
       try { e = window._yttv[k]; } catch (x) { continue; }
       if (!e) continue;
       try { if (e.instance) n += hookResolve(e.instance, k + '.instance'); } catch (x2) { }
-      try { if (e.prototype && e.prototype.resolveCommand) n += hookResolve(e.prototype, k + '.prototype'); } catch (x3) { }
+      try { if (e.prototype) n += hookResolve(e.prototype, k + '.prototype'); } catch (x3) { }
     }
     return n;
   }
@@ -1706,7 +2212,59 @@
     try { ok = installPlayerButton(); } catch (e) { log('btn install ERR ' + (e && e.message)); }
     if (!ok && btnTries < 40) setTimeout(btnRetry, 1500);
   }
+
+  // Новые диспетчеры команд появляются и после старта (меню настроек собирается
+  // при первом открытии шестерёнки). Перепроверяем _yttv, чтобы не пропустить их.
+  var rehookN = 0;
+  var rehookT = setInterval(function () {
+    rehookN++;
+    try { hookAllInstances(); } catch (e) { }
+    if (rehookN >= 600) clearInterval(rehookT); // ~20 мин
+  }, 2000);
   // ===== VOT-UI END =====
+
+  // Подсветка кнопки должна совпадать с состоянием перевода всегда — в том
+  // числе после переключения ролика при уже открытой панели. Тик дешёвый:
+  // пока data-vot-on совпадает, DOM не меняется.
+  setInterval(function () {
+    try {
+      if (!state.curId || document.hidden) return;
+      paintToggleBtn();
+    } catch (e) { }
+  }, 1200);
+
+  // Рендерер переиспользует DOM-узлы кнопок и меняет им aria-label. Ловим такие
+  // правки сразу: как только подпись узла перестала быть нашей — снимаем метки
+  // (иначе белый кружок остаётся на чужой кнопке до следующего тика).
+  var moTimer = null;
+  try {
+    if (window.MutationObserver) {
+      var mo = new MutationObserver(function (recs) {
+        var hit = false;
+        for (var i = 0; i < recs.length && !hit; i++) {
+          var r = recs[i];
+          if (r.type !== 'attributes' || !r.target) continue;
+          if (!r.target.getAttribute || !r.target.getAttribute('data-vot-toggle')) continue;
+          var lb = labelOf(r.target);
+          if (lb.replace('|', '') && !isToggleLabel(lb)) {
+            try {
+              r.target.removeAttribute('data-vot-on');
+              r.target.removeAttribute('data-vot-toggle');
+            } catch (e0) { }
+            if (paintStale < 8) { paintStale++; log('paint recycle cleared lb=' + lb.length); }
+            paintLog = '';
+          }
+          hit = true;
+        }
+        if (hit && !moTimer) {
+          moTimer = setTimeout(function () { moTimer = null; try { paintToggleBtn(); } catch (e1) { } }, 120);
+        }
+      });
+      mo.observe(document.documentElement || document.body, {
+        attributes: true, attributeFilter: ['aria-label', 'title'], subtree: true
+      });
+    }
+  } catch (e2) { log('MO ERR ' + (e2 && e2.message)); }
 
   setupUI();
   btnRetry();
