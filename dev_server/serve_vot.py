@@ -7,6 +7,7 @@ the next page load without rebuilding the APK.
 
 import http.server
 import json
+import os
 import pathlib
 import socketserver
 import subprocess
@@ -52,8 +53,19 @@ def _meta_worker(vid):
         "--print",
         "%(language)s\t%(duration)s\t%(title)s",
     ]
+    # yt-dlp rewrites whatever --cookies file it is given (and a bot-gate answer
+    # even wipes the session cookies out of it), so the master jar exported by
+    # hand must never be passed directly. fill_audio already owns that rule
+    # (private per-run copy), so reuse it here instead of duplicating it.
+    tmp_jar = None
     if COOKIES.is_file():
-        args += ["--cookies", str(COOKIES)]
+        try:
+            import fill_audio
+
+            cargs, _how, tmp_jar = fill_audio._cookie_args(str(COOKIES), None)
+            args += cargs
+        except Exception:  # noqa: BLE001 - never block metadata on the copy trick
+            args += ["--cookies", str(COOKIES)]
     args.append("https://www.youtube.com/watch?v=" + vid)
     try:
         p = subprocess.run(
@@ -85,6 +97,12 @@ def _meta_worker(vid):
         return {"ok": False, "err": "timeout"}
     except Exception as e:  # noqa: BLE001 - dev tool, report as text
         return {"ok": False, "err": str(e)[:200]}
+    finally:
+        if tmp_jar:
+            try:
+                os.remove(tmp_jar)
+            except OSError:
+                pass
 
 
 def _meta_prefetch(vid):

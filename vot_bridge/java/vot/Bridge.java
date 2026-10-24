@@ -565,7 +565,14 @@ public final class Bridge {
                 + " msg=" + (p.containsKey(9) ? String.valueOf(p.get(9)) : "-")
                 + " audio=" + (p.containsKey(1) ? "yes" : "no")
                 + " tid=" + (p.containsKey(7) ? String.valueOf(p.get(7)) : "-")
-                + " lively=" + (p.containsKey(10) ? String.valueOf(num(p.get(10))) : "-"));
+                + " lively=" + (p.containsKey(10) ? String.valueOf(num(p.get(10))) : "-")
+                // Field 8 is the source language Yandex detected, 11/12 are its
+                // verdicts: "this video may be translated" and "retry makes sense".
+                // The extension (vot.js 1.12.2) reads all three; we only logged them
+                // as raw hex before. Seeing them in the log proves the semantics.
+                + " lang8=" + (p.containsKey(8) ? String.valueOf(p.get(8)) : "-")
+                + " allow=" + (p.containsKey(11) ? String.valueOf(num(p.get(11))) : "-")
+                + " retry=" + (p.containsKey(12) ? String.valueOf(num(p.get(12))) : "-"));
 
         JSONObject out = new JSONObject();
         out.put("status", num(p.get(4)));
@@ -575,6 +582,18 @@ public final class Bridge {
         if (p.containsKey(9)) out.put("message", String.valueOf(p.get(9)));
         if (p.containsKey(2)) out.put("duration", dnum(p.get(2)));
         out.put("lively", p.containsKey(10) && num(p.get(10)) != 0);
+        // 8 = source language of the video (never empty in a normal answer).
+        // It arrives in the very first response (~1-2 s), which is far faster
+        // than the PC metadata path (yt-dlp, cold cache ~10 s), so the JS side
+        // can decide "this is Russian, do not translate" from the answer itself.
+        if (p.containsKey(8)) {
+            String lang8 = String.valueOf(p.get(8));
+            if (!lang8.isEmpty() && !"null".equals(lang8)) out.put("lang", lang8);
+        }
+        // 11 = allowToTranslateVideo, 12 = shouldRetry. Both optional: absent
+        // means Yandex said nothing and the JS fallback keeps its old behaviour.
+        if (p.containsKey(11)) out.put("allow", num(p.get(11)) != 0);
+        if (p.containsKey(12)) out.put("shouldRetry", num(p.get(12)) != 0);
         return out;
     }
 

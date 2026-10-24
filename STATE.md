@@ -214,6 +214,77 @@ actionPanel.overlayPanelRenderer.content.overlayPanelItemListRenderer.items`),
 - F5 (`votDebug`) печатает `dbg orig … skel` и ре-диспатчит исходную команду
   через `votSubHost` — решающий тест «принимает ли клиент команды из JS».
 
+## 3zz. Механики из расширения VOT 1.12.2 (24.10 20:15, ПРОГОН НА ТВ OK)
+Цель: убрать лишние ожидания и штормы опросов, честно отказывать без лестницы.
+- `Bridge.java` (`handleTranslate`): в лог `translate resp` добавлены `lang8=`/`allow=`/`retry=`,
+  в JSON ответа — `lang` (поле 8), `allow` (11), `shouldRetry` (12). dex 40 236 B, APK установлен.
+- `dev_server/vot.js`:
+  - `handleResp`: поле 8 сразу в `state.origLang` + `maybeSkipNow` ДО запуска звука;
+  - `status=0` + `allow===false` (и не после нашей загрузки звука) — терминальный отказ без
+    ретрая/лестницы; `shouldRetry===false` снимает одноразовый повтор, `escalate` оставлен
+    (другой шард = другая задача);
+  - `status=6` + `allow===false` — только лог (флаг не трактуем: «нужен звук» лечится филлером);
+  - `startTranslation`: ожидание языка 3 тика (4.5 с) → один 500 мс;
+  - `poll()`: `NaN`/нет поля 5 больше не даёт `setTimeout(NaN)`; без подсказки — 3×3 с, потом
+    8 с → 20 с (`POLL_NO_HINT/FAST_TRIES/SLOW/SLOW_MAX`), `state.polls` (сброс при смене ролика),
+    в логе `poll in … rem=… n=…`.
+- **Прогон 20:15 (3 ролика: `dQw4w9WgXcQ`, `jNQXAC9IVRw`, `9bZkp7q19f0`)**: новый dex работает
+  (`allow=1` в ответах), `translate start` → `status=1` → `play` за ~0.3 с, `paint on` на каждом,
+  `ERR`/`unhandled` = 0, `poll in` = 0 (кэш тёплый — ветка опроса живьём не проверена).
+  **Важно**: поле 8 в ОТВЕТЕ не приходит (`lang8=-`), потому что мы всегда шлём поле 8 в запросе
+  (`lang=en`) — Яндекс язык не детектит и не возвращает. Язык по-прежнему берём из `/fill_status`
+  (`meta … lang=en`). Код на поле 8 остаётся как страховка (сработает, если поле придёт).
+- Дальше: ревью + коммит.
+
+## 3zy. Разбор ошибки перевода `DaeWIAqoEfI` (24.10 20:25, НЕ наш код)
+Лог (`VotBridge`): ролик `DaeWIAqoEfI` (648 с, lang=en) не в кэше Яндекса → `status=6` (нужен звук) →
+другой шард тоже пуст → ПК-филлер:
+`fill failed state=err why=RuntimeError: yt-dlp: … --cookies for the authentication`
+⇒ корень: **куки yt-dlp не авторизованы**, YouTube отвечает «Sign in to confirm you're not a bot».
+- В `dev_server/yt_cookies.txt` для домена `.youtube.com` есть только `__Secure-3PSID/3PAPISID`,
+  а `SID`/`SAPISID`/`LOGIN_INFO`/`__Secure-1PSID` = 0 (логина нет). Для `.google.com` логин есть,
+  но yt-dlp читает домен `.youtube.com` ⇒ файл эквивалентен анонимному.
+- Проверено (tester): `web_embedded`/`tv`/`android_vr`/`web_safari` — все дают бот-гейт; без куки
+  ответ побайтно тот же. Контрольный `dQw4w9WgXcQ` с этими же куками качается (`itag=140`, 3.4 МБ)
+  ⇒ конвейер рабочий, дело в конкретном ролике + отсутствии логина.
+- Сделано (24.10 20:4x): `fill_audio.py` — fail-fast по маркерам `BOT_GATE`
+  («Sign in to confirm you're not a bot», «cookies for the authentication»): после 2-го попадания
+  `RuntimeError("нужен вход в YouTube: куки не авторизованы …")` вместо лестницы 4 клиентов.
+  Замер: CLI 6.3 с, через `/fill` → `state=err` за 8.3 с (было ~40–60 с); хороший ролик 6.4 с.
+- `vot.js` (`handleResp`, ветка ожидания филлера): при `state.pcFailed` опрос больше не
+  прекращается молча — ставится явный статус «Перевод: сервер не отдаёт этот ролик /
+  ПК-филлер не смог скачать звук» (раньше на экране висело старое «ПК готовит звук…»).
+- **РЕШЕНО (24.10 20:44)**: пользователь закрыл Chrome → `yt-dlp --cookies-from-browser chrome`
+  (с `--cookies <новый файл>`) дал **478 768 B** с живым логином: `SID`=153, `SAPISID`=34,
+  `__Secure-1PSID`=153, `LOGIN_INFO`=319 для `.youtube.com`. Старый анонимный jar —
+  `dev_server/yt_cookies.bak.txt` (в `.gitignore`, в коммит не идёт).
+  `DaeWIAqoEfI` качается: `itag=140`, 10 491 796 B за 8.9–9.3 с.
+- **Защита мастера куки**: `yt-dlp --cookies <файл>` ПЕРЕЗАПИСЫВАЕТ jar на выходе, а бот-гейт
+  приходит с `Set-Cookie`, вычищающим сессию — именно так файл и «деградировал» до анонимного.
+  `fill_audio.py`: `_cookie_args()` → `(args, how, tmp_jar)`, копия на прогон
+  `%TEMP%\votfill\yt_cookies_run_<pid>_<rand6>.txt` (уникальная: параллельные `/fill` не
+  топят друг друга), `download()` = `try: _download_with(...) / finally: os.remove(tmp_jar)`
+  (`_download_with` — вынесенная лестница формат×клиент). Проверено: SHA256 мастера до/после
+  совпал байт-в-байт, копия удалена.
+- **Тот же риск в мета-пути** (нашёл tester): `serve_vot.py:_meta_worker` (фоновый yt-dlp для
+  `lang`/`title`) отдавал МАСТЕР напрямую и тоже его перезаписывал. Теперь он берёт
+  `fill_audio._cookie_args()` (пер-запуск копия) и удаляет её в `finally` (+`import os`).
+  Проверено: после 3 прогонов мета-воркера SHA256 и mtime мастера не изменились.
+
+## 3zx. ПК-филлер: `timeout waiting` ≠ провал (24.10 21:0x)
+Замер (`fill_audio.py` без `--tid`, `DaeWIAqoEfI` 648 с): `kick first` tid=484055536 =
+`kick before upload` tid=484055536 (шард стабилен), звук залит, но Яндекс >250 с держит
+`status=3` (`rem≈175`) → `ok=false`, `error="timeout waiting for the translation"`.
+`--max-wait` — только минимум: повторная заливка продлевает `deadline` на 90 с (150 → 250 с).
+- `vot.js` (`handleResp`, ветка ожидания филлера): ответ `/fill_status` с `state=err` и текстом
+  `/timeout waiting/i` больше НЕ считается провалом — `fill: server still synthesizing … -> keep
+  polling`, `state.pcDeadline` продлевается на 120 с, опрос продолжается (звук у Яндекса уже есть,
+  осталось дождаться синтеза). Настоящий провал (нет куки / yt-dlp) по-прежнему даёт явный статус.
+- `langBase()`: сравнение языков режет регион (`ru-RU` = `ru`) в `maybeSkipNow` и в проверке
+  `skipLang` — иначе русский ролик с тегом региона уезжал в перевод (замечание ревью).
+- Ревью: blocker/major нет; закрыты minor (пер-запуск копия куки + удаление в `finally`).
+- Осталось: прогон на ТВ длинного ролика (должен дойти до `status=1` после `fill timeout`).
+
 ## 3z. Громкость: два уровня (24.10, ГОТОВО и закоммичено)
 Коммит `f2e39b82fae`.
 Перевод играет нативный `MediaPlayer` в мосте ⇒ из JS его не приглушить: добавлен `POST /volume`
@@ -265,7 +336,7 @@ actionPanel.overlayPanelRenderer.content.overlayPanelItemListRenderer.items`),
 1. Микшер (одновременный оригинал+перевод) — сейчас это и есть «Оригинал при переводе» (уровень
    видео 0–100 при активном переводе); отдельного второго потока нет.
 2. Два режима автоперевода: «все ролики при включённой кнопке» (реализовано) и «только этот ролик».
-3. Техдолг: язык оригинала из поля 3 ответа Яндекса (вместо yt-dlp/`/fill_status`), `fill failed … --cookies`.
+3. Техдолг: язык оригинала из поля 3 ответа Яндекса (вместо yt-dlp/`/fill_status`); `fill failed … --cookies` — ЗАКРЫТО (живые куки + fail-fast + защита мастера).
 0. СДЕЛАНО (12:41–13:20): кнопка в баре → OK → панель (10 пунктов) → BACK без остановки видео;
    все пункты проверены живьём; язык оригинала приходит с ПК через `/fill_status`
    (`meta id=dQw4w9WgXcQ lang=en` за ~200 мс); `skipLang` E2E (`translate skipped: source lang=en

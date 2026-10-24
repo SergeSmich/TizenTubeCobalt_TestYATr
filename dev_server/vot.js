@@ -15,6 +15,14 @@
   var SEEK_COOLDOWN = 3000;
   var POLL_BASE = 3000;
   var POLL_MAX = 5000;
+  // When the answer carries no "remaining" hint we cannot size the sleep, so we
+  // fast-poll a few times (the audio usually appears in a couple of seconds),
+  // then back off — the same idea as vot.js (3 s -> 5 s -> 10 s -> 20 s) instead
+  // of hammering the server every 3 s for minutes.
+  var POLL_NO_HINT = 3000;
+  var POLL_FAST_TRIES = 3;
+  var POLL_SLOW = 8000;
+  var POLL_SLOW_MAX = 20000;
   // How long we keep asking Yandex while the PC is downloading/uploading the
   // source audio. The PC needs 30-150 s (download + 10 chunks), and Yandex
   // answers 6 the whole time, so the normal "status 6 = dead end" logic must
@@ -79,7 +87,13 @@
     pcDeadline: 0,
     pcFailed: false,
     pcDone: false,
-    pcWaits: 0
+    pcWaits: 0,
+    // Сколько раз продлевали ожидание ПК-филлера после «timeout waiting»
+    // (сервер синтезирует дольше своего max_wait). Кэп — в handleResp.
+    pcExtends: 0,
+    // Сколько опросов сделано для текущего ролика: по нему растёт пауза, когда
+    // сервер не прислал подсказку remaining (иначе спали бы опросы подряд).
+    polls: 0
   };
 
   var statusEl = null;
@@ -611,9 +625,23 @@
     // уже не нужен, не начинаем воспроизведение и не тратим запросы.
     if (state.skipLangBlock === id) { state.busy = false; return; }
     log('resp status=' + r.status + ' tid=' + r.translationId + (r.remaining != null ? ' rem=' + r.remaining : '') +
-      ' lively=' + (r.lively ? 1 : 0));
+      ' lively=' + (r.lively ? 1 : 0) + (r.lang ? ' lang=' + r.lang : '') +
+      (r.allow === false ? ' allow=0' : '') + (r.shouldRetry === false ? ' retry=0' : ''));
     if (r.translationId) state.translationId = r.translationId;
     if (r.lively) state.livelyVoice = true;
+    // Поле 8 ответа — язык оригинала от самого Яндекса. Оно приходит уже в
+    // первом ответе (~1-2 с), поэтому решение «ролик на исключённом языке»
+    // больше не ждёт yt-dlp на ПК (холодный кэш ~10 с). Проверяем ДО запуска
+    // звука: иначе русский ролик успевал заиграть на секунду и глох.
+    if (r.lang) {
+      var rl = String(r.lang).toLowerCase();
+      if (rl !== state.origLang) {
+        state.origLang = rl;
+        log('resp lang=' + rl + ' (field 8)');
+      }
+      maybeSkipNow(id, rl);
+      if (state.skipLangBlock === id) { state.busy = false; return; }
+    }
     if (r.status === 1 && r.audioUrl) { state.busy = false; onReady(r.audioUrl); return; }
     // status 5 = partial_ready: the audio URL already works, only the tail of
     // the video is still being translated. Start playing right away instead
@@ -629,7 +657,14 @@
     // never let those codes reach the failure branches below.
     if (state.pcTried && !state.pcDone && (r.status === 6 || r.status === 0)) {
       state.busy = false;
-      if (state.pcFailed) return;
+      // ПК-филлер уже упал (нет куки / yt-dlp не смог скачать звук). Опрос
+      // дальше бессмысленен, но и молча выходить нельзя: на экране оставалось
+      // старое «ПК готовит звук…», и пользователь не понимал, что случилось.
+      if (state.pcFailed) {
+        log('fill failed -> stop polling status=' + r.status);
+        setStatus('Перевод: сервер не отдаёт этот ролик\nПК-филлер не смог скачать звук', '#e53935');
+        return;
+      }
       if (!state.pcDeadline) state.pcDeadline = Date.now() + PC_FILL_WAIT;
       var left = Math.round((state.pcDeadline - Date.now()) / 1000);
       if (left <= 0) {
@@ -655,6 +690,23 @@
           }
           if (fr.state === 'err' || fr.state === 'offline') {
             var why = (fr.res && (fr.res.error || fr.res.status)) || fr.state;
+            // "timeout waiting for the translation" — это НЕ провал филлера:
+            // звук уже загружен, Яндекс просто ещё синтезирует (у нас замер
+            // 648-секундного ролика: status=3, rem≈175с, дольше max_wait ПК).
+            // Раньше мы гасили опрос и показывали ошибку, хотя перевод вот-вот
+            // должен был появиться. Продолжаем ждать своим опросом.
+            if (/timeout waiting/i.test(String(why))) {
+              // Продлеваем ожидание, но не бесконечно: /fill_status помнит
+              // последний результат и отдаёт его вечно, так что без счётчика
+              // провалившаяся задача держала бы опрос часами.
+              state.pcExtends = (state.pcExtends || 0) + 1;
+              if (state.pcExtends <= 5) {
+                log('fill: server still synthesizing (' + why + ') -> keep polling n=' + state.pcExtends);
+                state.pcDeadline = Math.max(state.pcDeadline || 0, Date.now() + 120000);
+                return;
+              }
+              log('fill: still synthesizing after ' + state.pcExtends + ' extensions, giving up');
+            }
             state.pcFailed = true;
             state.pcDeadline = 0;
             state.busy = false;
@@ -683,16 +735,29 @@
         uploadRealAudio(id, dur, state.translationId);
         return;
       }
+      // Поле 11 (allowToTranslateVideo) = 0 значит «это видео перевести нельзя»:
+      // ни повтор, ни другой шард, ни ПК-филлер вердикт не изменят, поэтому
+      // отказываем сразу, а не после 40-секундной лестницы. После нашей
+      // загрузки звука флагу не верим: там 0 означал «не смог декодировать».
+      if (r.allow === false && !state.audioUploaded) {
+        log('status=0 allow=0 -> terminal msg=' + msg);
+        setStatus('Перевод: сервер отказывается переводить этот ролик', '#e53935');
+        return;
+      }
       // "Не удается перевести видео, попробуйте позже" is often transient: retry
       // the first request once before giving up. Yandex caches the verdict by
       // translationId and answers in ~0.1 s, so this retry costs almost nothing.
-      if (!state.retried && /позже|later|try/i.test(msg)) {
+      // Поле 12 (shouldRetry) = 0 говорит, что повтор бессмысленен — тот же
+      // вердикт лежит в кэше по этому translationId. Другой шард (escalate)
+      // всё равно остаётся: там задача другая.
+      if (!state.retried && r.shouldRetry !== false && /позже|later|try/i.test(msg)) {
         state.retried = true;
         log('retry after status=0 msg=' + msg);
         setStatus('Перевод: повторяю запрос…', '#f5a623');
         setTimeout(function () { if (state.curId === id) startTranslation(id, dur); }, 2000);
         return;
       }
+      if (r.shouldRetry === false) log('status=0 retry=0 -> no repeat msg=' + msg);
       // status=0 is terminal for this translationId only, and the task id lives
       // in one shard: the other shard may still hold a working cache entry (and
       // whatever we get there can be filled from the PC). Without this ladder a
@@ -717,6 +782,10 @@
       // the browser clients fill; then let the PC dev server fill it (yt-dlp with
       // the browser cookies downloads the track there and uploads it, after which
       // this very video turns into status=1; nothing is downloaded on the TV).
+      // Поле 11 при status=6 НЕ трактуем как отказ: «нужен звук» — это обычный
+      // ответ для ролика без кэша, и ПК-филлер его лечит. Только пишем в лог,
+      // чтобы по прогонам понять, приходит ли флаг вместе с 6.
+      if (r.allow === false) log('status=6 allow=0 (ignored: audio can still be supplied) msg=' + (r.message || ''));
       if (escalate(id, dur, r, 'status=6')) return;
       state.busy = false;
       // Both shards are empty. Handing Yandex the real audio is what the browser
@@ -982,23 +1051,21 @@
     // Если решить сразу, русский ролик успеет уехать в перевод — ждём метаданные.
     if (skip && !orig) {
       var mt = metaTries || 0;
-      // Ждём метаданные недолго: у закэшированных роликов язык приходит за ~0.1 с,
-      // у холодных — несколько секунд. Долгое ожидание ломает быстрый старт
-      // перевода, поэтому после ~4.5 с стартуем, а если язык позже окажется
-      // исключённым — гасим перевод (maybeSkipNow).
-      if (mt < 3) {
-        // Первый тик короткий: у тёплого кэша язык приходит за ~0.1–0.4 с,
-        // и ждать полтора секунды впустую незачем.
-        var waitMs = (mt === 0) ? 600 : 1500;
+      // Язык оригинала теперь приходит и в первом ответе Яндекса (поле 8),
+      // поэтому yt-dlp больше не на критическом пути: одна короткая попытка
+      // поймать тёплый кэш метаданных (~0.1–0.4 с), дальше стартуем сразу.
+      // Если язык окажется исключённым, handleResp гасит перевод ДО запуска
+      // звука (maybeSkipNow) — русский ролик не успевает заиграть.
+      if (mt < 1) {
         log('translate waiting for source lang try=' + (mt + 1) + ' id=' + id);
         setTimeout(function () {
           if (state.curId === id) startTranslation(id, dur, lang, mt + 1);
-        }, waitMs);
+        }, 500);
         return;
       }
       log('translate: source lang unknown, starting anyway id=' + id);
     }
-    if (skip && orig && skip === orig) {
+    if (skip && orig && langBase(orig) === langBase(skip)) {
       state.busy = false;
       log('translate skipped: source lang=' + orig + ' matches skipLang=' + skip + ' id=' + id);
       setStatus('Перевод: ролик на языке «' + langLabel(orig) + '»\n(исключён в настройках)', '#90a4ae');
@@ -1018,19 +1085,31 @@
   function poll(id, dur, remaining) {
     // Перевод отменён (язык исключён) — не тратим запросы и поллинг.
     if (state.skipLangBlock === id) { state.busy = false; return; }
-    if (remaining <= 0) { state.busy = false; setStatus('Перевод: нет готового перевода', '#e53935'); return; }
-    // The server hint ("rem=71") is very conservative: in practice the
-    // translation shows up much sooner, so never sleep longer than POLL_MAX.
-    var delay = Math.min(Math.max(POLL_BASE, remaining * 1000), POLL_MAX);
+    // remaining приходит из ответа (поле 5) и может отсутствовать. Раньше
+    // «нет подсказки» превращалось в Math.min(..., >NaN<) и setTimeout(NaN) =
+    // мгновенный повтор: шторм запросов к Яндексу. Теперь «неизвестно» = -1.
+    var rem = (typeof remaining === 'number' && isFinite(remaining)) ? remaining : -1;
+    if (rem === 0) { state.busy = false; setStatus('Перевод: нет готового перевода', '#e53935'); return; }
+    state.polls = (state.polls || 0) + 1;
+    var delay;
+    if (rem < 0) {
+      delay = (state.polls <= POLL_FAST_TRIES)
+        ? POLL_NO_HINT
+        : Math.min(POLL_SLOW * (state.polls - POLL_FAST_TRIES), POLL_SLOW_MAX);
+    } else {
+      // The server hint ("rem=71") is very conservative: in practice the
+      // translation shows up much sooner, so never sleep longer than POLL_MAX.
+      delay = Math.min(Math.max(POLL_BASE, rem * 1000), POLL_MAX);
+    }
     setStatus((state.active ? 'Перевод: играю, доготовится…' : 'Перевод: в очереди/переводится…') +
-      ' (~' + remaining + 'с)', '#f5a623');
-    log('poll in ' + (delay / 1000).toFixed(0) + 's rem=' + remaining);
+      (rem > 0 ? ' (~' + rem + 'с)' : ''), '#f5a623');
+    log('poll in ' + (delay / 1000).toFixed(0) + 's rem=' + rem + ' n=' + state.polls);
     setTimeout(function () {
       // За время ожидания перевод мог быть отменён (пришёл язык из skipLang).
       if (state.skipLangBlock === id || state.curId !== id) { state.busy = false; return; }
       http('POST', '/translate',
         { videoUrl: watchUrl(id), duration: dur, firstRequest: false, lang: state.lang || 'en', targetLang: 'ru' },
-        function (r) { handleResp(r, id, dur, Math.max(3, remaining - 1)); },
+        function (r) { handleResp(r, id, dur, rem > 0 ? Math.max(3, rem - 1) : -1); },
         function (e) { state.busy = false; setStatus('Перевод: ошибка поллинга\n' + e, '#e53935'); log('poll ERR ' + e); });
     }, delay);
   }
@@ -1298,6 +1377,8 @@
     state.pcFailed = false;
     state.pcDone = false;
     state.pcWaits = 0;
+    state.pcExtends = 0;
+    state.polls = 0;
     state.livelyVoice = false;
     state.playedOnce = false;
     state.restarting = false;
@@ -1401,6 +1482,13 @@
     return String(code || '') || 'не выбрано';
   }
 
+  // «ru-RU», «RU», «ru» — один язык: Яндекс и yt-dlp отдают тег с регионом, а в
+  // настройках лежит двухбуквенный код. Без нормализации сравнение промахивалось
+  // и русский ролик уезжал в перевод (замечание ревью).
+  function langBase(code) {
+    return String(code || '').toLowerCase().split('-')[0];
+  }
+
   // Базовый URL ПК-сервера: мост на ТВ (/fill_status и др.) проксирует только
   // фиксированные пути, поэтому /meta спрашиваем у ПК напрямую.
   var PC_BASE = 'http://192.168.1.186:8013';
@@ -1426,8 +1514,8 @@
   // Ролик оказался на исключённом языке (по умолчанию русский) уже после старта
   // перевода: гасим звук перевода и блокируем повторный запуск для этого id.
   function maybeSkipNow(id, lang) {
-    var skip = String(uiPref('skipLang', 'ru') || '').toLowerCase();
-    if (!skip || String(lang || '').toLowerCase() !== skip) return;
+    var skip = langBase(uiPref('skipLang', 'ru'));
+    if (!skip || langBase(lang) !== skip) return;
     if (state.skipLangBlock === id) return;
     state.skipLangBlock = id;
     var wasRunning = state.active || state.audioPaused || state.busy;

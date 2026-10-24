@@ -349,6 +349,8 @@ third_party/rust/target/
 # local secrets and machine-specific state (never commit)
 dev_server/vot_secret.json
 dev_server/yt_cookies.txt
+# backups / exports of the same jar (any name that starts with yt_cookies)
+dev_server/yt_cookies*.txt
 vot_bridge/logs/
 # scratch dumps / stray root artefacts
 *.log

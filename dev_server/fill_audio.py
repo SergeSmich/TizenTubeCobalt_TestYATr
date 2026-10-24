@@ -21,10 +21,12 @@ CLI (used for one-off testing):
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import uuid
 
 import vot_probe as vp
 
@@ -37,25 +39,62 @@ DEFAULT_CLIENTS = ("web_embedded", "tv_embedded", "web_safari", "default")
 # Yandex converts AAC/mp4 only; opus/webm uploads are accepted (http 200) and
 # then ignored, leaving the translation at status=6 forever.
 ACCEPTED_EXT = (".m4a", ".mp4", ".aac")
+# yt-dlp prints these when the cookie jar carries no login: it is an account
+# problem, so no other client/format can help (see BOT_GATE use in download()).
+BOT_GATE = (
+    "Sign in to confirm you're not a bot",
+    "cookies for the authentication",
+)
 
 
 # ---------------------------------------------------------------- yt-dlp
 def _cookie_args(cookies_file, browser):
-    """--cookies wins; otherwise let yt-dlp read (and dump) the browser jar."""
+    """--cookies wins; otherwise let yt-dlp read (and dump) the browser jar.
+
+    Returns (args, how, temp_jar): temp_jar is our private copy and must be
+    removed by the caller when the run is over.
+    """
     if (
         cookies_file
         and os.path.isfile(cookies_file)
         and os.path.getsize(cookies_file) > 0
     ):
-        return ["--cookies", cookies_file], "file:" + os.path.basename(cookies_file)
+        # yt-dlp writes the jar back on exit, and a bot-gate answer comes with
+        # Set-Cookie that wipes the session (proved 24.10: after one failed run
+        # the exported jar lost SID/LOGIN_INFO and every download turned into
+        # "Sign in to confirm you're not a bot"). Work on a copy, so a bad video
+        # can never destroy the login the owner exported by hand.
+        #
+        # The copy is per run (pid + random) because two /fill jobs may run at
+        # once: sharing one file let one job's bot-gate Set-Cookie leak into the
+        # other job's jar.
+        try:
+            tmp_dir = os.path.join(tempfile.gettempdir(), "votfill")
+            os.makedirs(tmp_dir, exist_ok=True)
+            tmp = os.path.join(
+                tmp_dir, f"yt_cookies_run_{os.getpid()}_{uuid.uuid4().hex[:6]}.txt"
+            )
+            shutil.copyfile(cookies_file, tmp)
+            return (
+                ["--cookies", tmp],
+                "file:" + os.path.basename(cookies_file) + " (copy)",
+                tmp,
+            )
+        except OSError as e:
+            print(f"fill: cookie copy failed ({e}), using the file as is", flush=True)
+        return (
+            ["--cookies", cookies_file],
+            "file:" + os.path.basename(cookies_file),
+            None,
+        )
     if browser:
         # yt-dlp dumps the jar into --cookies on exit, so one successful run
         # with the browser closed is enough for every later run.
         args = ["--cookies-from-browser", browser]
         if cookies_file:
             args += ["--cookies", cookies_file]
-        return args, "browser:" + browser
-    return [], "none"
+        return args, "browser:" + browser, None
+    return [], "none", None
 
 
 def download(
@@ -71,6 +110,36 @@ def download(
 ):
     """Fetch the original audio track. Returns (path, itag, size).
 
+    The cookie jar is only ever used through a private per-run copy: yt-dlp
+    rewrites whatever file it is given, and a bot-gate answer wipes the login
+    from it, so the exported master jar must stay untouched.
+    """
+    cargs, how, tmp_jar = _cookie_args(cookies_file, browser)
+    try:
+        return _download_with(
+            video_url, out_dir, cargs, how, fmt, log, timeout, clients, js_runtime
+        )
+    finally:
+        if tmp_jar:
+            try:
+                os.remove(tmp_jar)
+            except OSError:
+                pass
+
+
+def _download_with(
+    video_url,
+    out_dir,
+    cargs,
+    how,
+    fmt,
+    log,
+    timeout,
+    clients,
+    js_runtime,
+):
+    """Inner half of download(): the format x client ladder.
+
     Two things are mandatory on this PC (both proved the hard way):
       * cookies - without them every client answers "Sign in to confirm
         you're not a bot";
@@ -80,7 +149,6 @@ def download(
         (yt-dlp issue 12482), the embedded clients still hand out plain urls.
     """
     os.makedirs(out_dir, exist_ok=True)
-    cargs, how = _cookie_args(cookies_file, browser)
     tpl = os.path.join(out_dir, "%(id)s.%(ext)s")
     last = ""
     # Format-major: try the requested AAC format on every client before falling
@@ -92,6 +160,7 @@ def download(
             fmts.append(f)
     todo = [(f, c) for f in fmts for c in (clients or DEFAULT_CLIENTS)]
     refused = set()
+    gate = 0
     for fmt, client in todo:
         if fmt in refused:
             continue
@@ -141,6 +210,22 @@ def download(
         if p.returncode != 0 or len(out) < 2:
             last = (p.stderr or p.stdout or "").strip().replace("\n", " ")[-300:]
             log(f"fill: yt-dlp client={client} failed: {last}")
+            # "Sign in to confirm you're not a bot" is the cookie jar talking, not
+            # the client: every remaining client answers the same (proved on
+            # DaeWIAqoEfI 24.10 — web_embedded/tv/android_vr/web_safari, and with
+            # no cookies at all the answer is byte-identical). Give up after the
+            # second hit instead of walking the whole format x client ladder,
+            # which kept the TV waiting ~40-60 s for a verdict we already knew.
+            if any(m in last for m in BOT_GATE):
+                gate += 1
+                log(
+                    f"fill: bot gate {gate} client={client} -> cookie jar is not logged in"
+                )
+                if gate >= 2:
+                    raise RuntimeError(
+                        "нужен вход в YouTube: куки не авторизованы "
+                        "(Sign in to confirm you're not a bot)"
+                    )
             continue
         path, fid = out[-2].strip(), out[-1].strip()
         if not os.path.isfile(path):
