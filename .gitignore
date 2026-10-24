@@ -352,6 +352,7 @@ dev_server/yt_cookies.txt
 vot_bridge/logs/
 # scratch dumps / stray root artefacts
 *.log
+/_shots/
 /0
 _v_repo/
 _vhost/

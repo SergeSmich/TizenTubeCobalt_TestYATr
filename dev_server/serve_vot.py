@@ -9,6 +9,8 @@ import http.server
 import json
 import pathlib
 import socketserver
+import subprocess
+import sys
 import threading
 import time
 import traceback
@@ -22,6 +24,81 @@ COOKIES = ROOT / "yt_cookies.txt"
 # videoId -> {"state": "run"|"ok"|"err", "res": {...}, "t": epoch}
 FILL_JOBS = {}
 FILL_LOCK = threading.Lock()
+
+# videoId -> {"ok": bool, "lang": "en", "duration": "123", "title": "..."}
+# The TV build has no ytInitialPlayerResponse, so the original language of a
+# video can only be obtained here (yt-dlp metadata) and handed to the overlay.
+META_CACHE = {}
+# videoId, для которых метаданные уже грузятся в фоне (чтобы не плодить потоки).
+META_PENDING = set()
+# Один замок на оба словаря: HTTP-сервер многопоточный, а проверка
+# «нет в кэше и нет в очереди» + постановка в очередь должны быть атомарны,
+# иначе на один ролик запускается два тяжёлых yt-dlp.
+META_LOCK = threading.Lock()
+
+
+def _meta_worker(vid):
+    args = [
+        sys.executable,
+        "-m",
+        "yt_dlp",
+        "--skip-download",
+        "--no-playlist",
+        "--no-warnings",
+        "--js-runtimes",
+        "node",
+        "--extractor-args",
+        "youtube:player_client=web_embedded",
+        "--print",
+        "%(language)s\t%(duration)s\t%(title)s",
+    ]
+    if COOKIES.is_file():
+        args += ["--cookies", str(COOKIES)]
+    args.append("https://www.youtube.com/watch?v=" + vid)
+    try:
+        p = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            encoding="utf-8",
+            errors="replace",
+        )
+        lines = (p.stdout or "").strip().splitlines()
+        if not lines:
+            return {
+                "ok": False,
+                "err": ((p.stderr or "no output")[-300:]).replace("\n", " "),
+            }
+        parts = lines[-1].split("\t")
+        lang = (parts[0] or "").strip()
+        if lang in ("NA", "None", "null"):
+            lang = ""
+        return {
+            "ok": True,
+            "videoId": vid,
+            "lang": lang,
+            "duration": parts[1] if len(parts) > 1 else "",
+            "title": parts[2] if len(parts) > 2 else "",
+        }
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "err": "timeout"}
+    except Exception as e:  # noqa: BLE001 - dev tool, report as text
+        return {"ok": False, "err": str(e)[:200]}
+
+
+def _meta_prefetch(vid):
+    """Фоновая догрузка метаданных: /fill_status не должен ждать yt-dlp."""
+    try:
+        r = _meta_worker(vid)
+        if r.get("ok"):
+            with META_LOCK:
+                META_CACHE[vid] = r
+    except Exception:  # noqa: BLE001 - dev tool
+        pass
+    finally:
+        with META_LOCK:
+            META_PENDING.discard(vid)
 
 
 def _fill_worker(vid, duration, tid, lang):
@@ -192,11 +269,54 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if "videoId=" in self.path:
                 vid = self.path.split("videoId=", 1)[1].split("&")[0]
             with FILL_LOCK:
-                job = FILL_JOBS.get(vid) or {"state": "none", "res": {}, "t": 0}
+                job = dict(FILL_JOBS.get(vid) or {"state": "none", "res": {}, "t": 0})
+            # Язык оригинала для пункта «не переводить с языка»: на ТВ нет
+            # ytInitialPlayerResponse, а прямой GET к ПК из HTTPS-страницы не
+            # доходит (mixed content). Мост проксирует именно /fill_status,
+            # поэтому метаданные отдаём здесь: из кэша сразу, иначе — фоном.
+            if vid:
+                with META_LOCK:
+                    meta = META_CACHE.get(vid)
+                    need_prefetch = meta is None and vid not in META_PENDING
+                    if need_prefetch:
+                        META_PENDING.add(vid)
+                # Поток запускаем вне замка: старт thread'а не должен ждать.
+                if need_prefetch:
+                    threading.Thread(
+                        target=_meta_prefetch, args=(vid,), daemon=True
+                    ).start()
+                if meta and meta.get("ok"):
+                    job["lang"] = meta.get("lang") or ""
+                    job["title"] = meta.get("title") or ""
             self._send(
                 200,
                 "application/json; charset=utf-8",
                 json.dumps(job, ensure_ascii=False).encode("utf-8"),
+            )
+            return
+        if self.path.startswith("/meta"):
+            vid = ""
+            if "videoId=" in self.path:
+                vid = self.path.split("videoId=", 1)[1].split("&")[0].strip()
+            if not vid:
+                self._send(
+                    400,
+                    "application/json; charset=utf-8",
+                    b'{"ok":false,"err":"videoId required"}',
+                )
+                return
+            with META_LOCK:
+                cached = META_CACHE.get(vid)
+            if cached is None:
+                # yt-dlp takes a few seconds: the TV thread waits, the server
+                # is threaded so other requests keep flowing.
+                cached = _meta_worker(vid)
+                with META_LOCK:
+                    META_CACHE[vid] = cached
+            self._send(
+                200,
+                "application/json; charset=utf-8",
+                json.dumps(cached, ensure_ascii=False).encode("utf-8"),
             )
             return
         if self.path.startswith("/vot_config.json"):
@@ -210,14 +330,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
             )
             return
         else:
-            path = ROOT / "vot.js"
-            ctype = "application/javascript; charset=utf-8"
-        try:
-            body = path.read_bytes()
-        except OSError as e:
-            self._send(404, "text/plain", str(e).encode())
+            # One URL for the whole overlay: the UI layer first, then the main
+            # script. The native userscript injection only knows a single URL, so
+            # concatenating here keeps "one file to inject" without a build step.
+            body = b""
+            for name in ("vot_ui.js", "vot.js"):
+                p = ROOT / name
+                try:
+                    body += p.read_bytes() + b"\n;\n"
+                except OSError as e:
+                    if name == "vot.js":
+                        self._send(404, "text/plain", str(e).encode())
+                        return
+            self._send(200, "application/javascript; charset=utf-8", body)
             return
-        self._send(200, ctype, body)
 
     def do_OPTIONS(self):
         self._send(204, "text/plain", b"")
@@ -296,6 +422,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
 class ThreadingServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        """ТВ закрывает keep-alive соединения (WinError 10054) — это норма,
+        а socketserver по умолчанию печатает на каждый случай полный трейсбек."""
+        import sys as _sys
+
+        exc = _sys.exc_info()[1]
+        if isinstance(
+            exc, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)
+        ):
+            return
+        super().handle_error(request, client_address)
 
 
 if __name__ == "__main__":

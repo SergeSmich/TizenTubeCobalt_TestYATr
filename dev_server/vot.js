@@ -48,11 +48,18 @@
     // We used to send "auto", which is a separate, nearly empty shard — every
     // request started a fresh synthesis (~50 s) or ended in status 6.
     lang: 'en',
+    // Язык оригинала (с ПК) и последний статус для панели. Пустые по умолчанию:
+    // язык становится известен асинхронно, после /fill_status.
+    origLang: '',
+    uiStatus: '',
     altLangTried: false,
     audioTried: false,
     playedOnce: false,
     restarting: false,
     lastSeek: 0,
+    // id ролика, перевод которого отменён навсегда: язык оригинала оказался
+    // исключённым (skipLang). Сбрасывается при смене ролика.
+    skipLangBlock: null,
     pcTried: false,
     pcDeadline: 0,
     pcFailed: false,
@@ -117,6 +124,7 @@
   }
 
   function setStatus(text, color) {
+    try { state.uiStatus = String(text || ''); } catch (e0) { }
     try {
       var el = ensureStatus();
       if (!el) return;
@@ -521,13 +529,18 @@
   }
 
   function pcFillAllowed() {
-    return !state.pcTried && (!state.cfg || state.cfg.pcFill !== false);
+    // Лог и решение должны совпадать: раньше отсутствие конфига писалось как
+    // «cfg_off=1», хотя филлер в этом случае разрешён.
+    if (uiPref('pcFill.enabled', true) === false) { log('pcFill denied: pref off'); return false; }
+    if (state.cfg && state.cfg.pcFill === false) { log('pcFill denied: cfg off'); return false; }
+    if (state.pcTried) { log('pcFill denied: already tried'); return false; }
+    return true;
   }
 
   // Both shards are dead (or the task id is terminal): the same ladder as
   // status=6 — look in the other shard, then let the PC fill the cache.
   function escalate(id, dur, r, why) {
-    if (!state.altLangTried) {
+    if (!state.altLangTried && uiPref('otherShard.enabled', true) !== false) {
       state.altLangTried = true;
       state.retried = false; // a fresh shard means a fresh task id: retry again
       var alt = (state.lang === 'en') ? 'auto' : 'en';
@@ -546,6 +559,9 @@
     // A poll scheduled for the previous video can land after the user switched:
     // acting on it would poison altLangTried/pcTried/retried for the new video.
     if (state.curId !== id) return;
+    // Язык оригинала пришёл позже и оказался исключённым (русский): перевод
+    // уже не нужен, не начинаем воспроизведение и не тратим запросы.
+    if (state.skipLangBlock === id) { state.busy = false; return; }
     log('resp status=' + r.status + ' tid=' + r.translationId + (r.remaining != null ? ' rem=' + r.remaining : '') +
       ' lively=' + (r.lively ? 1 : 0));
     if (r.translationId) state.translationId = r.translationId;
@@ -898,10 +914,47 @@
       });
   }
 
-  function startTranslation(id, dur, lang) {
+  function startTranslation(id, dur, lang, metaTries) {
     if (state.busy) return;
+    if (state.skipLangBlock === id) { state.busy = false; return; }
+    if (uiPref('translate.enabled', true) === false) {
+      state.busy = false;
+      log('translate skipped: disabled in prefs id=' + id);
+      setStatus('Перевод выключен в настройках\nвключить: F4 → «Перевод включён»', '#90a4ae');
+      return;
+    }
+    // Перевод нужен «с иностранного на русский», поэтому по умолчанию
+    // исключён русский: ролик на русском переводить не надо.
+    var skip = String(uiPref('skipLang', 'ru') || '').toLowerCase();
+    var orig = String(state.origLang || '').toLowerCase();
+    // Язык оригинала приходит с ПК асинхронно (yt-dlp, холодный кэш ~10 с).
+    // Если решить сразу, русский ролик успеет уехать в перевод — ждём метаданные.
+    if (skip && !orig) {
+      var mt = metaTries || 0;
+      // Ждём метаданные недолго: у закэшированных роликов язык приходит за ~0.1 с,
+      // у холодных — несколько секунд. Долгое ожидание ломает быстрый старт
+      // перевода, поэтому после ~4.5 с стартуем, а если язык позже окажется
+      // исключённым — гасим перевод (maybeSkipNow).
+      if (mt < 3) {
+        // Первый тик короткий: у тёплого кэша язык приходит за ~0.1–0.4 с,
+        // и ждать полтора секунды впустую незачем.
+        var waitMs = (mt === 0) ? 600 : 1500;
+        log('translate waiting for source lang try=' + (mt + 1) + ' id=' + id);
+        setTimeout(function () {
+          if (state.curId === id) startTranslation(id, dur, lang, mt + 1);
+        }, waitMs);
+        return;
+      }
+      log('translate: source lang unknown, starting anyway id=' + id);
+    }
+    if (skip && orig && skip === orig) {
+      state.busy = false;
+      log('translate skipped: source lang=' + orig + ' matches skipLang=' + skip + ' id=' + id);
+      setStatus('Перевод: ролик на языке «' + langLabel(orig) + '»\n(исключён в настройках)', '#90a4ae');
+      return;
+    }
     state.busy = true;
-    state.lang = lang || state.lang || 'en';
+    state.lang = (lang && lang !== 'auto') ? lang : (uiPref('shard', 'auto') === 'en' ? 'en' : (lang || state.lang || 'en'));
     state.title = (typeof document.title === 'string') ? document.title : '';
     setStatus('Перевод: отправляю запрос…\nvideo=' + id + ' · ' + Math.round(dur) + 'с', '#f5a623');
     log('translate start id=' + id + ' dur=' + dur.toFixed(1) + ' lang=' + state.lang);
@@ -912,6 +965,8 @@
   }
 
   function poll(id, dur, remaining) {
+    // Перевод отменён (язык исключён) — не тратим запросы и поллинг.
+    if (state.skipLangBlock === id) { state.busy = false; return; }
     if (remaining <= 0) { state.busy = false; setStatus('Перевод: нет готового перевода', '#e53935'); return; }
     // The server hint ("rem=71") is very conservative: in practice the
     // translation shows up much sooner, so never sleep longer than POLL_MAX.
@@ -920,6 +975,8 @@
       ' (~' + remaining + 'с)', '#f5a623');
     log('poll in ' + (delay / 1000).toFixed(0) + 's rem=' + remaining);
     setTimeout(function () {
+      // За время ожидания перевод мог быть отменён (пришёл язык из skipLang).
+      if (state.skipLangBlock === id || state.curId !== id) { state.busy = false; return; }
       http('POST', '/translate',
         { videoUrl: watchUrl(id), duration: dur, firstRequest: false, lang: state.lang || 'en', targetLang: 'ru' },
         function (r) { handleResp(r, id, dur, Math.max(3, remaining - 1)); },
@@ -1002,6 +1059,9 @@
       state.busy = false;
       state.playedOnce = true;
       log('play offset=' + offset.toFixed(1));
+      // Перевод пошёл — сразу применяем ЕГО громкость: иначе играет 100%,
+      // пока пользователь не тронет ползунок заново.
+      applyVolume();
       if (!state.loop) { state.loop = true; syncLoop(); }
       if (done) done();
     }, function (e) {
@@ -1046,6 +1106,8 @@
     state.partial = false;
     state.curUrl = null;
     state.lastSeek = 0;
+    // Вернулись к оригиналу — вернуть его громкость.
+    applyVolume();
     if (clearTranslation) {
       state.translationId = null;
       state.audioUploaded = false;
@@ -1148,6 +1210,10 @@
     state.busy = false;
     state.active = false;
     state.audioPaused = false;
+    // Язык оригинала относится к конкретному ролику: без сброса предыдущее
+    // значение (например ru) применится к новому видео и оно будет пропущено.
+    state.origLang = '';
+    state.skipLangBlock = null;
     state.loop = false;
     state.partial = false;
     state.curUrl = null;
@@ -1171,6 +1237,7 @@
     http('POST', '/stop', { }, function () { }, function () { });
     setStatus('Перевод: видео найдено, жду плеер…\nvideo=' + id, '#90a4ae');
     log('watch detected id=' + id);
+    fetchMeta(id);
     var tries = 0;
     (function wait() {
       var v = findVideo();
@@ -1191,4 +1258,457 @@
       }
     })();
   }, 1500);
+
+  // ===== VOT-UI BEGIN: панель настроек перевода (рендерит vot_ui.js) =====
+  function uiPref(k, d) {
+    try { return window.VOTUI ? VOTUI.pref(k, d) : d; } catch (e) { return d; }
+  }
+  function uiSet(k, v) {
+    try { if (window.VOTUI) VOTUI.setPref(k, v); return; } catch (e) { }
+    try { localStorage.setItem('vot-ui-' + k, JSON.stringify(v)); } catch (e2) { }
+  }
+  function uiToast(m, ms) {
+    try { if (window.VOTUI) VOTUI.toast(m, ms); } catch (e) { }
+  }
+
+  // Пока микс недоступен (одна аудиодорожка на поток), «оригинал» задаёт громкость,
+  // когда играет оригинал, «перевод» — когда играет перевод.
+  function applyVolume() {
+    var v = findVideo();
+    if (!v) return;
+    var pct = Number(state.active ? uiPref('vol.translate', 100) : uiPref('vol.original', 100));
+    if (isNaN(pct)) pct = 100;
+    try { v.muted = (pct <= 0); } catch (e) { }
+    try { v.volume = Math.max(0, Math.min(1, pct / 100)); } catch (e2) { }
+    // Cobalt может игнорировать v.volume (звук идёт мимо WebAudio), поэтому
+    // логируем и запрошенное, и фактическое значение — иначе не отличить
+    // «ползунок не работает» от «громкость применяется на стороне плеера».
+    var got = 1;
+    try { got = v.volume; } catch (e3) { got = -1; }
+    log('vol pct=' + pct + ' active=' + (state.active ? 1 : 0) + ' muted=' + (v.muted ? 1 : 0)
+      + ' got=' + got);
+  }
+
+  var VOT_LANGS = [
+    { label: 'не выбрано', value: '' },
+    { label: 'русский', value: 'ru' },
+    { label: 'английский', value: 'en' },
+    { label: 'украинский', value: 'uk' },
+    { label: 'казахский', value: 'kk' },
+    { label: 'немецкий', value: 'de' },
+    { label: 'французский', value: 'fr' },
+    { label: 'испанский', value: 'es' }
+  ];
+
+  function langLabel(code) {
+    for (var i = 0; i < VOT_LANGS.length; i++) {
+      if (String(VOT_LANGS[i].value) === String(code)) return VOT_LANGS[i].label;
+    }
+    return String(code || '') || 'не выбрано';
+  }
+
+  // Базовый URL ПК-сервера: мост на ТВ (/fill_status и др.) проксирует только
+  // фиксированные пути, поэтому /meta спрашиваем у ПК напрямую.
+  var PC_BASE = 'http://192.168.1.186:8013';
+
+  function httpPC(method, path, body, cb, err) {
+    try {
+      var x = new XMLHttpRequest();
+      x.open(method, PC_BASE + path, true);
+      if (body) x.setRequestHeader('Content-Type', 'application/json');
+      x.onreadystatechange = function () {
+        if (x.readyState !== 4) return;
+        if (x.status === 200) {
+          try { cb(JSON.parse(x.responseText)); } catch (e) { (err || function () { })(e); }
+        } else {
+          (err || function () { })(new Error('http ' + x.status + ' ' + String(x.responseText || '').slice(0, 160)));
+        }
+      };
+      x.onerror = function () { (err || function () { })(new Error('network')); };
+      x.send(body ? JSON.stringify(body) : null);
+    } catch (e) { (err || function () { })(e); }
+  }
+
+  // Ролик оказался на исключённом языке (по умолчанию русский) уже после старта
+  // перевода: гасим звук перевода и блокируем повторный запуск для этого id.
+  function maybeSkipNow(id, lang) {
+    var skip = String(uiPref('skipLang', 'ru') || '').toLowerCase();
+    if (!skip || String(lang || '').toLowerCase() !== skip) return;
+    if (state.skipLangBlock === id) return;
+    state.skipLangBlock = id;
+    var wasRunning = state.active || state.audioPaused || state.busy;
+    log((wasRunning ? 'translate abort: source lang=' : 'translate skip (late meta): source lang=')
+      + lang + ' matches skipLang=' + skip + ' id=' + id);
+    state.busy = false;
+    if (wasRunning) stopAudio(true);
+    setStatus('Перевод: ролик на языке «' + langLabel(lang) + '»\n(исключён в настройках)', '#90a4ae');
+  }
+
+  // Язык оригинала: на ТВ-сборке ytInitialPlayerResponse нет, поэтому язык
+  // спрашиваем у ПК (yt-dlp metadata); нужен для пункта «не переводить с языка».
+  // Прямой запрос к ПК (http://192.168.1.186) из HTTPS-страницы блокируется как
+  // mixed content, поэтому идём через мост: /fill_status он уже проксирует на ПК,
+  // а ПК дописывает в ответ lang/title (с кэшем и фоновой догрузкой yt-dlp).
+  // Пока ПК не успел — повторяем опрос.
+  function fetchMeta(id, tries) {
+    var n = tries || 0;
+    http('GET', '/fill_status?videoId=' + encodeURIComponent(id), null, function (j) {
+      if (state.curId !== id) return;
+      var lang = String((j && j.lang) || '');
+      if (lang) {
+        if (lang !== state.origLang) {
+          state.origLang = lang;
+          log('meta id=' + id + ' lang=' + lang
+            + ' title=' + String((j && j.title) || '').slice(0, 40));
+          maybeSkipNow(id, lang);
+        }
+        return;
+      }
+      if (n < 8) setTimeout(function () { fetchMeta(id, n + 1); }, 2500);
+      else log('meta id=' + id + ' lang unknown (pc meta timeout)');
+    }, function (e) {
+      // Сетевая ошибка (ПК перезапускается) — это не «языка нет»: повторяем,
+      // иначе ролик навсегда останется без определения языка.
+      if (state.curId !== id) return;
+      log('meta ERR ' + (e && e.message) + ' try=' + (n + 1));
+      if (n < 8) setTimeout(function () { fetchMeta(id, n + 1); }, 2500);
+    });
+  }
+
+  function manualFill() {
+    var v = findVideo(), id = state.curId;
+    if (!id) { uiToast('Нет активного ролика'); return; }
+    uiToast('ПК заполняет звук…');
+    pcFill(id, (v && v.duration) ? v.duration : 0, { translationId: state.translationId }, 'manual');
+  }
+
+  function checkFillStatus() {
+    var id = state.curId;
+    if (!id) { uiToast('Нет активного ролика'); return; }
+    http('GET', '/fill_status?videoId=' + encodeURIComponent(id), null, function (j) {
+      uiToast('ПК: ' + String((j && j.state) || '?') + ((j && j.status) ? ' · status=' + j.status : ''));
+    }, function (e) { uiToast('ПК недоступен: ' + (e && e.message)); });
+  }
+
+  function openTranslatePanel() {
+    if (!window.VOTUI || !VOTUI.open) { uiToast('UI-слой не загружен'); return; }
+    var items = [
+      { title: 'Перевод включён', type: 'toggle',
+        value: function () { return uiPref('translate.enabled', true) !== false; },
+        onSelect: function () { uiSet('translate.enabled', uiPref('translate.enabled', true) === false); } },
+      { title: 'Шард запроса', type: 'choice',
+        value: function () { return String(uiPref('shard', 'auto')); },
+        options: function () { return [{ label: 'auto (как на ТВ)', value: 'auto' }, { label: 'en', value: 'en' }]; },
+        onPick: function (v) { uiSet('shard', v); state.lang = v; } },
+      { title: 'Искать в другом кэше', type: 'toggle',
+        value: function () { return uiPref('otherShard.enabled', true) !== false; },
+        onSelect: function () { uiSet('otherShard.enabled', uiPref('otherShard.enabled', true) === false); } },
+      { title: 'ПК-филлер', type: 'toggle',
+        value: function () { return uiPref('pcFill.enabled', true) !== false; },
+        onSelect: function () { uiSet('pcFill.enabled', uiPref('pcFill.enabled', true) === false); } },
+      { title: 'Уровень звука перевода', type: 'slider', min: 0, max: 100, step: 5,
+        value: function () { return Number(uiPref('vol.translate', 100)); },
+        format: function (v) { return v + '%'; },
+        onChange: function (v) { uiSet('vol.translate', v); applyVolume(); } },
+      { title: 'Уровень звука оригинала', type: 'slider', min: 0, max: 100, step: 5,
+        value: function () { return Number(uiPref('vol.original', 100)); },
+        format: function (v) { return v + '%'; },
+        onChange: function (v) { uiSet('vol.original', v); applyVolume(); } },
+      { title: 'Не переводить с языка (по умолч. рус.)', type: 'choice',
+        value: function () { return langLabel(uiPref('skipLang', 'ru')); },
+        options: function () { return VOT_LANGS; },
+        onPick: function (v) {
+          uiSet('skipLang', v);
+          // Пользователь поменял правило: снимаем блокировку с текущего ролика.
+          state.skipLangBlock = null;
+        } },
+      { title: 'Заполнить звук на ПК сейчас', type: 'action', onSelect: manualFill },
+      { title: 'Проверить статус ПК', type: 'action', onSelect: checkFillStatus },
+      { title: 'Статус перевода', type: 'info', value: function () { return state.uiStatus || ''; } }
+    ];
+    VOTUI.open({
+      title: 'Перевод (Яндекс)',
+      subtitle: state.curId ? ('ролик ' + state.curId + (state.lang ? ' · шард ' + state.lang : '')) : 'ролик не открыт',
+      items: items
+    });
+  }
+
+  // Лог фокуса: что реально в фокусе после каждого нажатия (до 80 строк).
+  // hit=1 означает, что в фокусе наша кнопка «Перевод» (сравнение делается в JS,
+  // потому что кириллица в logcat ломается кодировкой консоли).
+  var dbgKeys = 0;
+  function debugKeys() {
+    if (uiPref('debug.keys', true) === false) return;
+    window.addEventListener('keydown', function (e) {
+      if (dbgKeys >= 80) return;
+      dbgKeys++;
+      var a = document.activeElement, t = '', al = '', hit = 0;
+      try {
+        if (a.getAttribute) al = String(a.getAttribute('aria-label') || '');
+        var raw = String((a && a.textContent) || '').replace(/\s+/g, ' ');
+        t = raw.slice(0, 16);
+        hit = (raw.indexOf('Перевод') >= 0 || al.indexOf('Перевод') >= 0) ? 1 : 0;
+      } catch (x) { }
+      log('K kc=' + e.keyCode + ' fa=' + (a ? String(a.tagName).toLowerCase().slice(0, 16) : '-')
+        + ' hit=' + hit + ' t=' + t);
+    }, true);
+  }
+
+  function setupUI() {
+    if (!window.VOTUI || !VOTUI.on) return;
+    VOTUI.init();
+    debugKeys();
+    // Однократная миграция префов. В тестах skipLang сохранился как «en»,
+    // из-за чего основной сценарий (англоязычный ролик) молча пропускался.
+    // Перевод нужен «с иностранного на русский», поэтому исключён русский.
+    if (Number(uiPref('prefs.v', 1)) < 2) {
+      uiSet('skipLang', 'ru');
+      uiSet('prefs.v', 2);
+      log('prefs migrated to v2: skipLang=ru');
+    }
+    VOTUI.on('menu.toggle', function () {
+      if (VOTUI.isOpen()) VOTUI.close(); else openTranslatePanel();
+    });
+    VOTUI.on('translate.toggle', function () {
+      var on = uiPref('translate.enabled', true) !== false;
+      uiSet('translate.enabled', !on);
+      uiToast(on ? 'Перевод выключен' : 'Перевод включён');
+    });
+    VOTUI.on('pref.vol.translate', applyVolume);
+    VOTUI.on('pref.vol.original', applyVolume);
+    log('ui ready v=' + String(VOTUI.version));
+  }
+  // ---- кнопка «Перевод» в панели плеера -------------------------------------
+  // Панель плеера строит функция из window._yttv, чей код содержит
+  // TRANSPORT_CONTROLS_BUTTON_TYPE_*: у неё методы возвращают массив кнопок.
+  // Вставляем свой элемент с customAction и перехватываем его в resolveCommand
+  // (TizenTube уже патчит resolveCommand, поэтому оборачиваемся поверх него).
+  // Тип берём из известных энумов плеера: неизвестный тип рендерер молча
+  // выбрасывает (проверено на ТВ — кнопка не появлялась).
+  var VOT_BTN_TYPE = 'TRANSPORT_CONTROLS_BUTTON_TYPE_PIP';
+  var VOT_ACTION = 'VOT_PANEL_SHOW';
+  var btnLog = 0;
+
+  function votBtnItem() {
+    return {
+      type: VOT_BTN_TYPE,
+      button: {
+        buttonRenderer: {
+          isDisabled: false,
+          text: { runs: [{ text: 'Перевод' }] },
+          icon: { iconType: 'TRANSLATE' },
+          command: { customAction: { action: VOT_ACTION } },
+          trackingParams: null
+        }
+      }
+    };
+  }
+
+  function injectVotBtn(res) {
+    if (!res || typeof res.length !== 'number' || !res.length) return res;
+    var types = [], have = false, at = -1, i;
+    for (i = 0; i < res.length; i++) {
+      var it = res[i];
+      if (!it || typeof it !== 'object' || typeof it.type !== 'string') return res;
+      types.push(String(it.type).replace('TRANSPORT_CONTROLS_BUTTON_TYPE_', ''));
+      var bc = it.button && it.button.buttonRenderer && it.button.buttonRenderer.command;
+      if (it.type === VOT_BTN_TYPE && actionOf(bc) === VOT_ACTION) have = true;
+      if (at < 0 && it.type.indexOf('PLAYBACK_SETTINGS') >= 0) at = i;
+    }
+    if (have) return res;
+    var btn = votBtnItem();
+    if (at >= 0) res.splice(at, 0, btn); else res.push(btn);
+    if (btnLog < 4) { btnLog++; log('btn injected [' + types.join('|') + '] ' + (at < 0 ? 'end' : 'at ' + at)); }
+    return res;
+  }
+
+  function wrapListMethods(inst, where) {
+    if (!inst) return 0;
+    var keys = [], o = inst, d = 0;
+    while (o && o !== Object.prototype && d < 4) {
+      var ns = Object.getOwnPropertyNames(o);
+      for (var i = 0; i < ns.length; i++) if (keys.indexOf(ns[i]) < 0) keys.push(ns[i]);
+      o = Object.getPrototypeOf(o); d++;
+    }
+    var n = 0;
+    for (var j = 0; j < keys.length; j++) {
+      var k = keys[j];
+      if (k === 'constructor') continue;
+      var f = null;
+      try { f = inst[k]; } catch (e) { continue; }
+      if (typeof f !== 'function' || f.__votWrapped) continue;
+      var src = '';
+      try { src = Function.prototype.toString.call(f); } catch (e2) { continue; }
+      if (src.indexOf('TRANSPORT_CONTROLS_BUTTON_TYPE_') < 0) continue;
+      inst[k] = (function (orig) {
+        var w = function () { return injectVotBtn(orig.apply(this, arguments)); };
+        w.__votWrapped = 1;
+        return w;
+      })(f);
+      n++;
+    }
+    if (n && btnLog < 8) { btnLog++; log('btn methods ' + n + ' via ' + where + ' keys=' + keys.length); }
+    return n;
+  }
+
+  function actionOf(cmd) {
+    if (!cmd || typeof cmd !== 'object') return '';
+    if (cmd.customAction && cmd.customAction.action) return String(cmd.customAction.action);
+    if (cmd.signalAction && cmd.signalAction.customAction && cmd.signalAction.customAction.action) {
+      return String(cmd.signalAction.customAction.action);
+    }
+    return '';
+  }
+
+  // Пункт «Перевод» в нативном меню настроек плеера (шестерёнка). Это самый
+  // надёжный путь: TizenTube сам так вставляет мини-плеер/шаринг/PiP, и они видны.
+  function votPopupItem() {
+    return {
+      compactLinkRenderer: {
+        title: { simpleText: 'Перевод' },
+        icon: { iconType: 'TRANSLATE' },
+        serviceEndpoint: {
+          commandExecutorCommand: { commands: [{ customAction: { action: VOT_ACTION } }] }
+        }
+      }
+    };
+  }
+
+  function collectItemLists(obj, out, depth) {
+    if (!obj || typeof obj !== 'object' || depth > 10 || out.length > 24) return out;
+    if (Object.prototype.toString.call(obj) === '[object Array]') {
+      for (var i = 0; i < obj.length && i < 60; i++) collectItemLists(obj[i], out, depth + 1);
+      return out;
+    }
+    for (var k in obj) {
+      var v = null;
+      try { v = obj[k]; } catch (e) { continue; }
+      if (!v || typeof v !== 'object') continue;
+      if (Object.prototype.toString.call(v) === '[object Array]') out.push(v);
+      else collectItemLists(v, out, depth + 1);
+    }
+    return out;
+  }
+
+  function popupInsert(cmd) {
+    if (!cmd || typeof cmd !== 'object' || !cmd.openPopupAction) return 0;
+    var lists = collectItemLists(cmd, [], 0), done = 0;
+    for (var i = 0; i < lists.length && !done; i++) {
+      var arr = lists[i], looks = false, have = false, j;
+      for (j = 0; j < arr.length; j++) {
+        var it = arr[j];
+        if (!it || !it.compactLinkRenderer) continue;
+        looks = true;
+        var ic = it.compactLinkRenderer.serviceEndpoint
+          && it.compactLinkRenderer.serviceEndpoint.commandExecutorCommand
+          && it.compactLinkRenderer.serviceEndpoint.commandExecutorCommand.commands;
+        if (ic) for (var q = 0; q < ic.length; q++) if (actionOf(ic[q]) === VOT_ACTION) have = true;
+      }
+      if (!looks || have) continue;
+      arr.splice(Math.min(1, arr.length), 0, votPopupItem());
+      done = 1;
+      log('popup item inserted n=' + arr.length);
+    }
+    return done;
+  }
+
+  function hookResolve(inst, where) {
+    if (!inst || typeof inst.resolveCommand !== 'function') return 0;
+    var rc = inst.resolveCommand;
+    if (rc.__votHooked) return 0;
+    var h = function (cmd) {
+      try {
+        var act = actionOf(cmd);
+        if (act === VOT_ACTION) { log('btn PRESSED'); openTranslatePanel(); return true; }
+        var cc = cmd && cmd.commandExecutorCommand && cmd.commandExecutorCommand.commands;
+        if (cc && cc.length) {
+          for (var i = 0; i < cc.length; i++) {
+            if (actionOf(cc[i]) === VOT_ACTION) { log('btn PRESSED exec'); openTranslatePanel(); return true; }
+          }
+        }
+      } catch (e) { }
+      // Даём отработать TizenTube (она сдвигает индексы в списке), затем вставляем
+      // свой пункт в уже готовый список настроек плеера.
+      var r = rc.apply(this, arguments);
+      if (cmd && cmd.openPopupAction) {
+        try { popupInsert(cmd); } catch (e2) { log('popup ERR ' + (e2 && e2.message)); }
+      }
+      return r;
+    };
+    h.__votHooked = 1;
+    inst.resolveCommand = h;
+    log('resolve hooked via ' + where);
+    return 1;
+  }
+
+  function hookAllInstances() {
+    if (!window._yttv) return 0;
+    var n = 0;
+    for (var k in window._yttv) {
+      var e = null;
+      try { e = window._yttv[k]; } catch (x) { continue; }
+      if (!e) continue;
+      try { if (e.instance) n += hookResolve(e.instance, k + '.instance'); } catch (x2) { }
+      try { if (e.prototype && e.prototype.resolveCommand) n += hookResolve(e.prototype, k + '.prototype'); } catch (x3) { }
+    }
+    return n;
+  }
+
+  function installPlayerButton() {
+    if (!window._yttv) return false;
+    hookAllInstances();
+    // Повторная инъекция скрипта: обёртка уже стоит, только до-патчиваем инстансы.
+    var prev = window.__votBtnKey;
+    if (prev && typeof window._yttv[prev] === 'function' && window._yttv[prev].__votWrapped) {
+      try { if (window._yttv[prev].instance) wrapListMethods(window._yttv[prev].instance, 'instance2'); } catch (e0) { }
+      return true;
+    }
+    var key = null, fn = null;
+    for (var k in window._yttv) {
+      var v = window._yttv[k];
+      if (typeof v !== 'function' || v.__votWrapped) continue;
+      var src = '';
+      try { src = Function.prototype.toString.call(v); } catch (e) { continue; }
+      if (src.indexOf('TRANSPORT_CONTROLS_BUTTON_TYPE_') < 0) continue;
+      if (src.indexOf('PLAYBACK_SETTINGS') < 0) continue;
+      key = k; fn = v; break;
+    }
+    if (!key) return false;
+    try { if (window._yttv[key].instance) wrapListMethods(window._yttv[key].instance, 'instance'); } catch (e4) { }
+    if (window._yttv[key] !== fn) return true; // только что обернули
+    var W = function () {
+      // Строка ниже нужна, чтобы фильтр TizenTube (поиск по коду функции) продолжал
+      // находить нашу обёртку: TRANSPORT_CONTROLS_BUTTON_TYPE_PLAYBACK_SETTINGS
+      // TRANSPORT_CONTROLS_BUTTON_TYPE_FEATURED_ACTION
+      var args = Array.prototype.slice.call(arguments), obj = null;
+      try {
+        // Reflect — ES6; в Cobalt его может не быть вовсе, поэтому проверяем
+        // существование объекта, а не свойство (иначе ReferenceError).
+        obj = (typeof Reflect !== 'undefined' && Reflect.construct)
+          ? Reflect.construct(fn, args, fn)
+          : new (Function.prototype.bind.apply(fn, [null].concat(args)))();
+      } catch (e) { log('btn ctor ERR ' + (e && e.message)); throw e; }
+      try { wrapListMethods(obj, 'ctor'); hookResolve(obj, 'ctor'); } catch (e2) { log('btn ctor patch ERR ' + (e2 && e2.message)); }
+      return obj;
+    };
+    W.prototype = fn.prototype;
+    W.__votWrapped = 1;
+    window._yttv[key] = W;
+    window.__votBtnKey = key;
+    log('btn ctor wrapped key=' + key);
+    return true;
+  }
+
+  var btnTries = 0;
+  function btnRetry() {
+    btnTries++;
+    var ok = false;
+    try { ok = installPlayerButton(); } catch (e) { log('btn install ERR ' + (e && e.message)); }
+    if (!ok && btnTries < 40) setTimeout(btnRetry, 1500);
+  }
+  // ===== VOT-UI END =====
+
+  setupUI();
+  btnRetry();
+
 })();
