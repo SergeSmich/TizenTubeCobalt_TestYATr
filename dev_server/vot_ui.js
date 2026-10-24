@@ -42,15 +42,22 @@
   // ---------- CSS ----------
   var CSS = [
     '#vot-ui-root{position:fixed;left:0;top:0;right:0;bottom:0;z-index:' + Z + ';display:none;',
-    'font-family:Roboto,"Noto Sans",sans-serif;color:#fff;}',
-    '#vot-ui-root.vot-open{display:block;}',
+    'align-items:center;justify-content:center;font-family:Roboto,"Noto Sans",sans-serif;color:#fff;}',
+    '#vot-ui-root.vot-open{display:flex;}',
     '#vot-ui-back{position:absolute;left:0;top:0;right:0;bottom:0;background:rgba(0,0,0,.72);}',
-    '#vot-ui-panel{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);',
-    'width:940px;max-height:820px;background:rgba(28,28,28,.98);border-radius:20px;',
-    'padding:28px 34px;box-shadow:0 14px 56px rgba(0,0,0,.7);overflow:hidden;}',
+    // Центрирование — flex'ом: связка left/top:50% + translate(-50%,-50%) на ТВ
+    // давала сдвиг панели влево и обрезку края. Анимация задаётся из JS
+    // inline-стилями (CSS keyframes в Cobalt могут не запускаться).
+    // Позиция панели задаётся из JS явными пикселями (см. placePanel): на ТВ
+    // layout viewport шире экрана, из-за чего left:50%/flex давали сдвиг влево.
+    '#vot-ui-panel{position:absolute;left:0;top:0;width:940px;max-width:94%;max-height:820px;',
+    'background:rgba(28,28,28,.98);border-radius:20px;padding:28px 34px;',
+    'box-shadow:0 14px 56px rgba(0,0,0,.7);overflow:hidden;transform-origin:50% 50%;}',
     '.vot-h1{font-size:34px;font-weight:500;margin:0 0 4px;}',
     '.vot-sub{font-size:22px;color:rgba(255,255,255,.66);margin:0 0 14px;line-height:1.35;}',
-    '.vot-list{max-height:560px;overflow:hidden;}',
+    // Список скроллится сам (пунктов больше, чем влезает по высоте), а
+    // render() подводит фокус в видимую область.
+    '.vot-list{max-height:600px;overflow-y:auto;}',
     '.vot-row{display:flex;align-items:center;justify-content:space-between;min-height:84px;',
     'padding:0 24px;border-radius:12px;font-size:26px;margin:4px 2px;}',
     '.vot-row.vot-focus{background:rgba(255,255,255,.18);box-shadow:0 0 0 4px #fff inset;}',
@@ -107,7 +114,7 @@
   // ---------- DOM ----------
   var root = null, panelEl = null, listEl = null, titleEl = null, subEl = null, hintEl = null, toastEl = null;
   var cur = null, stack = [];
-  var toastTimer = null;
+  var toastTimer = null, geomN = 0;
 
   function mk(tag, cls, text) {
     var e = document.createElement(tag);
@@ -216,6 +223,8 @@
     if (cur.index >= items.length) cur.index = 0;
     root.className = 'vot-open';
     render();
+    placePanel();
+    animateIn();
     log('panel "' + cur.title + '" items=' + items.length + ' depth=' + stack.length);
   }
 
@@ -227,11 +236,142 @@
     show(spec);
   }
 
+  // Видимая область: position:fixed на ТВ может считаться от layout viewport,
+  // который шире экрана, поэтому всё считаем через visualViewport.
+  function vpBox() {
+    var v = null, w = 0, h = 0, x = 0, y = 0;
+    try { v = window.visualViewport; } catch (e) { v = null; }
+    try {
+      w = (v && v.width) || window.innerWidth || 1920;
+      h = (v && v.height) || window.innerHeight || 1080;
+      x = (v && v.offsetLeft) || 0;
+      y = (v && v.offsetTop) || 0;
+    } catch (e2) { w = 1920; h = 1080; }
+    return { w: w, h: h, x: x, y: y };
+  }
+
+  // Ставим панель по центру видимой области явными пикселями: flex/translate
+  // на ТВ давали сдвиг влево и обрезку, потому что layout viewport шире экрана.
+  function placePanel() {
+    try {
+      var b = vpBox();
+      var w = Math.min(940, Math.round(b.w * 0.94));
+      var mh = Math.min(820, Math.round(b.h * 0.92));
+      panelEl.style.width = w + 'px';
+      panelEl.style.maxHeight = mh + 'px';
+      var lx = Math.round(b.x + (b.w - w) / 2);
+      var ly = Math.round(b.y + (b.h - mh) / 2);
+      panelEl.style.left = lx + 'px';
+      panelEl.style.top = ly + 'px';
+      // после вёрстки центрируем по фактической высоте
+      var ah = panelEl.offsetHeight || mh;
+      if (ah > 0 && ah < mh) ly = Math.round(b.y + (b.h - ah) / 2);
+      panelEl.style.top = ly + 'px';
+      panelEl.__votL = lx; // цель для анимации «выезда»
+      panelEl.__votT = ly;
+      if (geomN < 6) {
+        geomN++;
+        var pr = panelEl.getBoundingClientRect();
+        log('geom iw=' + window.innerWidth + 'x' + window.innerHeight + ' vv=' + b.x + ',' + b.y
+          + ' ' + Math.round(b.w) + 'x' + Math.round(b.h) + ' panel='
+          + Math.round(pr.left) + ',' + Math.round(pr.top) + ' ' + Math.round(pr.width)
+          + 'x' + Math.round(pr.height) + ' root=' + root.className);
+      }
+    } catch (e) { log('geom ERR ' + (e && e.name)); }
+  }
+
   function close() {
     cur = null;
     stack = [];
-    if (root) root.className = '';
+    if (!root || !panelEl) return;
+    // Закрытие — покадрово из JS (CSS-transition в Cobalt не срабатывает).
+    animateOut(function () {
+      try {
+        root.className = '';
+        root.style.opacity = '';
+        panelEl.style.transform = '';
+      } catch (e2) { }
+    });
     log('close');
+  }
+
+  // Появление/закрытие как у нативного оверлея: затемнение проявляется, панель
+  // «выезжает» слева с масштабом .94→1. Анимируем ПОКАДРОВО из JS
+  // (requestAnimationFrame, при его отсутствии — setTimeout): CSS-transition и
+  // @keyframes в Cobalt не запускались, окно появлялось рывком, а изменения
+  // `el.style.*` перерисовываются нормально.
+  var animTimer = null, animDone = null, animFrames = 0;
+  function animRun(dur, apply, done) {
+    var useRaf = false, start = -1, timer = null;
+    try { useRaf = typeof requestAnimationFrame === 'function'; } catch (e) { useRaf = false; }
+    if (animTimer) {
+      try { if (useRaf) cancelAnimationFrame(animTimer); else clearTimeout(animTimer); } catch (e1) { }
+      animTimer = null;
+    }
+    animFrames = 1;
+    animDone = done || null;
+    try { apply(0); } catch (e0) { log('anim ERR ' + (e0 && e0.name)); }
+    var tick = function (now) {
+      if (start < 0) start = now;
+      var k = Math.min(1, (now - start) / dur);
+      animFrames++;
+      try { apply(k); } catch (e2) { log('anim ERR ' + (e2 && e2.name)); }
+      if (k < 1) {
+        timer = useRaf ? requestAnimationFrame(tick)
+          : setTimeout(function () { tick(now + 20); }, 20);
+        animTimer = timer;
+        return;
+      }
+      animTimer = null;
+      var d = animDone;
+      animDone = null;
+      if (d) { try { d(); } catch (e3) { } }
+    };
+    timer = useRaf ? requestAnimationFrame(tick) : setTimeout(function () { tick(0); }, 20);
+    animTimer = timer;
+  }
+
+  function animateIn() {
+    if (!panelEl) return;
+    var b = vpBox();
+    var tx = Number(panelEl.__votL || 0), ty = Number(panelEl.__votT || 0);
+    var slide = Math.round(Math.min(170, b.w * 0.09));
+    animRun(230, function (k) {
+      var e = 1 - Math.pow(1 - k, 3); // ease-out
+      panelEl.style.left = Math.round(tx - slide * (1 - e)) + 'px';
+      panelEl.style.top = ty + 'px';
+      panelEl.style.opacity = String(0.15 + 0.85 * e);
+      panelEl.style.transform = 'scale(' + (0.94 + 0.06 * e) + ')';
+      root.style.opacity = String(0.25 + 0.75 * e);
+    }, function () {
+      try {
+        panelEl.style.left = tx + 'px';
+        panelEl.style.top = ty + 'px';
+        panelEl.style.opacity = '1';
+        panelEl.style.transform = 'scale(1)';
+        root.style.opacity = '1';
+      } catch (e0) { }
+      log('anim in ok frames=' + animFrames + ' slide=' + slide);
+    });
+  }
+
+  function animateOut(cb) {
+    if (!panelEl) { if (cb) cb(); return; }
+    var tx = Number(panelEl.__votL || 0), ty = Number(panelEl.__votT || 0);
+    animRun(160, function (k) {
+      var e = k * k;
+      panelEl.style.left = Math.round(tx - 90 * e) + 'px';
+      panelEl.style.top = ty + 'px';
+      panelEl.style.opacity = String(Math.max(0, 1 - e));
+      root.style.opacity = String(Math.max(0, 1 - e));
+    }, function () {
+      try {
+        root.style.opacity = '';
+        panelEl.style.opacity = '';
+      } catch (e0) { }
+      log('anim out ok frames=' + animFrames);
+      if (cb) { try { cb(); } catch (e1) { } }
+    });
   }
 
   function back() {
@@ -312,7 +452,7 @@
   }
 
   // ---------- клавиши ----------
-  var KEY = { UP: 38, DOWN: 40, LEFT: 37, RIGHT: 39, ENTER: 13, BACK: 27, MENU: 18, F3: 114, F4: 115 };
+  var KEY = { UP: 38, DOWN: 40, LEFT: 37, RIGHT: 39, ENTER: 13, BACK: 27, MENU: 18, F3: 114, F4: 115, F5: 116 };
 
   function navLog(dir) {
     var it = cur && cur.items[cur.index];

@@ -89,17 +89,6 @@
     bridgeLog('[VOT] ' + m);
   }
 
-  // Кириллица в logcat приходит мусором, поэтому всё не-ASCII экранируем:
-  // такие строки можно прочитать и сравнить глазами (`\u041d\u0430...`).
-  function escAscii(s, max) {
-    var out = '', src = String(s == null ? '' : s);
-    for (var i = 0; i < src.length && out.length < (max || 80); i++) {
-      var c = src.charCodeAt(i);
-      out += (c >= 32 && c < 127) ? src.charAt(i) : '\\u' + ('000' + c.toString(16)).slice(-4);
-    }
-    return out;
-  }
-
   function bridgeLog(m) {
     try {
       var x = new XMLHttpRequest();
@@ -1353,22 +1342,45 @@
     try { if (window.VOTUI) VOTUI.toast(m, ms); } catch (e) { }
   }
 
-  // Пока микс недоступен (одна аудиодорожка на поток), «оригинал» задаёт громкость,
-  // когда играет оригинал, «перевод» — когда играет перевод.
+  // Громкость перевода живёт ВНЕ страницы: звук играет нативный MediaPlayer
+  // внутри моста, поэтому из JS его не приглушить — уровень уходит запросом
+  // /volume (Bridge.java), а мост хранит его в sVol и ставит новым плеерам.
+  // В видео остаётся звук оригинала: при работающем переводе его уровень задаёт
+  // «Оригинал при переводе», без перевода видео всегда 100 % (иначе пункт меню
+  // глушил бы обычный просмотр).
+  var volSentTr = -1; // последний уровень перевода, отправленный в мост
+
+  function volPct(k, def) {
+    var n = Math.round(Number(uiPref(k, def)));
+    if (!isFinite(n)) n = def;
+    return Math.max(0, Math.min(100, n));
+  }
+
   function applyVolume() {
+    var tr = volPct('vol.translate', 100);
+    if (tr !== volSentTr) {
+      volSentTr = tr;
+      http('POST', '/volume', { pct: tr }, function () { }, function (e) {
+        log('vol ERR ' + (e && e.message));
+      });
+    }
     var v = findVideo();
     if (!v) return;
-    var pct = Number(state.active ? uiPref('vol.translate', 100) : uiPref('vol.original', 100));
-    if (isNaN(pct)) pct = 100;
-    try { v.muted = (pct <= 0); } catch (e) { }
+    var pct = state.active ? volPct('vol.original', 0) : 100;
+    try { v.muted = (pct <= 0); } catch (e1) { }
     try { v.volume = Math.max(0, Math.min(1, pct / 100)); } catch (e2) { }
     // Cobalt может игнорировать v.volume (звук идёт мимо WebAudio), поэтому
     // логируем и запрошенное, и фактическое значение — иначе не отличить
     // «ползунок не работает» от «громкость применяется на стороне плеера».
     var got = 1;
     try { got = v.volume; } catch (e3) { got = -1; }
-    log('vol pct=' + pct + ' active=' + (state.active ? 1 : 0) + ' muted=' + (v.muted ? 1 : 0)
-      + ' got=' + got);
+    log('vol tr=' + tr + ' orig=' + pct + ' active=' + (state.active ? 1 : 0)
+      + ' muted=' + (v.muted ? 1 : 0) + ' got=' + got);
+  }
+
+  // Подпись пункта «Громкость» в корне нативной панели.
+  function votVolText() {
+    return 'перевод ' + volPct('vol.translate', 100) + '% · оригинал ' + volPct('vol.original', 0) + '%';
   }
 
   var VOT_LANGS = [
@@ -1492,12 +1504,12 @@
       { title: 'ПК-филлер', type: 'toggle',
         value: function () { return uiPref('pcFill.enabled', true) !== false; },
         onSelect: function () { uiSet('pcFill.enabled', uiPref('pcFill.enabled', true) === false); } },
-      { title: 'Уровень звука перевода', type: 'slider', min: 0, max: 100, step: 5,
-        value: function () { return Number(uiPref('vol.translate', 100)); },
+      { title: 'Громкость перевода', type: 'slider', min: 0, max: 100, step: 5,
+        value: function () { return volPct('vol.translate', 100); },
         format: function (v) { return v + '%'; },
         onChange: function (v) { uiSet('vol.translate', v); applyVolume(); } },
-      { title: 'Уровень звука оригинала', type: 'slider', min: 0, max: 100, step: 5,
-        value: function () { return Number(uiPref('vol.original', 100)); },
+      { title: 'Оригинал при переводе', type: 'slider', min: 0, max: 100, step: 5,
+        value: function () { return volPct('vol.original', 0); },
         format: function (v) { return v + '%'; },
         onChange: function (v) { uiSet('vol.original', v); applyVolume(); } },
       { title: 'Не переводить с языка (по умолч. рус.)', type: 'choice',
@@ -1513,29 +1525,275 @@
       { title: 'Статус перевода', type: 'info', value: function () { return state.uiStatus || ''; } }
     ];
     VOTUI.open({
-      title: 'Перевод (Яндекс)',
+      title: 'Перевод Яндекс',
       subtitle: state.curId ? ('ролик ' + state.curId + (state.lang ? ' · шард ' + state.lang : '')) : 'ролик не открыт',
       items: items
     });
   }
 
-  // Лог фокуса: что реально в фокусе после каждого нажатия (до 80 строк).
-  // hit=1 означает, что в фокусе наша кнопка «Перевод» (сравнение делается в JS,
-  // потому что кириллица в logcat ломается кодировкой консоли).
-  var dbgKeys = 0;
-  function debugKeys() {
-    if (uiPref('debug.keys', true) === false) return;
+  // ---- нативное меню «Перевод» (многоуровневое, как «Аудио»/«Качество») -----
+  // Клиент рисует панель по данным из САМОЙ команды
+  // (openPopupAction.popup.overlaySectionRenderer.overlay.overlayTwoPanelRenderer…)
+  // и исполняет её, только если она вложена в serviceEndpoint пункта — ровно так
+  // открываются «Качество»/«Субтитры». Пересылка готовой команды через
+  // диспетчер из JS клиентом игнорируется (проверено на ТВ), поэтому наши
+  // уровни вкладываются в пункты при сборке попапа: шаблон — команда корня
+  // настроек (votTpl, снимается в popupInsert), пункты — свои, uid = vot-*.
+  var votTpl = null;    // команда корня настроек — шаблон для наших плашек
+  var votBuildDepth = 0; // защита от рекурсии при сборке уровней
+  var instSeq = 0, popupInstLog = 0;
+  var votSetLog = 0;
+
+  function isObj(o) { return !!o && typeof o === 'object'; }
+
+  function shallowCopy(o) {
+    var r = {}, k;
+    if (!isObj(o)) return r;
+    for (k in o) { try { r[k] = o[k]; } catch (e) { } }
+    return r;
+  }
+
+  // Копируем звенья пути до items и подменяем список — исходную команду
+  // (её переиспользует клиент) менять нельзя.
+  function votCloneCmd(src, items, uid) {
+    if (!src || !src.openPopupAction) return null;
+    var oa = shallowCopy(src.openPopupAction), pop = shallowCopy(oa.popup);
+    var sec = shallowCopy(pop.overlaySectionRenderer), ov = shallowCopy(sec.overlay);
+    var tp = shallowCopy(ov.overlayTwoPanelRenderer), ap = shallowCopy(tp.actionPanel);
+    var pan = shallowCopy(ap.overlayPanelRenderer), ct = shallowCopy(pan.content);
+    var lst = shallowCopy(ct.overlayPanelItemListRenderer);
+    lst.items = items;
+    ct.overlayPanelItemListRenderer = lst;
+    pan.content = ct; ap.overlayPanelRenderer = pan; tp.actionPanel = ap;
+    ov.overlayTwoPanelRenderer = tp; sec.overlay = ov; pop.overlaySectionRenderer = sec;
+    oa.popup = pop;
+    if (uid) oa.uniqueId = uid;
+    var cmd = shallowCopy(src);
+    cmd.openPopupAction = oa;
+    cmd.__votOwn = 1; // свою панель не патчим пунктом «Перевод»
+    return cmd;
+  }
+
+  function votEndp(action) {
+    return { commandExecutorCommand: { commands: [{ customAction: { action: action } }] } };
+  }
+
+  function votItem(o) {
+    var lr = { title: { simpleText: o.title } };
+    if (o.sub) lr.subtitle = { simpleText: String(o.sub) };
+    if (o.icon) lr.icon = { iconType: o.icon };
+    if (o.second) lr.secondaryIcon = { iconType: o.second };
+    if (o.action) lr.serviceEndpoint = votEndp(o.action);
+    return { compactLinkRenderer: lr };
+  }
+
+  function votChevron(title, sub, action, icon) {
+    return votItem({ title: title, sub: sub, icon: icon, second: 'CHEVRON_RIGHT', action: action });
+  }
+
+  function votCheck(title, key, val, sel, sub) {
+    return votItem({ title: title, sub: sub,
+      second: sel ? 'CHECK' : 'RADIO_BUTTON_UNCHECKED',
+      action: 'VOT_SET:' + key + ':' + val });
+  }
+
+  function votSwitch(title, sub, key, on) {
+    return votCheck(title, key, on ? '0' : '1', on, sub);
+  }
+
+  // Пункт-стрелка, который открывает НАШУ стопку плашек: подпанель вкладывается
+  // прямо в serviceEndpoint пункта — тем же путём клиент открывает «Качество» и
+  // «Субтитры» (никакой пересылки команд из JS: её клиент игнорирует).
+  function votNavItem(title, sub, lv, icon) {
+    var cmd = votPanelCmd(lv);
+    var lr = { title: { simpleText: title } };
+    if (sub) lr.subtitle = { simpleText: String(sub) };
+    if (icon) lr.icon = { iconType: icon };
+    lr.secondaryIcon = { iconType: 'CHEVRON_RIGHT' };
+    lr.serviceEndpoint = cmd
+      ? { commandExecutorCommand: { commands: [cmd] } }
+      : votEndp('VOT_NAV:' + lv); // шаблона ещё нет — откроем DOM-панель
+    return { compactLinkRenderer: lr };
+  }
+
+  // Команда нашей панели: копия корня настроек с нашими пунктами и своим uid.
+  function votPanelCmd(lv) {
+    if (!votTpl || votBuildDepth > 2) return null;
+    var items = null;
+    votBuildDepth++;
+    try { items = votLevelItems(lv); } catch (e) {
+      log('vot items ERR ' + (e && e.message));
+      items = null;
+    }
+    votBuildDepth--;
+    if (!items) return null;
+    return votCloneCmd(votTpl, items, lv);
+  }
+
+  function votSrcText() {
+    var o = uiPref('otherShard.enabled', true) !== false;
+    var p = uiPref('pcFill.enabled', true) !== false;
+    return (o ? 'другой кэш' : 'только шард') + (p ? ' + ПК' : '');
+  }
+
+  function votStatusText() {
+    var s = String(state.uiStatus || '');
+    if (!s) s = state.curId ? ('ролик ' + state.curId) : 'ролик не открыт';
+    return s.slice(0, 70);
+  }
+
+  function votLevelItems(lv) {
+    var on = uiPref('translate.enabled', true) !== false && isTranslateOn(), i, out = [];
+    if (lv === 'vot-src') {
+      out.push(votSwitch('Другой шард кэша', 'искать озвучку в соседнем кэше',
+        'otherShard.enabled', uiPref('otherShard.enabled', true) !== false));
+      out.push(votSwitch('ПК-филлер', 'дозаполнять звук через ПК',
+        'pcFill.enabled', uiPref('pcFill.enabled', true) !== false));
+      out.push(votItem({ title: 'Заполнить звук сейчас', sub: 'через ПК', action: 'VOT_FILL' }));
+      out.push(votItem({ title: 'Проверить статус ПК', action: 'VOT_FILLSTATUS' }));
+      return out;
+    }
+    if (lv === 'vot-shard') {
+      out.push(votCheck('auto (как на ТВ)', 'shard', 'auto', String(uiPref('shard', 'auto')) === 'auto'));
+      out.push(votCheck('en', 'shard', 'en', String(uiPref('shard', 'auto')) === 'en'));
+      return out;
+    }
+    if (lv === 'vot-vol') {
+      // Родного слайдера в клиенте нет, поэтому строка ведёт себя как ползунок:
+      // влево/вправо меняют уровень шагом 10 % (votSliderKeys), значение
+      // применяется сразу и сразу же перерисовывается в этой строке.
+      out.push(votItem({ title: 'Громкость перевода',
+        sub: volPct('vol.translate', 100) + '% · влево/вправо',
+        icon: 'VOLUME_UP', second: 'CHEVRON_LEFT' }));
+      out.push(votItem({ title: 'Оригинал при переводе',
+        sub: volPct('vol.original', 0) + '% · влево/вправо',
+        icon: 'VOLUME_MUTE', second: 'CHEVRON_LEFT' }));
+      return out;
+    }
+    if (lv === 'vot-skip') {
+      var sk = String(uiPref('skipLang', 'ru') || '');
+      for (i = 0; i < VOT_LANGS.length; i++) {
+        out.push(votCheck(VOT_LANGS[i].label, 'skipLang', String(VOT_LANGS[i].value),
+          sk === String(VOT_LANGS[i].value)));
+      }
+      return out;
+    }
+    // корень
+    out.push(votItem({ title: 'Перевод Яндекс', sub: on ? 'включён' : 'выключен',
+      icon: 'TRANSLATE', second: on ? 'CHECK' : 'RADIO_BUTTON_UNCHECKED',
+      action: VOT_TOGGLE_ACTION }));
+    out.push(votNavItem('Источник перевода', votSrcText(), 'vot-src'));
+    out.push(votNavItem('Шард запроса', String(uiPref('shard', 'auto')), 'vot-shard'));
+    out.push(votNavItem('Громкость', votVolText(), 'vot-vol'));
+    out.push(votNavItem('Не переводить с', langLabel(uiPref('skipLang', 'ru')), 'vot-skip'));
+    out.push(votItem({ title: 'Статус', sub: votStatusText() }));
+    return out;
+  }
+
+  function votSet(rest) {
+    var s = String(rest || ''), p = s.indexOf(':');
+    if (p < 0) { log('vot set: bad ' + s.slice(0, 24)); return; }
+    var k = s.slice(0, p), v = s.slice(p + 1);
+    if (k === 'shard') { uiSet('shard', v); state.lang = v; }
+    else if (k === 'otherShard.enabled' || k === 'pcFill.enabled') uiSet(k, v === '1');
+    else if (k === 'vol.translate' || k === 'vol.original') { uiSet(k, Number(v) || 0); applyVolume(); }
+    else if (k === 'skipLang') { uiSet('skipLang', v); state.skipLangBlock = null; }
+    else { log('vot set: unknown ' + k); return; }
+    if (votSetLog < 24) { votSetLog++; log('vot set ' + k + '=' + v); }
+    // Нативная панель закрывается на выборе (как «Качество»), поэтому ничего не
+    // перерисовываем: подписи уровней обновятся при следующем открытии меню.
+  }
+
+  // Единая точка разбора наших действий: и кнопка в баре, и пункты панели
+  // приходят сюда через перехваченный resolveCommand.
+  function handleAction(a) {
+    var s = String(a || '');
+    if (!s) return false;
+    if (s === VOT_TOGGLE_ACTION) { log('btn TOGGLE'); toggleTranslate(); return true; }
+    // VOT_ACTION/VOT_NAV остаются только как страховка: их шлют пункты,
+    // собранные до того, как мы поймали шаблон нативной панели.
+    if (s === VOT_ACTION) { log('btn PRESSED'); openTranslatePanel(); return true; }
+    if (s.indexOf('VOT_NAV:') === 0) { openTranslatePanel(); return true; }
+    if (s.indexOf('VOT_SET:') === 0) { votSet(s.slice(8)); return true; }
+    if (s === 'VOT_FILL') { manualFill(); return true; }
+    if (s === 'VOT_FILLSTATUS') { checkFillStatus(); return true; }
+    return false;
+  }
+
+  // Ползунки громкости. Родного слайдера в ТВ-клиенте нет (в реестре только
+  // compactLinkRenderer/setting*-рендереры), поэтому влево/вправо ловим сами:
+  // срабатывает, только когда фокус стоит на строке «Громкость перевода» или
+  // «Оригинал при переводе» — в остальных плашках стрелки работают как обычно.
+  // Клиент рисует подписи из нашей команды ровно один раз, поэтому после
+  // изменения уровня строку приходится перерисовывать вручную (votPaintValue).
+  var volKeyLog = 0;
+
+  // Какая из наших строк в фокусе. Подпись может лежать в aria-label (как у
+  // кнопок плеера) или текстом в поддереве — проверяем и то, и другое.
+  function volKeyOf(a) {
+    if (!a) return '';
+    var al = '', tx = '';
+    try { if (a.getAttribute) al = String(a.getAttribute('aria-label') || ''); } catch (e) { }
+    try { tx = String(a.textContent || ''); } catch (e2) { }
+    var s = (al + ' ' + tx).replace(/\s+/g, ' ').toLowerCase();
+    if (s.indexOf('громкость перевода') >= 0) return 'vol.translate';
+    if (s.indexOf('оригинал при переводе') >= 0) return 'vol.original';
+    return '';
+  }
+
+  // Подмена значения прямо в узле строки: «… 70% · влево/вправо».
+  function votPaintValue(node, val) {
+    if (!node) return 0;
+    var re = /(\d{1,3})(\s*%)/, hit = 0, arr = [node], kids = [], i, j;
+    try { kids = node.getElementsByTagName ? node.getElementsByTagName('*') : []; } catch (e) { kids = []; }
+    for (i = 0; i < kids.length; i++) arr.push(kids[i]);
+    for (i = 0; i < arr.length; i++) {
+      var el = arr[i], ch = null, attrs = ['aria-label', 'title'];
+      try { ch = el.childNodes; } catch (e2) { ch = null; }
+      if (ch) {
+        for (j = 0; j < ch.length; j++) {
+          var n = ch[j];
+          if (!hit && n && n.nodeType === 3 && re.test(String(n.nodeValue || ''))) {
+            n.nodeValue = String(n.nodeValue).replace(re, String(val) + '$2');
+            hit = 1;
+          }
+        }
+      }
+      for (j = 0; j < attrs.length; j++) {
+        try {
+          var av = el.getAttribute && el.getAttribute(attrs[j]);
+          if (av && re.test(String(av))) {
+            el.setAttribute(attrs[j], String(av).replace(re, String(val) + '$2'));
+          }
+        } catch (e3) { }
+      }
+    }
+    return hit;
+  }
+
+  function votSliderKeys() {
     window.addEventListener('keydown', function (e) {
-      if (dbgKeys >= 80) return;
-      dbgKeys++;
-      var a = document.activeElement, al = '', hit = 0;
-      try {
-        if (a.getAttribute) al = String(a.getAttribute('aria-label') || '');
-        var raw = String((a && a.textContent) || '').replace(/\s+/g, ' ');
-        hit = (raw.indexOf('Перевод') >= 0 || al.indexOf('Перевод') >= 0) ? 1 : 0;
-      } catch (x) { }
-      log('K kc=' + e.keyCode + ' fa=' + (a ? String(a.tagName).toLowerCase().slice(0, 16) : '-')
-        + ' hit=' + hit + ' al=' + escAscii(al, 48));
+      var kc = e.keyCode;
+      if (kc !== 37 && kc !== 39) return;
+      var a = document.activeElement, key = volKeyOf(a);
+      if (!key) return;
+      var def = key === 'vol.translate' ? 100 : 0;
+      var cur = volPct(key, def);
+      var next = cur + (kc === 39 ? 10 : -10);
+      if (next < 0) next = 0;
+      if (next > 100) next = 100;
+      // Своя обработка важнее клиента: иначе вправо уводило бы фокус из панели.
+      try { e.preventDefault(); e.stopPropagation(); } catch (x2) { }
+      if (next === cur) return;
+      uiSet(key, next);
+      applyVolume();
+      var painted = votPaintValue(a, next);
+      uiToast((key === 'vol.translate' ? 'Громкость перевода: ' : 'Оригинал при переводе: ')
+        + next + '%', 1800);
+      if (volKeyLog < 16) {
+        volKeyLog++;
+        log('vol slide ' + key + ' ' + cur + '->' + next + ' paint=' + painted);
+      }
     }, true);
   }
 
@@ -1576,7 +1834,7 @@
   function setupUI() {
     if (!window.VOTUI || !VOTUI.on) return;
     VOTUI.init();
-    debugKeys();
+    votSliderKeys();
     // Однократная миграция префов. В тестах skipLang сохранился как «en»,
     // из-за чего основной сценарий (англоязычный ролик) молча пропускался.
     // Перевод нужен «с иностранного на русский», поэтому исключён русский.
@@ -1584,6 +1842,15 @@
       uiSet('skipLang', 'ru');
       uiSet('prefs.v', 2);
       log('prefs migrated to v2: skipLang=ru');
+    }
+    // v3: два независимых уровня — перевод (MediaPlayer моста) и оригинал,
+    // который звучит из видео, пока идёт перевод. Раньше vol.original был 100 %,
+    // из-за чего оригинал перекрывал перевод.
+    if (Number(uiPref('prefs.v', 1)) < 3) {
+      uiSet('vol.translate', 100);
+      uiSet('vol.original', 0);
+      uiSet('prefs.v', 3);
+      log('prefs migrated to v3: vol.translate=100 orig=0');
     }
     VOTUI.on('menu.toggle', function () {
       if (VOTUI.isOpen()) VOTUI.close(); else openTranslatePanel();
@@ -1650,7 +1917,7 @@
   // открытие панели, поэтому: (1) ищем узел по подписи, (2) ставим на него
   // data-vot-toggle/data-vot-on, (3) цвет рисует CSS из vot_ui.js через
   // transition — получается такая же плавная смена, как у кнопки субтитров.
-  var paintTimer = null, paintChain = [], paintProbe = 0, paintLog = '', paintMiss = 0, paintMissAt = 0, paintStale = 0;
+  var paintTimer = null, paintChain = [], paintLog = '', paintMiss = 0, paintMissAt = 0, paintStale = 0;
 
   function elInfo(el) {
     try {
@@ -1782,39 +2049,6 @@
     return null;
   }
 
-  // Один раз за запуск: структура узла кнопки и подписи соседей по ряду —
-  // по этому логу видно, что именно рисует кружок (нужно для доводки CSS).
-  function probeDom(el) {
-    if (paintProbe) return;
-    paintProbe = 1;
-    var out = ['probe how=' + (el.__votHow || '?') + ' ' + elInfo(el)], i, up = el;
-    try {
-      for (i = 0; i < 3 && up.parentNode && up.parentNode.tagName; i++) {
-        up = up.parentNode;
-        out.push('up' + (i + 1) + '=' + elInfo(up));
-      }
-    } catch (e) { }
-    var names = [];
-    try {
-      var ch = el.parentNode ? el.parentNode.children : null;
-      for (i = 0; ch && i < ch.length && i < 16; i++) {
-        var lb = '';
-        try { lb = String(ch[i].getAttribute('aria-label') || ''); } catch (e2) { }
-        if (!lb) {
-          try {
-            var d = ch[i].querySelector('[aria-label]');
-            if (d) lb = String(d.getAttribute('aria-label') || '');
-          } catch (e3) { }
-        }
-        var sz = elInfo(ch[i]);
-        names.push((ch[i] === el ? '*' : '') + 'len' + lb.length
-          + (lb.indexOf('Перевод') >= 0 ? 'RU' : '') + ':' + sz.slice(sz.lastIndexOf(' ') + 1));
-      }
-    } catch (e4) { }
-    out.push('row=' + names.join(' '));
-    log(out.join(' | '));
-  }
-
   // Иероглиф на белом кружке — тёмный, подписи (элементы с текстом) — белые.
   // Помечаем иконки атрибутом data-vot-ic; если иконку распознать не удалось
   // (рендерер рисует символ текстом), красим всё содержимое (data-vot-all).
@@ -1906,7 +2140,6 @@
       paintLog = on;
       log('paint ' + (on === '1' ? 'on' : 'off') + ' via ' + (el.__votHow || '?')
         + ' lb=' + deepLabelLen(el) + ' ' + elInfo(el));
-      probeDom(el);
     }
     verifyPaint(el, on);
   }
@@ -2007,18 +2240,24 @@
     return '';
   }
 
-  // Пункт «Перевод» в нативном меню настроек плеера (шестерёнка). Это самый
-  // надёжный путь: TizenTube сам так вставляет мини-плеер/шаринг/PiP, и они видны.
+  // Пункт «Перевод Яндекс» в нативном меню настроек плеера (шестерёнка). Внутри
+  // пункта лежит готовая команда нашей панели: клиент откроет её сам, как
+  // «Качество» — стопкой плашек справа, с родной анимацией и навигацией.
   function votPopupItem() {
-    return {
-      compactLinkRenderer: {
-        title: { simpleText: 'Перевод' },
-        icon: { iconType: 'TRANSLATE' },
-        serviceEndpoint: {
-          commandExecutorCommand: { commands: [{ customAction: { action: VOT_ACTION } }] }
-        }
-      }
+    var cmd = votPanelCmd('vot-settings');
+    var lr = {
+      title: { simpleText: 'Перевод Яндекс' },
+      icon: { iconType: 'TRANSLATE' },
+      // Стрелка — как у плашек, открывающих подменю («Скорость», «Пожалуйста»).
+      secondaryIcon: { iconType: 'CHEVRON_RIGHT' }
     };
+    if (cmd) {
+      lr.serviceEndpoint = { commandExecutorCommand: { commands: [cmd] } };
+    } else {
+      // Шаблон не поймали (настройки ещё не открывались) — DOM-панель.
+      lr.serviceEndpoint = { commandExecutorCommand: { commands: [{ customAction: { action: VOT_ACTION } }] } };
+    }
+    return { compactLinkRenderer: lr };
   }
 
   function collectItemLists(obj, out, depth) {
@@ -2073,7 +2312,12 @@
         && it.compactLinkRenderer.serviceEndpoint.commandExecutorCommand
         && it.compactLinkRenderer.serviceEndpoint.commandExecutorCommand.commands;
       if (!ic) continue;
-      for (var q = 0; q < ic.length; q++) if (actionOf(ic[q]) === VOT_ACTION) return true;
+      for (var q = 0; q < ic.length; q++) {
+        if (actionOf(ic[q]) === VOT_ACTION) return true;
+        var uid = '';
+        try { uid = String((ic[q].openPopupAction || {}).uniqueId || ''); } catch (e) { uid = ''; }
+        if (uid.indexOf('vot-') === 0) return true;
+      }
     }
     return false;
   }
@@ -2084,7 +2328,10 @@
   // повторная вставка безопасна (проверка popupHasOurs).
   function popupInsert(cmd) {
     if (!cmd || typeof cmd !== 'object' || !cmd.openPopupAction) return 0;
+    if (cmd.__votOwn) return 0; // своя панель: пункт «Перевод» в ней не нужен
     if (String(cmd.openPopupAction.uniqueId || '') !== 'playback-settings') return 0;
+    // Шаблон для наших панелей: та же команда, что клиент сейчас отрисует.
+    votTpl = cmd;
     var lists = popupItemLists(cmd), i;
     for (i = 0; i < lists.length; i++) {
       var arr = lists[i];
@@ -2110,16 +2357,26 @@
     var rc = inst[name];
     if (typeof rc !== 'function' || rc.__votHooked) return 0;
     var h = function (cmd) {
+      // Держим ссылки на диспетчеры: шаблон корня настроек и тот инстанс,
+      // который открывает вложенные панели (Качество/Субтитры). Свою панель
+      // отправляем именно второму — он умеет строить стопку плашек.
       try {
-        var act = actionOf(cmd);
-        if (act === VOT_TOGGLE_ACTION) { log('btn TOGGLE'); toggleTranslate(); return true; }
-        if (act === VOT_ACTION) { log('btn PRESSED'); openTranslatePanel(); return true; }
+        if (!inst.__votId) inst.__votId = ++instSeq;
+        if (name === 'resolveCommand' && cmd && cmd.openPopupAction) {
+          var uid = String(cmd.openPopupAction.uniqueId || '');
+          if (popupInstLog < 24) {
+            popupInstLog++;
+            log('popup inst=' + inst.__votId + ' uid=' + (uid || '-')
+              + ' own=' + (cmd.__votOwn ? 1 : 0) + ' w=' + where);
+          }
+        }
+      } catch (e9) { }
+      try {
+        if (handleAction(actionOf(cmd))) return true;
         var cc = cmd && cmd.commandExecutorCommand && cmd.commandExecutorCommand.commands;
         if (cc && cc.length) {
           for (var i = 0; i < cc.length; i++) {
-            var a2 = actionOf(cc[i]);
-            if (a2 === VOT_TOGGLE_ACTION) { log('btn TOGGLE exec'); toggleTranslate(); return true; }
-            if (a2 === VOT_ACTION) { log('btn PRESSED exec'); openTranslatePanel(); return true; }
+            if (handleAction(actionOf(cc[i]))) return true;
           }
         }
       } catch (e) { }

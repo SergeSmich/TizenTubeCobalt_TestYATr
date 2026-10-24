@@ -135,6 +135,112 @@ detected` и `paint on` нового ролика «выкл» нет; `translat
 `cmd.openPopupAction.uniqueId === 'playback-settings'`, тот же путь `…overlayPanelItemListRenderer.items`,
 `splice` ДО вызова оригинала.
 
+### 3j. Нативная панель РАБОТАЕТ (24.10 18:0x–18:2x, подтвердил пользователь)
+Вложенная команда принята клиентом: пункт «Перевод Яндекс» открывает родную стопку плашек справа
+с нативной анимацией, подуровни открываются, BACK закрывает. В логе НЕТ `popup inst= uid=vot-*` —
+клиент исполняет `serviceEndpoint.commandExecutorCommand.commands` своим путём, минуя наши хуки
+(поэтому `customAction` внутри пунктов всё равно доходит: `vot set vol.translate=…`).
+Доработки по просьбе пользователя (18:2x, к проверке):
+- у пункта в шестерёнке теперь `secondaryIcon=CHEVRON_RIGHT` (как у «Скорость»/«Пожалуйста»);
+- переключатели в нашей панели рисуются как радио (`CHECK`/`RADIO_BUTTON_UNCHECKED`);
+- `votItem` с полем `lv` добавляет второй командой перерисовку уровня (`votPanelCmd(lv,false)`),
+  чтобы значение в списке обновлялось сразу после выбора (`votLevelItems(lv, rf)`, глубина ≤3);
+- слайдер громкости: родного рендерера-слайдера в ТВ-клиенте НЕТ (проверено по кэшу
+  `tv-player-es6.js`/kabuki: только `compactLinkRenderer`, `setting*`, `overlayPanel*`), поэтому
+  `votSliderKeys()` в capture-фазе ловит LEFT/RIGHT, когда фокус на строке вида «40%»:
+  шаг 10 %, сразу `uiSet('vol.translate')` + `applyVolume()` + тост «Громкость перевода: N%».
+
+### 3i. Нативная панель через ВЛОЖЕННУЮ команду (24.10 18:xx, подтверждено)
+Пересылка `openPopupAction` из JS клиентом игнорируется (`vot probe hit=0`), поэтому пункт
+«Перевод Яндекс» теперь несёт панель В СВОЁМ `serviceEndpoint.commandExecutorCommand.commands[0]`
+— тем же путём клиент открывает «Качество»/«Субтитры».
+`dev_server/vot.js`: `votTpl` (команда корня из `popupInsert`) → `votCloneCmd(src, items, uid)` →
+`votPanelCmd(lv)` → `votNavItem()`/`votPopupItem()`; уровни `vot-settings`/`vot-src`/`vot-shard`/
+`vot-vol`/`vot-skip` собираются рекурсивно (глубина ≤2). Мёртвый путь удалён: `openVotPopup`,
+`votProbe*`, `votDebug`, `openVotMenu`, `votHost`/`votSubHost`; `VOT_ACTION`/`VOT_NAV` остались
+страховкой → DOM-панель. `votSet` больше не перерисовывает уровень (панель закрывается на выборе).
+`domProbe` сканирует `getElementsByTagName('*')` + фильтр `ytlr-` (селектор `ytlr-*` в Cobalt бросает).
+
+### 3h. Нативное меню «Перевод» (24.10 17:2x)
+Отдельное DOM-окно заменяем на нативную многоуровневую панель. Формат снят дампом
+(`popup#`): корень `uid=playback-settings` — полный payload лежит В САМОЙ команде
+(`openPopupAction.popup.overlaySectionRenderer.overlay.overlayTwoPanelRenderer.
+actionPanel.overlayPanelRenderer.content.overlayPanelItemListRenderer.items`),
+пункты-стрелки — `secondaryIcon=CHEVRON_RIGHT`, радио — `CHECK`/`RADIO_BUTTON_UNCHECKED`,
+а `serviceEndpoint.openClientOverlayAction` несёт только `type` (контент тянет сервер,
+свой тип зарегистрировать нельзя).
+Реализовано в `dev_server/vot.js`:
+- `votHost = {inst, fn, cmd}` — сохраняем диспетчер и шаблон корня при первом попапе
+  `playback-settings` (в `hookMethod`);
+- `votCloneCmd(src, items)` — копия звеньев пути с подменой `items`, метка `cmd.__votOwn`
+  (свою панель `popupInsert` не патчит);
+- уровни: `vot-settings` (Перевод вкл/выкл · Источник · Шард · Громкость · Язык-исключение ·
+  Статус) → `vot-src`, `vot-shard`, `vot-vol`, `vot-skip`;
+- действия: `VOT_NAV:<уровень>`, `VOT_SET:<ключ>:<значение>`, `VOT_FILL`, `VOT_FILLSTATUS`
+  → общий `handleAction()`; после выбора уровень перерисовывается (галочка);
+- `openVotMenu()` = нативная панель, при отсутствии шаблона — прежняя DOM-панель;
+- диагностика: `vot probe <уровень> n=<узлов> hit=<найдено>` через 500 мс — рисует ли
+  рендерер наши пункты. `node --check` и склейка `/vot.js` — OK, на ТВ не проверено.
+**Итог прогона 17:22**: нативный путь не работает — `vot popup open vot-settings n=6`
+есть, но `vot probe hit=0`: клиент не рендерит `openPopupAction`, собранный из JS
+(диспетчер молча игнорирует). Поэтому `openVotMenu()` открывает DOM-панель, а нативная
+панель осталась за префом `nativeMenu` (для опытов). Отладка: **F5** (`votDebug`) шлёт
+диспетчеру исходную команду корня — если меню не появится, путь закрыт окончательно.
+Пункт меню переименован в «Перевод Яндекс» (без двоеточия — `isToggleLabel` его не
+принимает за кнопку, кружок на него не переезжает).
+**UI-панель (по фото с ТВ)**: `left/top:50%` + `translate(-50%,-50%)` давало сдвиг
+влево и обрезку края → центрирование переведено на flex у `#vot-ui-root.vot-open`;
+анимация появления/закрытия — inline-стилями (`opacity` + `scale(.92→1)`, 220 мс,
+`cubic-bezier(.2,0,0,1)`), т.к. CSS-keyframes в Cobalt не запускались; `.vot-list`
+получил `max-height:600px;overflow-y:auto` (10 пунктов не влезали, фокус уводится
+`scrollIntoView`).
+**Итог 17:3x (со слов пользователя)**: пункт «Перевод Яндекс» есть, но панель
+появляется без анимации (CSS-transition/keyframes в Cobalt не запускаются вообще).
+Поэтому: (а) позиция панели — явные пиксели от `visualViewport` (`placePanel`,
+цель хранится в `panelEl.__votL/__votT`); (б) анимация — покадровая из JS
+(`animRun`: `requestAnimationFrame`, fallback `setTimeout(20мс)`), «выезд» слева
+на ~170 px + `scale .94→1` + прозрачность, 230 мс; закрытие — 160 мс влево.
+Диагностика в логе: `geom iw=… vv=… panel=…` и `anim in ok frames=N` —
+по числу кадров видно, идёт ли перерисовка.
+**Уточнение пользователя**: нативное меню — это НЕ окно по центру, а стопка плашек,
+выезжающая справа из-за края; пункты перевода надо встроить в родное меню.
+Ход (24.10 17:5x): добавлены зонды и попытка диспетчеризации в правильный инстанс:
+- `popup inst=<id> uid=…` в хуке — видно, разные ли инстансы открывают корень и подпанели;
+- `votSubHost` = инстанс, открывавший подпанель (`uid≠playback-settings`);
+  `openVotPopup` шлёт команду сначала ему, потом корневому (`host=i`);
+- `skel#N` — скелет `overlayTwoPanelRenderer` (есть ли подпанели внутри команды);
+- `dom#N` — теги/классы/размеры нативных панелей в DOM (для копии вида);
+- `openVotMenu` при `hit=0` через 460 мс откатывается на DOM-панель;
+- F5 (`votDebug`) печатает `dbg orig … skel` и ре-диспатчит исходную команду
+  через `votSubHost` — решающий тест «принимает ли клиент команды из JS».
+
+## 3z. Громкость: два уровня (24.10, к проверке)
+Перевод играет нативный `MediaPlayer` в мосте ⇒ из JS его не приглушить: добавлен `POST /volume`
+(`Bridge.java`: `sVol`, `setAudioVolume`, `mp.setVolume(sVol,sVol)` при создании плеера) — нужна
+пересборка dex+APK моста. В `dev_server/vot.js`:
+- `vot-vol` = две строки-ползунка: «Громкость перевода» (100 %) и «Оригинал при переводе» (0 %),
+  `second: CHEVRON_LEFT`, подпись `N% · влево/вправо`; в корне — `votNavItem('Громкость', votVolText())`
+  (`перевод N% · оригинал M%`), хелпер `volPct()` с клампом 0–100;
+- `applyVolume()`: в мост `POST /volume {pct: vol.translate}` (только при изменении, `volSentTr`),
+  видео = `state.active ? vol.original : 100` (без перевода уровень не трогаем), лог
+  `vol tr=… orig=… active=… muted=… got=…`;
+- `votSliderKeys()`: LEFT/RIGHT ловятся в capture, строка определяется по `aria-label`/тексту
+  (`volKeyOf`: «громкость перевода» / «оригинал при переводе»), шаг 10, `preventDefault`,
+  `applyVolume()` + `votPaintValue()` (правит цифру прямо в тексте/aria-label узла) + тост;
+- `prefs.v=3`: `vol.translate=100`, `vol.original=0` (раньше оригинал 100 % перекрывал перевод);
+- `VOT_VOLS` удалён; DOM-панель (`F4`) получила те же два слайдера.
+`node --check` OK, склейка `/vot.js` отдаёт новый код (139 223 B). На ТВ не проверено.
+**Прогон 24.10 18:55–18:56** (мост пересобран: `classes4.dex` 39 692 B, install Success):
+`prefs migrated to v3`, `watch detected dQw4w9WgXcQ` → `translate start` → `status=1` → `play` →
+`vol tr=100 orig=0 active=1 muted=1 got=0` (оригинал заглушён, это и нужно) → `audio volume 100%`
+от моста (значит `POST /volume` работает). `vol ERR`=0. Ждём проверки с пульта.
+**Подтверждено пользователем (24.10 19:0x)**: «работает все» — ползунки меняют звук перевода и
+оригинала сразу, цифра в строке обновляется, значения переживают перезапуск меню, при выключенном
+переводе уровень не меняется. Временная диагностика удалена (`dumpPopup`, `panelSkeleton`, `domProbe`,
+`probeDom`, `debugKeys`, `escAscii`, мёртвые `closeTimer`/`votNavLog`/`menu.debug`), ревью пройдено
+(0 blocker/major), смоук после чистки: `vol tr=100 orig=10 active=1` → `audio volume 100%`,
+`paint on` на двух роликах подряд, `unhandled`=0, `vol ERR`=0.
+
 ## 4. Клавиши (Android keycode → web keyCode)
 `134`→`115` (F4, панель), `133`→`114` (F3, вкл/выкл перевода), `82`→`18` (MENU — тоже панель),
 `23`→`13` (OK), `4`→`27` (BACK), `21/22/19/20`→`37/39/38/40`. `115`/`114` в `input keyevent` —

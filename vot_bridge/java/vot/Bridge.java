@@ -74,6 +74,9 @@ public final class Bridge {
     private static volatile boolean sPrepared = false;
     private static volatile long sLastPosMs = -1;
     private static volatile boolean sPlaying = false;
+    // Громкость перевода: MediaPlayer в Cobalt играет мимо JS, поэтому уровень
+    // задаётся из моста (/volume) и переиспользуется для новых треков.
+    private static volatile float sVol = 1f;
 
     // ---- runtime config (posted by the overlay to /config) ----
     // lively  : ask Yandex for "live voices" (needs a Yandex OAuth token)
@@ -428,6 +431,10 @@ public final class Bridge {
                     if (url.isEmpty()) throw new IOException("missing url");
                     playAudio(url, offset);
                     resp = "{\"ok\":1,\"playing\":\"starting\"}";
+                } else if (path.startsWith("/volume")) {
+                    JSONObject req = body.length > 0 ? new JSONObject(new String(body, StandardCharsets.UTF_8)) : new JSONObject();
+                    setAudioVolume(req.optDouble("pct", 100));
+                    resp = "{\"ok\":1}";
                 } else if (path.startsWith("/pause")) {
                     pauseAudio();
                     resp = "{\"ok\":1}";
@@ -706,6 +713,7 @@ public final class Bridge {
                 sPlayer = mp;
                 sPlayerUrl = url;
                 sPrepared = false;
+                try { mp.setVolume(sVol, sVol); } catch (Throwable e) { }
                 mp.prepareAsync();
             } catch (Throwable e) {
                 android.util.Log.e("VotBridge", "play failed", e);
@@ -713,6 +721,20 @@ public final class Bridge {
                 sPlaying = false;
             }
         });
+    }
+
+    // Громкость перевода (0…100 %). JS не может управлять звуком MediaPlayer,
+    // поэтому уровень задаётся этим эндпоинтом и запоминается в sVol.
+    private static void setAudioVolume(double pct) {
+        if (Double.isNaN(pct) || pct < 0) pct = 0;
+        if (pct > 100) pct = 100;
+        final float v = (float) (pct / 100.0);
+        sVol = v;
+        ensureAudioThread();
+        sAudioHandler.post(() -> {
+            try { if (sPlayer != null) sPlayer.setVolume(v, v); } catch (Throwable e) { }
+        });
+        android.util.Log.i("VotBridge", "audio volume " + (int) pct + "%");
     }
 
     private static void seekAudio(double offsetSec) {
