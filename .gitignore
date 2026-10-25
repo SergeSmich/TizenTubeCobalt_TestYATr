@@ -358,6 +358,9 @@ vot_bridge/logs/
 /0
 _v_repo/
 _vhost/
+# reference copy of the VOT extension sources (decompiled/reverse-engineered,
+# useful locally, never committed)
+/temp/
 # build artifacts (APK / dex / signing / smali tooling kept locally only)
 /apk_out/
 /apk_203/
