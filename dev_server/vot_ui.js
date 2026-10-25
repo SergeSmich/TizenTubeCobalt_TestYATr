@@ -221,6 +221,7 @@
       index: spec.index || 0
     };
     if (cur.index >= items.length) cur.index = 0;
+    closeGen++; // отменяем страховку закрытия предыдущей панели
     root.className = 'vot-open';
     render();
     placePanel();
@@ -280,18 +281,29 @@
     } catch (e) { log('geom ERR ' + (e && e.name)); }
   }
 
+  // Поколение закрытия: страховочный таймер не должен «погасить» панель,
+  // которую успели открыть заново (иначе на экране пустой полноэкранный слой).
+  var closeGen = 0;
+
   function close() {
     cur = null;
     stack = [];
     if (!root || !panelEl) return;
-    // Закрытие — покадрово из JS (CSS-transition в Cobalt не срабатывает).
-    animateOut(function () {
+    var gen = ++closeGen;
+    var done = function () {
+      if (gen !== closeGen) return;
       try {
         root.className = '';
         root.style.opacity = '';
         panelEl.style.transform = '';
       } catch (e2) { }
-    });
+    };
+    // Закрытие — покадрово из JS (CSS-transition в Cobalt не срабатывает).
+    animateOut(done);
+    // Страховка: кадры анимации могут не дойти (Cobalt «съедает» rAF при
+    // проигрывании видео), и тогда полноэкранный #vot-ui-root остался бы
+    // видимым поверх плеера — «пропадает интерфейс, все кнопки».
+    setTimeout(done, 400);
     log('close');
   }
 

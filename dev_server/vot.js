@@ -42,6 +42,19 @@
   var META_GAPS = [400, 600, 900, 1500, 2500, 2500, 2500, 2500, 2500];
   var MARK = 'VOT-OVERLAY-V14';
 
+  // Повторная инъекция того же скрипта в ту же страницу (TizenTube подгружает
+  // userScript на некоторых переходах) не должна плодить таймеры, MutationObserver
+  // и слушатели клавиш: иначе через несколько минут в странице живут десятки
+  // экземпляров оверлея, и интерфейс плеера начинает «пропадать»/подтормаживать.
+  // Новый код всё равно применяется только после перезапуска приложения.
+  try {
+    if (window.__VOT_OVERLAY_MARK === MARK) {
+      try { console.log('[VOT] overlay already active (' + MARK + ') -> skip re-init'); } catch (e0) { }
+      return;
+    }
+    window.__VOT_OVERLAY_MARK = MARK;
+  } catch (e) { }
+
   var state = {
     curId: null,
     busy: false,
@@ -2002,12 +2015,46 @@
     return hit;
   }
 
+  // Строка «Громкость перевода», на которой остался фокус, может НЕ быть видна:
+  // нативная панель закрылась, а её DOM (с нашими подписями) остался в дереве и
+  // продолжает держать activeElement. Раньше в этом случае мы всё равно гасили
+  // LEFT/RIGHT (preventDefault + stopPropagation), и клиент переставал получать
+  // стрелки — интерфейс плеера «пропадал» до перезапуска приложения. Поэтому
+  // перехватываем клавиши только если строка реально на экране: проверяем сам
+  // узел и трёх его предков (глубже обход на ТВ дорог).
+  var volIgn = 0;
+  function nodeOnScreen(a) {
+    if (!a || a.nodeType !== 1 || !a.getBoundingClientRect) return false;
+    try {
+      if (!document.body || !document.body.contains(a)) return false;
+      var r = a.getBoundingClientRect();
+      if (!r || r.width < 4 || r.height < 4) return false;
+      var cur = a, i, st = null;
+      for (i = 0; i < 4 && cur && cur.nodeType === 1; i++) {
+        try {
+          st = window.getComputedStyle ? window.getComputedStyle(cur) : null;
+          if (st) {
+            if (st.display === 'none' || st.visibility === 'hidden') return false;
+            if (st.opacity !== '' && Number(st.opacity) < 0.05) return false;
+          }
+        } catch (e0) { }
+        cur = cur.parentNode;
+      }
+      return true;
+    } catch (e) { return false; }
+  }
+
   function votSliderKeys() {
     window.addEventListener('keydown', function (e) {
       var kc = e.keyCode;
       if (kc !== 37 && kc !== 39) return;
       var a = document.activeElement, key = volKeyOf(a);
       if (!key) return;
+      if (!nodeOnScreen(a)) {
+        // Клавишу не трогаем — она уходит клиенту как обычно.
+        if (volIgn < 12) { volIgn++; log('vol slide ignored: row not visible kc=' + kc); }
+        return;
+      }
       var def = key === 'vol.translate' ? 100 : 0;
       var cur = volPct(key, def);
       var next = cur + (kc === 39 ? 10 : -10);
@@ -2711,15 +2758,63 @@
   }, 2000);
   // ===== VOT-UI END =====
 
+  // ---- сторож интерфейса плеера ---------------------------------------------
+  // Пользователь сообщил: «иногда в какой-то момент пропадает интерфейс плеера,
+  // все кнопки; помогает перезапуск». Чтобы понять, что именно исчезает (узлы
+  // ряда, видимость, наша панель), раз в ~2.4 с снимаем компактный срез DOM и
+  // пишем его в лог ТОЛЬКО при изменении. Строки вида `ui rows=1 btn=4 lb=9
+  // vis=1 432x72 our=1 panel=0 af=body`.
+  var uiPrev = '', uiLog = 0;
+
+  function uiSample() {
+    var rows = null, n = 0, lb = 0, vis = 0, w = 0, h = 0, i;
+    try { rows = document.querySelectorAll('ytlr-player-actions-container'); } catch (e) { rows = null; }
+    if (rows) {
+      for (i = 0; i < rows.length; i++) {
+        try {
+          n += rows[i].querySelectorAll('ytlr-button-renderer').length;
+          lb += rows[i].querySelectorAll('[aria-label]').length;
+          var b = rows[i].getBoundingClientRect();
+          if (b.width > 0 && b.height > 0) { vis++; w = Math.round(b.width); h = Math.round(b.height); }
+        } catch (e2) { }
+      }
+    }
+    var ours = 0;
+    try { ours = document.querySelectorAll('[data-vot-toggle]').length; } catch (e3) { }
+    var pn = 0, toast = 0;
+    try {
+      var rt = document.getElementById('vot-ui-root');
+      pn = (rt && String(rt.className).indexOf('vot-open') >= 0) ? 1 : 0;
+      var ts = document.getElementById('vot-toast');
+      toast = (ts && ts.style.display === 'block') ? 1 : 0;
+    } catch (e4) { }
+    var af = '-';
+    try { af = document.activeElement ? String(document.activeElement.tagName || '').toLowerCase().slice(0, 12) : '-'; } catch (e5) { }
+    return 'rows=' + (rows ? rows.length : -1) + ' btn=' + n + ' lb=' + lb + ' vis=' + vis
+      + ' ' + w + 'x' + h + ' our=' + ours + ' panel=' + pn + ' toast=' + toast + ' af=' + af;
+  }
+
+  function uiWatch() {
+    var s = uiSample();
+    if (s === uiPrev) return;
+    uiPrev = s;
+    if (uiLog < 120) { uiLog++; log('ui ' + s); }
+  }
+
   // Подсветка кнопки должна совпадать с состоянием перевода всегда — в том
   // числе после переключения ролика при уже открытой панели. Тик дешёвый:
   // пока data-vot-on совпадает, DOM не меняется.
+  var uiTickN = 0;
   setInterval(function () {
+    uiTickN++;
     try {
       if (!state.curId || document.hidden) return;
+      // Сторож интерфейса: раз в два тика (~2.4 с), только на странице ролика.
+      if (uiTickN % 2 === 0) uiWatch();
       paintToggleBtn();
     } catch (e) { }
   }, 1200);
+
 
   // Рендерер переиспользует DOM-узлы кнопок и меняет им aria-label. Ловим такие
   // правки сразу: как только подпись узла перестала быть нашей — снимаем метки
