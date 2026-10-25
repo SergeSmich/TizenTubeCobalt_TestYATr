@@ -593,6 +593,34 @@
     attempt();
   }
 
+  // Serverless: спрашиваем url у МОСТА. Мост сам ходит в InnerTube с куками
+  // телевизора (ANDROID_VR), поэтому ни ПК, ни запрос из страницы не нужны.
+  // Возвращает {url, itag}; url с `n` пока отдаём ошибкой (решателя нет).
+  function bridgeAudio(videoId, cb, err) {
+    http('GET', '/yt_url?videoId=' + encodeURIComponent(videoId) + '&client=vr', null,
+      function (r) {
+        if (!r || !r.status) { (err || function () {})(new Error('bridge: empty answer')); return; }
+        if (r.status !== 'OK') {
+          (err || function () {})(new Error('bridge: ' + r.status + ' ' + String(r.reason || '').slice(0, 120)));
+          return;
+        }
+        var list = r.formats || [], best = null, withN = 0, i, f, k;
+        var order = ['251', '140'];
+        for (i = 0; i < list.length; i++) if (list[i] && list[i].n) withN++;
+        for (k = 0; k < order.length && !best; k++) {
+          for (i = 0; i < list.length; i++) {
+            f = list[i];
+            if (f && !f.n && String(f.itag) === order[k]) { best = f; break; }
+          }
+        }
+        for (i = 0; i < list.length && !best; i++) if (list[i] && !list[i].n) best = list[i];
+        log('audio bridge vr fmt=' + list.length + ' withN=' + withN + ' login=' + (r.loggedIn ? 1 : 0) +
+            (best ? ' pick itag=' + best.itag : ' none'));
+        if (!best) { (err || function () {})(new Error('url needs n (' + withN + ')')); return; }
+        cb({ url: best.url, itag: Number(best.itag) || 0 });
+      }, err);
+  }
+
   // Cheap status-6 path: pretend the in-page audio probe failed and upload an
   // empty buffer, then re-ask Yandex to translate. No YouTube download at all.
   function failAudio(id, dur, tid) {
@@ -633,8 +661,9 @@
     state.uploading = true;
     state.translationId = tid;
     setStatus('Перевод: ищу исходный звук…', '#f5a623', 'wait');
-    log('audio lookup id=' + id + ' tid=' + tid);
-    innertubeAudio(id, function (a) {
+    var local = !!(state.cfg && state.cfg.audioMode === 'local');
+    log('audio lookup id=' + id + ' tid=' + tid + ' mode=' + (local ? 'local' : 'page'));
+    var onSrc = function (a) {
       log('audio src itag=' + a.itag + ' url=' + String(a.url).slice(0, 60));
       setStatus('Перевод: скачиваю и загружаю звук…\nitag=' + a.itag, '#f5a623', 'wait');
       http('POST', '/audio',
@@ -647,12 +676,15 @@
           poll(id, dur, 5);
         },
         function (e) { state.uploading = false; state.busy = false; setStatus('Перевод: не удалось загрузить звук\n' + e, '#e53935'); log('audio upload ERR ' + e); });
-    }, function (e) {
+    };
+    var onErr = function (e) {
       state.uploading = false;
       state.busy = false;
       setStatus('Перевод: не удалось получить звук\n' + e, '#e53935');
       log('audio inner ERR ' + e);
-    });
+    };
+    if (local) bridgeAudio(id, onSrc, onErr);
+    else innertubeAudio(id, onSrc, onErr);
   }
 
   // Ask the PC dev server to download the track and push it into the Yandex
@@ -1474,6 +1506,7 @@
       if (c && typeof c.lang === 'string' && c.lang) state.lang = c.lang;
       log('config lively=' + c.lively + ' token=' + (c.hasToken ? 'yes' : 'no') +
         ' worker=' + (c.worker || '-') + ' proxy=' + (c.proxyMode || 'off') +
+        ' audio=' + (c.audioMode || 'off') + ' pcFill=' + (c.pcFill === false ? 0 : 1) +
         ' lang=' + state.lang);
     }, function (e) { log('config ERR ' + e); });
   }, function (e) {
@@ -1685,7 +1718,37 @@
   // /fill_status он уже проксирует на ПК, а ПК дописывает в ответ lang/title
   // (быстрый детектор /youtubei/v1/player ~0.4-1 с, yt-dlp — фолбэк).
   // Пока ПК не успел — повторяем опрос по META_GAPS.
+  // Serverless: язык оригинала спрашивает мост (/meta_local = порт yt_lang.py).
+  // Если мост не смог — тихо откатываемся на прежний путь через ПК.
   function fetchMeta(id, tries) {
+    var n = tries || 0;
+    if (state.cfg && state.cfg.audioMode === 'local') { fetchMetaLocal(id, n); return; }
+    fetchMetaPC(id, n);
+  }
+
+  function fetchMetaLocal(id, n) {
+    http('GET', '/meta_local?videoId=' + encodeURIComponent(id), null, function (j) {
+      if (state.curId !== id) return;
+      var lang = String((j && j.lang) || '');
+      if (j && j.ok && lang) {
+        if (lang !== state.origLang) {
+          state.origLang = lang;
+          log('meta_local id=' + id + ' lang=' + lang + ' ms=' + (j.ms || 0)
+            + ' title=' + String(j.title || '').slice(0, 40));
+          maybeSkipNow(id, lang);
+        }
+        return;
+      }
+      log('meta_local fail ' + String((j && j.err) || 'no lang') + ' -> pc meta');
+      fetchMetaPC(id, n);
+    }, function (e) {
+      if (state.curId !== id) return;
+      log('meta_local ERR ' + (e && e.message) + ' -> pc meta');
+      fetchMetaPC(id, n);
+    });
+  }
+
+  function fetchMetaPC(id, tries) {
     var n = tries || 0;
     http('GET', '/fill_status?videoId=' + encodeURIComponent(id), null, function (j) {
       if (state.curId !== id) return;
@@ -1700,7 +1763,7 @@
         return;
       }
       if (n < META_GAPS.length) {
-        setTimeout(function () { fetchMeta(id, n + 1); }, META_GAPS[n]);
+        setTimeout(function () { fetchMetaPC(id, n + 1); }, META_GAPS[n]);
       } else {
         log('meta id=' + id + ' lang unknown (pc meta timeout)');
       }
@@ -1710,7 +1773,7 @@
       if (state.curId !== id) return;
       log('meta ERR ' + (e && e.message) + ' try=' + (n + 1));
       if (n < META_GAPS.length) {
-        setTimeout(function () { fetchMeta(id, n + 1); }, META_GAPS[n]);
+        setTimeout(function () { fetchMetaPC(id, n + 1); }, META_GAPS[n]);
       }
     });
   }

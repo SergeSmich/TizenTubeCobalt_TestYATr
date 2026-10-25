@@ -1,14 +1,20 @@
 package vot;
 
 import android.content.Context;
+import android.database.Cursor;
+import android.database.sqlite.SQLiteDatabase;
 import android.media.MediaPlayer;
 import android.os.Handler;
 import android.os.HandlerThread;
 
+import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -18,8 +24,10 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -92,12 +100,30 @@ public final class Bridge {
     // Empty-audio strategy for status 6: "audio" (SmartTube marker, default),
     // "votjs" (vot.js marker) or "skip" (don't touch, just keep polling).
     private static volatile String sFaMode = "audio";
+    // Serverless switches handed to the overlay via /config:
+    // audioMode : "off" (PC filler as before) | "local" (bridge resolves the
+    //             audio URL itself and feeds it to Yandex without a PC)
+    // pcFill    : may the overlay ask the PC dev server for the source audio
+    private static volatile String sAudioMode = "off";
+    private static volatile boolean sPcFill = true;
+
+    // ---- TV-side paths (needed to read Cobalt's cookie store) ----
+    private static volatile String sDataDir = "";
+    private static volatile String sCacheDir = "";
 
     private Bridge() {}
 
     public static synchronized void start(Context ctx) {
         if (started) return;
         started = true;
+        try {
+            sDataDir = ctx.getApplicationInfo().dataDir;
+            File cd = ctx.getCacheDir();
+            sCacheDir = cd == null ? sDataDir : cd.getAbsolutePath();
+        } catch (Throwable e) {
+            android.util.Log.w("VotBridge", "dirs failed: " + e);
+        }
+        android.util.Log.i("VotBridge", "dirs data=" + sDataDir + " cache=" + sCacheDir);
         Thread t = new Thread(Bridge::serve, "vot-bridge");
         t.setDaemon(true);
         t.start();
@@ -337,6 +363,468 @@ public final class Bridge {
     }
 
     // ---------------------------------------------------------------------
+    // YouTube session of the TV + InnerTube (serverless path, no PC)
+    // ---------------------------------------------------------------------
+    // Cobalt keeps its cookies in a plaintext Chromium SQLite store inside the
+    // app data dir. The bridge runs in the same uid, so it copies that file and
+    // reads it read-only: no root, no Keystore, no WebView.
+    private static final String COOKIE_REL = "app_content_shell/content_shell/Cookies";
+    private static final long COOKIE_TTL_MS = 60000L;
+    private static final String[] AUTH_COOKIES = {
+            "SID", "SAPISID", "APISID", "HSID", "SSID", "__Secure-1PSID",
+            "__Secure-3PSID", "__Secure-1PAPISID", "__Secure-3PAPISID", "LOGIN_INFO"
+    };
+    private static final Object COOKIE_LOCK = new Object();
+    private static volatile long sCookieAtMs;
+    private static volatile String sCookieHeader = "";
+    private static volatile String sCookieNames = "";
+    private static volatile String sCookieErr = "";
+    private static volatile boolean sCookieLoggedIn;
+    private static volatile Map<String, String> sCookieMap = new HashMap<>();
+
+    private static final String INNERTUBE = "https://www.youtube.com/youtubei/v1/player";
+    private static final String INNERTUBE_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
+    private static final String WEB_VERSION = "2.20240101.00.00";
+    private static final String WEB_UA =
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+            "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+    private static final String VR_VERSION = "1.62.27";
+    private static final String VR_UA =
+            "com.google.android.apps.youtube.vr.oculus/1.62.27 (Linux; U; Android 12; en_US; " +
+            "Quest 3 Build/SQ3A.220605.009.A1;) gzip";
+
+    private static final class MetaEntry {
+        final long at;
+        final boolean ok;
+        final JSONObject json;
+        MetaEntry(long at, boolean ok, JSONObject json) {
+            this.at = at; this.ok = ok; this.json = json;
+        }
+    }
+    private static final Map<String, MetaEntry> META_CACHE = new HashMap<>();
+
+    // Copy the Chromium store into our cache dir (it may be locked by Cobalt),
+    // then read host/name/value. Values stay in memory only: they never go into
+    // /yt_session and never into the log.
+    private static void refreshCookies(boolean force) {
+        synchronized (COOKIE_LOCK) {
+            long now = System.currentTimeMillis();
+            if (!force && sCookieAtMs != 0 && now - sCookieAtMs < COOKIE_TTL_MS) return;
+            sCookieAtMs = now;
+            sCookieErr = "";
+            Map<String, String> map = new HashMap<>();
+            StringBuilder names = new StringBuilder();
+            try {
+                if (sDataDir == null || sDataDir.isEmpty()) throw new IOException("no data dir");
+                File src = new File(sDataDir, COOKIE_REL);
+                if (!src.isFile()) throw new IOException("no cookie store");
+                File dst = new File(sCacheDir, "vot_cookies.db");
+                copyFile(src, dst);
+                SQLiteDatabase db = SQLiteDatabase.openDatabase(dst.getAbsolutePath(), null,
+                        SQLiteDatabase.OPEN_READONLY);
+                java.util.ArrayList<String> hosts = new java.util.ArrayList<>();
+                java.util.ArrayList<String> ns = new java.util.ArrayList<>();
+                java.util.ArrayList<String> vs = new java.util.ArrayList<>();
+                Cursor c = null;
+                try {
+                    c = db.rawQuery("SELECT host_key,name,value,expires_utc FROM cookies"
+                            + " WHERE host_key = 'youtube.com' OR host_key LIKE '%.youtube.com'", null);
+                    while (c.moveToNext()) {
+                        String host = c.getString(0);
+                        String name = c.getString(1);
+                        String val = c.isNull(2) ? "" : c.getString(2);
+                        if (name == null || name.isEmpty()) continue;
+                        long eu = c.isNull(3) ? 0L : c.getLong(3);
+                        if (eu > 0) {
+                            // Chromium: микросекунды от 1601; истёкшие не берём.
+                            long sec = eu / 1000000L - 11644473600L;
+                            if (sec < now / 1000L) continue;
+                        }
+                        hosts.add(host == null ? "" : host);
+                        ns.add(name);
+                        vs.add(val);
+                    }
+                } finally {
+                    if (c != null) c.close();
+                    db.close();
+                }
+                // Same name on several hosts: prefer ".youtube.com" (the session
+                // cookies live there), then anything else.
+                for (int pass = 0; pass < 2; pass++) {
+                    for (int i = 0; i < ns.size(); i++) {
+                        String host = hosts.get(i);
+                        boolean exact = host.equals(".youtube.com") || host.equals("youtube.com");
+                        if (pass == 0 ? !exact : exact) continue;
+                        String name = ns.get(i);
+                        if (map.containsKey(name)) continue;
+                        map.put(name, vs.get(i));
+                    }
+                }
+                StringBuilder sb = new StringBuilder();
+                for (Map.Entry<String, String> e : map.entrySet()) {
+                    String v = e.getValue();
+                    if (v == null || v.isEmpty()) continue;
+                    if (sb.length() > 0) sb.append("; ");
+                    sb.append(e.getKey()).append('=').append(v);
+                    if (names.length() > 0) names.append(',');
+                    names.append(e.getKey());
+                }
+                sCookieHeader = sb.toString();
+                sCookieLoggedIn = map.containsKey("SID") || map.containsKey("SAPISID");
+                android.util.Log.i("VotBridge", "yt cookies n=" + map.size()
+                        + " login=" + (sCookieLoggedIn ? 1 : 0) + " db=" + src.length()
+                        + "B headerLen=" + sCookieHeader.length() + " names=" + names);
+            } catch (Throwable e) {
+                // Частично прочитанный map не должен остаться в памяти: иначе
+                // cookie("SID") вернёт значение при sCookieLoggedIn=false.
+                map = new HashMap<>();
+                sCookieHeader = "";
+                sCookieLoggedIn = false;
+                sCookieErr = String.valueOf(e.getMessage());
+                android.util.Log.w("VotBridge", "yt cookies failed: " + e);
+            }
+            sCookieMap = map;
+            sCookieNames = names.toString();
+        }
+    }
+
+    private static String cookie(String name) {
+        String v = sCookieMap.get(name);
+        return v == null ? "" : v;
+    }
+
+    private static void copyFile(File from, File to) throws IOException {
+        File parent = to.getParentFile();
+        if (parent != null && !parent.isDirectory()) parent.mkdirs();
+        try (InputStream in = new FileInputStream(from);
+             OutputStream out = new FileOutputStream(to)) {
+            byte[] buf = new byte[16384];
+            int n;
+            while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+        }
+    }
+
+    private static String sha1Hex(String s) throws Exception {
+        MessageDigest md = MessageDigest.getInstance("SHA-1");
+        byte[] d = md.digest(s.getBytes(StandardCharsets.UTF_8));
+        StringBuilder sb = new StringBuilder(d.length * 2);
+        for (byte b : d) {
+            int v = b & 0xff;
+            if (v < 16) sb.append('0');
+            sb.append(Integer.toHexString(v));
+        }
+        return sb.toString();
+    }
+
+    // WEB requires SAPISIDHASH (plain Cookie header alone hits the bot gate on
+    // every non-cached video). Origin must match the header exactly.
+    private static String sapisidHash(String sapisid) {
+        try {
+            long ts = System.currentTimeMillis() / 1000L;
+            String digest = sha1Hex(ts + " " + sapisid + " https://www.youtube.com");
+            return "SAPISIDHASH " + ts + "_" + digest;
+        } catch (Throwable e) {
+            return "";
+        }
+    }
+
+    private static JSONObject itPlayer(String videoId, boolean vr) throws Exception {
+        refreshCookies(false);
+        JSONObject client = new JSONObject();
+        JSONObject body = new JSONObject();
+        JSONObject ctx = new JSONObject();
+        if (vr) {
+            client.put("clientName", "ANDROID_VR");
+            client.put("clientVersion", VR_VERSION);
+            client.put("deviceMake", "Oculus");
+            client.put("deviceModel", "Quest 3");
+            client.put("androidSdkVersion", 32);
+            client.put("osName", "Android");
+            client.put("osVersion", "12");
+            client.put("userAgent", VR_UA);
+        } else {
+            client.put("clientName", "WEB");
+            client.put("clientVersion", WEB_VERSION);
+        }
+        client.put("hl", "en");
+        client.put("gl", "US");
+        client.put("utcOffsetMinutes", 0);
+        ctx.put("client", client);
+        body.put("context", ctx);
+        body.put("videoId", videoId);
+        body.put("contentCheckOk", true);
+        body.put("racyCheckOk", true);
+
+        String ua = vr ? VR_UA : WEB_UA;
+        HttpURLConnection c = (HttpURLConnection) new URL(
+                INNERTUBE + "?key=" + INNERTUBE_KEY + "&prettyPrint=false").openConnection();
+        c.setConnectTimeout(8000);
+        c.setReadTimeout(15000);
+        c.setRequestMethod("POST");
+        c.setDoOutput(true);
+        c.setRequestProperty("Content-Type", "application/json");
+        c.setRequestProperty("User-Agent", ua);
+        c.setRequestProperty("X-Youtube-Client-Name", vr ? "28" : "1");
+        c.setRequestProperty("X-Youtube-Client-Version", vr ? VR_VERSION : WEB_VERSION);
+        c.setRequestProperty("Accept-Language", "en");
+        c.setRequestProperty("Origin", "https://www.youtube.com");
+        c.setRequestProperty("Referer", "https://www.youtube.com/");
+        String ck = sCookieHeader;
+        if (ck != null && !ck.isEmpty()) c.setRequestProperty("Cookie", ck);
+        if (!vr) {
+            String sap = cookie("SAPISID");
+            if (sap.isEmpty()) sap = cookie("__Secure-3PAPISID");
+            if (sap.isEmpty()) sap = cookie("__Secure-1PAPISID");
+            String authz = sap.isEmpty() ? "" : sapisidHash(sap);
+            if (!authz.isEmpty()) c.setRequestProperty("Authorization", authz);
+        }
+        JSONObject j;
+        try {
+            OutputStream os = c.getOutputStream();
+            os.write(body.toString().getBytes(StandardCharsets.UTF_8));
+            os.close();
+            int code = c.getResponseCode();
+            if (code >= 400) throw new IOException("innertube HTTP " + code + " " + errSnippet(c));
+            byte[] raw = YandexClient.readAll(c.getInputStream());
+            j = new JSONObject(new String(raw, StandardCharsets.UTF_8));
+        } finally {
+            try { c.disconnect(); } catch (Throwable e) { }
+        }
+        JSONObject ps = j.optJSONObject("playabilityStatus");
+        android.util.Log.i("VotBridge", "it player " + (vr ? "VR" : "WEB") + " id=" + videoId
+                + " status=" + (ps == null ? "?" : ps.optString("status", "?"))
+                + " login=" + (sCookieLoggedIn ? 1 : 0));
+        return j;
+    }
+
+    private static boolean hasParam(String url, String param) {
+        int q = url.indexOf('?');
+        if (q < 0) return false;
+        String[] kv = url.substring(q + 1).split("&");
+        for (String s : kv) {
+            int eq = s.indexOf('=');
+            String k = eq < 0 ? s : s.substring(0, eq);
+            if (k.equals(param)) return true;
+        }
+        return false;
+    }
+
+    private static String queryParam(String path, String key) {
+        int q = path.indexOf('?');
+        if (q < 0) return "";
+        String[] kv = path.substring(q + 1).split("&");
+        for (String s : kv) {
+            int eq = s.indexOf('=');
+            String k = eq < 0 ? s : s.substring(0, eq);
+            if (!k.equals(key)) continue;
+            String v = eq < 0 ? "" : s.substring(eq + 1);
+            try {
+                return java.net.URLDecoder.decode(v, "UTF-8");
+            } catch (Throwable e) {
+                return v;
+            }
+        }
+        return "";
+    }
+
+    // Diagnostics only: cookie NAMES, never values.
+    private static String handleYtSession() {
+        refreshCookies(true);
+        JSONObject o = new JSONObject();
+        try {
+            o.put("loggedIn", sCookieLoggedIn);
+            o.put("count", sCookieMap.size());
+            JSONArray auth = new JSONArray();
+            for (String a : AUTH_COOKIES) if (sCookieMap.containsKey(a)) auth.put(a);
+            o.put("auth", auth);
+            o.put("names", sCookieNames);
+            o.put("headerLen", sCookieHeader.length());
+            o.put("err", sCookieErr);
+            o.put("dataDir", sDataDir);
+        } catch (Throwable ignored) { }
+        android.util.Log.i("VotBridge", "yt_session " + o);
+        return o.toString();
+    }
+
+    // Direct audio URLs for the native filler: the JS side gets the real
+    // googlevideo link (and whether it still needs the "n" transform) instead
+    // of asking the PC to run yt-dlp.
+    private static JSONObject handleYtUrl(String videoId, boolean vr) throws Exception {
+        JSONObject j = itPlayer(videoId, vr);
+        JSONObject out = new JSONObject();
+        out.put("videoId", videoId);
+        out.put("client", vr ? "ANDROID_VR" : "WEB");
+        out.put("loggedIn", sCookieLoggedIn);
+        JSONObject ps = j.optJSONObject("playabilityStatus");
+        String st = ps == null ? "" : ps.optString("status", "");
+        out.put("status", st);
+        if (ps != null) out.put("reason", ps.optString("reason", ""));
+        JSONObject vd = j.optJSONObject("videoDetails");
+        if (vd != null) {
+            out.put("title", vd.optString("title", ""));
+            out.put("duration", vd.optInt("lengthSeconds", 0));
+        }
+        JSONArray arr = new JSONArray();
+        JSONObject sd = j.optJSONObject("streamingData");
+        JSONArray fmts = sd == null ? null : sd.optJSONArray("adaptiveFormats");
+        boolean hasN = false;
+        int cipher = 0;
+        if (fmts != null) {
+            for (int i = 0; i < fmts.length(); i++) {
+                JSONObject f = fmts.optJSONObject(i);
+                if (f == null) continue;
+                int itag = f.optInt("itag", 0);
+                String mime = f.optString("mimeType", "");
+                String url = f.optString("url", "");
+                if (url.isEmpty()) {
+                    if (!f.optString("signatureCipher", "").isEmpty()
+                            || !f.optString("cipher", "").isEmpty()) cipher++;
+                    continue;
+                }
+                boolean audio = mime.startsWith("audio/")
+                        || (itag >= 139 && itag <= 141) || itag == 249 || itag == 250 || itag == 251;
+                if (!audio) continue;
+                JSONObject o = new JSONObject();
+                o.put("itag", itag);
+                o.put("mime", mime);
+                long clen = f.optLong("contentLength", 0L);
+                if (clen <= 0) clen = qclen(url);
+                o.put("clen", clen);
+                o.put("url", url);
+                boolean n = hasParam(url, "n");
+                o.put("n", n);
+                if (n) hasN = true;
+                arr.put(o);
+            }
+        }
+        out.put("formats", arr);
+        out.put("hasN", hasN);
+        out.put("ciphered", cipher);
+        out.put("sabr", sd != null && sd.has("serverAbrStreamingUrl"));
+        return out;
+    }
+
+    // Port of dev_server/yt_lang.py: original language in ~0.5 s without the PC.
+    private static String metaLocal(String videoId) {
+        synchronized (META_CACHE) {
+            MetaEntry e = META_CACHE.get(videoId);
+            if (e != null) {
+                long age = System.currentTimeMillis() - e.at;
+                if (age < (e.ok ? 6L * 3600L * 1000L : 120000L)) {
+                    try {
+                        JSONObject copy = new JSONObject(e.json.toString());
+                        copy.put("cached", true);
+                        copy.put("ms", 0);
+                        return copy.toString();
+                    } catch (Throwable ignored) { }
+                }
+            }
+        }
+        long t0 = System.currentTimeMillis();
+        JSONObject out = new JSONObject();
+        boolean ok = false;
+        try {
+            String used = "WEB";
+            JSONObject j = itPlayer(videoId, false);
+            String st = playability(j);
+            if (!"OK".equals(st)) {
+                // Без живого логина WEB на большинстве роликов отдаёт
+                // UNPLAYABLE/LOGIN_REQUIRED, а ANDROID_VR тот же ролик отдаёт:
+                // язык берём из его ответа (yt_lang.py опирался на WEB+куки).
+                out.put("webStatus", st);
+                used = "ANDROID_VR";
+                j = itPlayer(videoId, true);
+                st = playability(j);
+            }
+            out.put("client", used);
+            if (!"OK".equals(st)) {
+                out.put("ok", false);
+                out.put("err", ("playability=" + st + " " + playReason(j)).trim());
+            } else {
+                String lang = fillLang(j, out);
+                out.put("videoId", videoId);
+                out.put("login", sCookieLoggedIn ? 1 : 0);
+                if (lang.isEmpty()) {
+                    out.put("ok", false);
+                    out.put("err", "no audio/caption language");
+                } else {
+                    ok = true;
+                    out.put("ok", true);
+                }
+            }
+        } catch (Throwable e) {
+            try {
+                out.put("ok", false);
+                out.put("err", String.valueOf(e.getMessage()));
+            } catch (Throwable ignored) { }
+        }
+        long ms = System.currentTimeMillis() - t0;
+        try {
+            out.put("ms", ms);
+            out.put("cached", false);
+        } catch (Throwable ignored) { }
+        synchronized (META_CACHE) {
+            META_CACHE.put(videoId, new MetaEntry(System.currentTimeMillis(), ok, out));
+        }
+        android.util.Log.i("VotBridge", "meta_local " + videoId + " "
+                + (ok ? "lang=" + out.optString("lang") : "err=" + out.optString("err"))
+                + " " + ms + "ms");
+        return out.toString();
+    }
+
+    private static String playability(JSONObject j) {
+        JSONObject ps = j.optJSONObject("playabilityStatus");
+        return ps == null ? "" : ps.optString("status", "");
+    }
+
+    private static String playReason(JSONObject j) {
+        JSONObject ps = j.optJSONObject("playabilityStatus");
+        return ps == null ? "" : ps.optString("reason", "");
+    }
+
+    // lang/audioTracks/title/duration из ответа player'а — как в yt_lang.py:
+    // порядок дорожек нестабилен, поэтому берём defaultAudioTrackIndex, а не [0].
+    private static String fillLang(JSONObject j, JSONObject out) throws Exception {
+        String atid = "";
+        int idx = 0;
+        JSONArray ids = new JSONArray();
+        JSONObject caps = j.optJSONObject("captions");
+        JSONObject rend = caps == null ? null : caps.optJSONObject("playerCaptionsTracklistRenderer");
+        if (rend != null) {
+            JSONArray tracks = rend.optJSONArray("audioTracks");
+            int n = tracks == null ? 0 : tracks.length();
+            if (n > 0) {
+                idx = rend.optInt("defaultAudioTrackIndex", 0);
+                if (idx < 0 || idx >= n) idx = 0;
+                for (int i = 0; i < n && i < 12; i++) {
+                    JSONObject t = tracks.optJSONObject(i);
+                    String id = t == null ? "" : t.optString("audioTrackId", "");
+                    ids.put(id);
+                    if (i == idx) atid = id;
+                }
+            }
+        }
+        if (atid.equalsIgnoreCase("none") || atid.equalsIgnoreCase("null")) atid = "";
+        int dot = atid.indexOf('.');
+        String lang = dot > 0 ? atid.substring(0, dot) : atid;
+        if (lang.isEmpty() && rend != null) {
+            JSONArray ct = rend.optJSONArray("captionTracks");
+            JSONObject c0 = ct == null || ct.length() == 0 ? null : ct.optJSONObject(0);
+            if (c0 != null) lang = c0.optString("languageCode", "");
+        }
+        out.put("lang", lang);
+        out.put("audioTrackId", atid);
+        out.put("audioIndex", idx);
+        out.put("audioTracks", ids);
+        JSONObject vd = j.optJSONObject("videoDetails");
+        if (vd != null) {
+            out.put("title", vd.optString("title", ""));
+            out.put("duration", vd.optString("lengthSeconds", ""));
+        }
+        return lang;
+    }
+
+    // ---------------------------------------------------------------------
     // HTTP server
     // ---------------------------------------------------------------------
     private static void serve() {
@@ -454,6 +942,16 @@ public final class Bridge {
                 } else if (path.startsWith("/config")) {
                     JSONObject req = body.length > 0 ? new JSONObject(new String(body, StandardCharsets.UTF_8)) : new JSONObject();
                     resp = handleConfig(req).toString();
+                } else if (path.startsWith("/yt_session")) {
+                    resp = handleYtSession();
+                } else if (path.startsWith("/yt_url")) {
+                    String vid = queryParam(path, "videoId");
+                    if (vid.isEmpty()) throw new IOException("missing videoId");
+                    resp = handleYtUrl(vid, !"web".equalsIgnoreCase(queryParam(path, "client"))).toString();
+                } else if (path.startsWith("/meta_local")) {
+                    String vid = queryParam(path, "videoId");
+                    if (vid.isEmpty()) throw new IOException("missing videoId");
+                    resp = metaLocal(vid);
                 } else if (path.startsWith("/log")) {
                     String msg = body.length > 0 ? new String(body, StandardCharsets.UTF_8) : "";
                     android.util.Log.i("VotBridge", "js: " + msg);
@@ -498,6 +996,8 @@ public final class Bridge {
         o.put("mediaProxy", sMediaProxy == null ? "" : sMediaProxy);
         o.put("proxyMode", sProxyMode == null ? "off" : sProxyMode);
         o.put("faMode", sFaMode == null ? "audio" : sFaMode);
+        o.put("audioMode", sAudioMode == null ? "off" : sAudioMode);
+        o.put("pcFill", sPcFill);
         return o;
     }
 
@@ -510,6 +1010,8 @@ public final class Bridge {
             if (req.has("mediaProxy")) sMediaProxy = req.optString("mediaProxy", "");
             if (req.has("proxyMode")) sProxyMode = req.optString("proxyMode", "off");
             if (req.has("faMode")) sFaMode = req.optString("faMode", "audio");
+            if (req.has("audioMode")) sAudioMode = req.optString("audioMode", "off");
+            if (req.has("pcFill")) sPcFill = req.optBoolean("pcFill", true);
             android.util.Log.i("VotBridge", "config " + configJson().toString());
         }
         return configJson();

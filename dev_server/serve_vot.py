@@ -387,11 +387,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # script. The native userscript injection only knows a single URL, so
             # concatenating here keeps "one file to inject" without a build step.
             body = b""
-            for name in ("vot_ui.js", "vot.js"):
+            for name in ("vot_ui.js", "vot.js", "vot_net.js"):
                 p = ROOT / name
                 try:
                     body += p.read_bytes() + b"\n;\n"
                 except OSError as e:
+                    # vot_net.js — необязательный диагностический зонд.
                     if name == "vot.js":
                         self._send(404, "text/plain", str(e).encode())
                         return
