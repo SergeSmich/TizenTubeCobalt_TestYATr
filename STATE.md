@@ -2,56 +2,62 @@
 
 ## Цель
 Живые голоса Яндекса (VOT) в TizenTubeCobalt на Samsung TV
-(`adb -s 192.168.1.100:5555`, `io.gh.reisxd.tizentube.cobalt`),
-**serverless**: в рантайме только API Яндекса + статика GitHub, без ПК/своего сервера.
-UI — JS-оверлей. Ветка `fix-vot-runtime-injection`, PR в `main` не делать. История — `STATE_ARCHIVE.md`.
+(`adb -s 192.168.1.100:5555`, пакет `io.gh.reisxd.tizentube.cobalt`), **serverless**: в рантайме только
+API Яндекса + статика GitHub, без ПК/своего сервера. UI — JS-оверлей.
+Ветка `fix-vot-runtime-injection`, PR в `main` не делать. История — `STATE_ARCHIVE.md`.
 
-## Работает (проверено 26.10)
-- Перевод E2E на ТВ без загрузки звука: `status=2 rem=N` → `status=1` → `play`
-  (`vtrans.s3-private.mds.yandex.net`), оверлей и воспроизведение живы; 文A = выключатель,
-  пункты и ползунки в шестерёнке; `skipLang=ru`.
-- **Яндекс сам переводит ролик целиком**: `wOp_wgp-f9I` (`de`): `2 rem=151` → `1` за ~60 с,
-  **COVERAGE 513.9/514.0 = 100 %** (mp3 8 223 391 B, 128 kbps). `status=6` — его транзиентный сбой.
-- 8 из 8 холодных (ролик, язык) пар отдали `status=2` без единого нашего байта:
-  `1fw8LHH-aMQ` fr/es/it, `wOp_wgp-f9I` fr/es, `32wH-_WKCZA` fr/pl, `ki1URTzrzhQ` fr.
+## Работает (проверено)
+- Перевод E2E без загрузки звука: `status=2 rem=N` → `status=1` → `play`
+  (`vtrans.s3-private.mds.yandex.net`); 文A = выключатель, пункты/ползунки в шестерёнке; `skipLang=ru`.
+- Холодная пара на ПК (`vot_probe.py poll X23-S8hAa3c 692.5 en`): `2 rem=63` → `1` за 46 с — API жив.
 - `audioMode:"off"`, захват MSE выключен (`CAP_ON=false`, в логе `cap=0`), `pcFill:false`;
-  принудительный AAC (`patchCodecs`) тоже включается только при `capture` — плеер штатно играет opus.
-- **`retrySix` проверен живьём (22:11):** `status=6` → `retry 1/3 in 15s` → `6` → `retry 2/3 in 45s`
-  → `status=1` → `play`; без единого нашего байта, звук не сломан (`drop=0`).
-- Мост: `/cap/*`, `/audio`, `/yt_url`, `/meta_local`, `/config`; dex 56 344 B установлен;
-  при старте `capCleanupStale()` удаляет старые `cache/cap_*.mp4` (проверено: файл 6.3 МБ удалён).
+  `patchCodecs` включается только при `capture` — плеер штатно играет opus.
+- Мост: `/cap/*`, `/audio`, `/yt_url`, `/meta_local`, `/config`, `/failaudio`; dex 56 344 B;
+  при старте `capCleanupStale()` удаляет старые `cache/cap_*.mp4`.
+- Второе устройство `192.168.1.198:5555` (SberBox_Top): APK установлен, мост и оверлей живы,
+  перевод работает; проброс на ПК — `tcp:18014` (ТВ1 занимает 18013).
 
-## Закрытые пути (не возвращаться)
-- **Прямые ссылки `/yt_url` → `/audio`**: ANDROID_VR отдаёт 4 формата с `n=false` и точным `clen`
-  (itag 140: 8 318 128 B / 514 с), но с ТВ `audio ua[0..3] code=403` → `no user-agent accepted
-  the audio url`. Без poToken googlevideo режет URL.
-- **MSE-захват (путь E)**: файл валиден (`aac/44100/2ch`, gaps=0), но растёт со скоростью плейбека
-  (за 40 с → ~46 с аудио, пакетов 51.4 %). Яндекс переводит только загруженное окно, а tid после
-  частичной загрузки навсегда висит в `status=3` без url (замер: 10+ мин). Одна загрузка на ролик.
-- **ПК-филлер**: yt-dlp → `Sign in to confirm you're not a bot`, `LOGGED_IN:false` — нужен новый
-  экспорт `dev_server/yt_cookies.txt`. Не приоритет (`pcFill:false`).
+## Главный вывод по `status=6` (замеры 26.10, важно)
+- `6` бывает двух сортов, по ответу их не отличить:
+  (а) транзиентный — тот же tid `X23-S8hAa3c` через ~3.5 мин отдал `1` с url;
+  (б) мёртвый — `l08V8bNg53I`, `1GZ5pFwdU2M` (en): `6` ~590 с → `2` (remaining тает) → `0`
+      («Возникла ошибка при переводе»), url нет и через 11 мин.
+- **`fail-audio-js` + пустое аудио (трюк форка SmartTube) проверен A/B и НЕ помогает:**
+  `PUT` → 200 `{"status":1}`, задача оживает (`6` → `2` за 0.2 с), но сервер считает звук
+  недоставленным: `remaining` 58→12 и через **51 с** терминальный `0`. fid
+  (`fallback-empty-audio:…` vs `web_api_get_all_generating_urls_data_from_iframe`) роли не играет.
+  На уже мёртвом `0` он лишь пересоздаёт задачу (`0` → через 228 с `3 tid=null` → через ~390 с новый `6`).
+  Итог: fail-audio = ускорение падения, не эскалация → в клиенте не отправляем (`faMode:"skip"`).
+- Корень прошлого бага: на `6` бросали tid и слали новый `firstRequest=true` → живая задача умирала.
 
-## Правки в рабочем дереве (не закоммичено)
-- `vot_bridge/java/vot/Bridge.java`: `capCleanupStale()` + вызов в `start()`; `capFileFor` снова
-  проверяет `sCacheDir`; `/cap/upload` читает файл строго по `?videoId=`; `/cap/status?videoId=` →
-  `fileSize`/`fileCurrent`.
-- `dev_server/vot.js`: `retrySix()` при `status=6` (`SIX_RETRY_MS=[15000,45000,120000]`, сброс
-  `altLangTried`), `state.sixTries` в дефолтах и при смене ролика; `capFill()` за `capFillAllowed()`.
-- `dev_server/vot_net.js`: `CAP_ON` + чтение `/config` на старте (`cap on` только при `capture`).
-- `dev_server/vot_config.json`: `audioMode:"off"`, `pcFill:false`, `fillMaxWait:240`.
-- `serve_vot.py` `_resolve_fill_meta()`, `fill_audio.py` `_promote_youtube_domain()`.
+## Сделано сейчас (не закоммичено)
+- `dev_server/vot.js`: `retrySix` удалён; на `status=6` → `holdSix()` — опрос ТОГО ЖЕ tid
+  (`firstRequest=false`) каждые 30 с, бюджет 10 мин на шард; после бюджета `escalate()`
+  (другой шард / ПК), на `status=0` — как раньше. `poll(id,dur,rem,holdMs)` + `state.sixSince/sixWaits`,
+  честный статус «сервер готовит звук…».
+- Прочее из предыдущего этапа: `Bridge.java` `capCleanupStale()` и `/cap/*` по `?videoId=`,
+  `vot_net.js` `CAP_ON` только при `capture`, `audioMode:"off"`, `pcFill:false`, `faMode:"skip"`.
 
 ## Следующие шаги
-1. Ревью diff (`reviewer`) и коммит в `fix-vot-runtime-injection` (не пушить, PR не делать).
-2. Следить за `retry`: если 3 попыток не хватает (ролик остаётся `6`), увеличить лестницу.
-3. Если `status=6` станет регулярным и перевод будет теряться — вернуться к варианту A (SABR/UMP).
+1. E2E на ТВ2 (192.168.1.198): холодный ролик → `hold tid` → `status=1` → `play`
+   (логи: `resp status=6` → `hold tid=… waited=…s` → `status=1` → `play`).
+2. Ревью (`reviewer`) и коммит в `fix-vot-runtime-injection` (не пушить, PR не делать).
+3. Если `6` останется частым и перевод будет теряться — вариант A (SABR/UMP) или ПК-филлер
+   с новым `yt_cookies.txt`.
+4. Serverless-долг: оверлей и конфиг тянутся с `http://192.168.1.186:8013` каждые 8 с — без ПК
+   перевода нет; зашить в dex или отдавать со статики GitHub.
+
+## Закрытые пути (не возвращаться)
+- **`/yt_url` → `/audio`**: ANDROID_VR даёт 4 формата с `n=false` и точным `clen`, но с ТВ
+  `code=403` для всех UA — без poToken googlevideo режет URL.
+- **MSE-захват (путь E)**: файл валиден, но растёт со скоростью плейбека; partial upload
+  навсегда висит в `status=3` без url. Одна загрузка на ролик.
+- **ПК-филлер**: yt-dlp → `Sign in to confirm you're not a bot`, нужен новый `yt_cookies.txt`.
 
 ## Грабли (не наступать)
-- **Нельзя `am force-stop`**: Cobalt теряет незаписанные куки. Выход — только штатный.
-- `am start` на живой инстанс — no-op; пересоздать задачу: `am start ... -f 0x10008000`.
-- Логи при старте теряются: буфер общий с `cobalt` (CSP-простыни) — снимать `logcat -s VotBridge`
-  в файл ДО запуска.
-- Бот-гейт `/yt_url`/`/meta_local`: 1 из 8–12 запросов, нужна тишина ~5 мин; у `/translate` гейта нет.
+- **Нельзя `am force-stop`**: Cobalt теряет куки. Пересоздать задачу: `am start ... -f 0x10008000`.
+- Логи при старте теряются (буфер общий с `cobalt`) — снимать `logcat -s VotBridge` в файл ДО запуска.
+- Бот-гейт `/yt_url`/`/meta_local`: 1 из 8–12 запросов; у `/translate` гейта нет.
 - Dev-сервер: `C:\Program Files\Python311\python.exe dev_server\serve_vot.py`; лог в `%TEMP%`.
-- ТВ сам меняет ролики (автоплей) — «текущий» захват может принадлежать другому видео.
-- Репо sparse-checkout: новые файлы — `git add --sparse`. CSS-анимации в Cobalt не идут.
+- ТВ сам меняет ролики (автоплей). Репо sparse-checkout: новые файлы — `git add --sparse`.
+- `Bridge.java` содержит BOM (читать `utf-8-sig`). CSS-анимации в Cobalt не идут.

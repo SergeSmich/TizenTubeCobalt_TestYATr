@@ -69,7 +69,6 @@
     audioIdx: 0,
     uploading: false,
     retried: false,
-    faTried: false,
     cfg: null,
     livelyVoice: false,
     // Yandex keys its per-video translation cache by the *source* language
@@ -126,8 +125,10 @@
     capFailed: false,
     capTries: 0,
     capSentSize: 0,
-    // Повторы запроса при status=6 (свой загрузчик Яндекса не смог достать звук).
-    sixTries: 0
+    // Сколько времени держим один translationId на status=6 и сколько опросов
+    // сделано: по ним видно, что сервер досчитывает сам (см. holdSix).
+    sixSince: 0,
+    sixWaits: 0
   };
 
   var statusEl = null;
@@ -630,39 +631,10 @@
       }, err);
   }
 
-  // Cheap status-6 path: pretend the in-page audio probe failed and upload an
-  // empty buffer, then re-ask Yandex to translate. No YouTube download at all.
-  function failAudio(id, dur, tid) {
-    if (state.faTried) { uploadAudio(id, dur, tid); return; }
-    state.faTried = true;
-    if (!tid) { uploadAudio(id, dur, tid); return; }
-    state.translationId = tid;
-    setStatus('Перевод: прошу сервер взять звук сам…', '#f5a623');
-    log('failaudio id=' + id + ' tid=' + tid);
-    http('POST', '/failaudio',
-      { videoUrl: watchUrl(id), videoId: id, translationId: String(tid) },
-      function (r) {
-        log('failaudio ok ' + JSON.stringify(r));
-        if (r && r.skipped) {
-          // Config says "skip": keep polling and let Yandex decide.
-          setStatus('Перевод: жду решения сервера…', '#f5a623', 'wait');
-          poll(id, dur, 60);
-          return;
-        }
-        setStatus('Перевод: перевожу без загрузки звука…', '#f5a623');
-        http('POST', '/translate',
-          { videoUrl: watchUrl(id), duration: dur, firstRequest: true, lang: state.lang || 'en', targetLang: 'ru', title: state.title },
-          function (r2) { state.busy = true; handleResp(r2, id, dur, 30); },
-          function (e) { log('retry after failaudio ERR ' + e); state.busy = false; uploadAudio(id, dur, tid); });
-      },
-      function (e) {
-        log('failaudio ERR ' + e);
-        uploadAudio(id, dur, tid);
-      });
-  }
-
   // status 6 (AUDIO_REQUESTED): download the source audio via the bridge and
   // upload it to Yandex, then continue polling for the finished translation.
+  // Вызывается только из ветки audioMode:"on" (закрытый путь, см. STATE.md);
+  // на обычном status=6 мы держим живой tid, а не грузим звук.
   function uploadAudio(id, dur, tid) {
     if (!tid) { state.busy = false; setStatus('Перевод: нет translationId для аудио', '#e53935'); return; }
     if (state.uploading) return;
@@ -827,31 +799,35 @@
     return true;
   }
 
-  // status=6 (AUDIO_REQUESTED) означает, что СВОЙ загрузчик Яндекса не смог
-  // достать звук именно сейчас: повторный запрос через полминуты попадает на
-  // живой воркер и перевод приходит сам (замер: 8 из 8 холодных (ролик, язык)
-  // отдали status=2 без единого байта от нас). Частичная загрузка fMP4 хуже
-  // ожидания: задача навсегда застревает в status=3 без url (замер: 10+ минут).
-  var SIX_RETRY_MS = [15000, 45000, 120000];
+  // status=6 (AUDIO_REQUESTED) — НЕ терминальный и НЕ повод бросать задачу.
+  // Замеры 26.10: (а) тот же tid `X23-S8hAa3c` отдал 6, а через ~3.5 мин — 1,
+  // (б) на «мёртвых» `l08V8bNg53I`/`1GZ5pFwdU2M` 6 → 2 → терминальный 0.
+  // Отличить (а) от (б) по ответу нельзя, поэтому держим tid и опрашиваем:
+  // каждая новая firstRequest=true создаёт НОВУЮ задачу и бросает живую —
+  // отсюда прежнее «попытка 1 из 3 → и никогда».
+  // fail-audio-js + пустое аудио (трюк форка SmartTube) проверен A/B: статус
+  // 200 {"status":1}, задача оживает, но сервер считает звук НЕдоставленным и
+  // через 51 с уходит в терминальный 0 (fid роли не играет) — хуже ожидания,
+  // поэтому не отправляем (см. STATE.md).
+  var SIX_HOLD_MS = 30000;    // пауза между опросами, пока сервер «готовит звук»
+  var SIX_HOLD_MAX = 600000;  // 10 мин на один шард, дальше — другой шард/ПК
 
-  function retrySix(id, dur, r, why) {
-    var n = state.sixTries || 0;
-    if (n >= SIX_RETRY_MS.length) return false;
-    state.sixTries = n + 1;
-    var wait = SIX_RETRY_MS[n];
+  function holdSix(id, dur, r, why) {
+    var tid6 = r.translationId || state.translationId;
+    var now = Date.now();
+    if (!state.sixSince) state.sixSince = now;
+    var waited = now - state.sixSince;
+    if (!tid6 || waited > SIX_HOLD_MAX) {
+      log(why + ' -> give up holding tid=' + tid6 + ' after ' + Math.round(waited / 1000) + 's');
+      state.sixSince = 0;
+      state.sixWaits = 0;
+      return false;
+    }
+    state.sixWaits = (state.sixWaits || 0) + 1;
     state.busy = false;
-    // Даём лестнице шанс снова: следующий 6 опять проверит другой шард.
-    state.altLangTried = false;
-    log(why + ' -> retry ' + state.sixTries + '/' + SIX_RETRY_MS.length
-      + ' in ' + Math.round(wait / 1000) + 's');
-    setStatus('Перевод: сервер готовит звук…\nпопытка ' + state.sixTries
-      + ' из ' + SIX_RETRY_MS.length, '#f5a623', 'wait');
-    var lang0 = state.lang;
-    setTimeout(function () {
-      if (state.curId !== id) return;
-      // Язык мог смениться за время ожидания (ползунок/меню) — берём актуальный.
-      startTranslation(id, dur, state.lang || lang0);
-    }, wait);
+    log(why + ' -> hold tid=' + tid6 + ' waited=' + Math.round(waited / 1000)
+      + 's n=' + state.sixWaits);
+    poll(id, dur, r.remaining != null ? r.remaining : -1, SIX_HOLD_MS);
     return true;
   }
 
@@ -870,6 +846,9 @@
     if (!state.altLangTried && uiPref('otherShard.enabled', true) !== false) {
       state.altLangTried = true;
       state.retried = false; // a fresh shard means a fresh task id: retry again
+      // Новый шард = новая задача: у неё свой бюджет ожидания на status=6.
+      state.sixSince = 0;
+      state.sixWaits = 0;
       var alt = (state.lang === 'en') ? 'auto' : 'en';
       state.busy = false;
       log(why + ' -> other shard lang=' + alt);
@@ -907,11 +886,21 @@
       maybeSkipNow(id, rl);
       if (state.skipLangBlock === id) { state.busy = false; return; }
     }
-    if (r.status === 1 && r.audioUrl) { state.busy = false; gateReady(id, r.audioUrl, false); return; }
+    if (r.status === 1 && r.audioUrl) {
+      // Успех: бюджет ожидания на status=6 отработан, следующий 6 (например,
+      // после выключения/включения кнопкой) должен снова получить свои 10 мин.
+      state.sixSince = 0;
+      state.sixWaits = 0;
+      state.busy = false;
+      gateReady(id, r.audioUrl, false);
+      return;
+    }
     // status 5 = partial_ready: the audio URL already works, only the tail of
     // the video is still being translated. Start playing right away instead
     // of waiting for the full file (~20 s later).
     if (r.status === 5 && r.audioUrl) {
+      state.sixSince = 0;
+      state.sixWaits = 0;
       state.busy = false;
       gateReady(id, r.audioUrl, true);
       poll(id, dur, r.remaining != null ? r.remaining : fallbackRem);
@@ -1055,8 +1044,11 @@
       // не участвует, а translationId остаётся тем самым, который опрашивает ТВ.
       var tid6 = r.translationId || state.translationId;
       if (tid6 && capFillAllowed() && capFill(id, dur, r, 'status=6')) return;
+      // Держим тот же translationId и опрашиваем: новый firstRequest здесь
+      // только вредит — он создаёт новую задачу и бросает живую (замер: тот же
+      // tid отдал 6, а через ~3.5 мин — status=1 с url).
+      if (holdSix(id, dur, r, 'status=6')) return;
       if (escalate(id, dur, r, 'status=6')) return;
-      if (retrySix(id, dur, r, 'status=6')) return;
       state.busy = false;
       // Both shards are empty. Handing Yandex the real audio is what the browser
       // extension does, but on this TV it cannot work: every innerTube client
@@ -1303,6 +1295,11 @@
   function startTranslation(id, dur, lang, metaTries) {
     if (state.busy) return;
     if (state.skipLangBlock === id) { state.busy = false; return; }
+    // Новая операция перевода (кнопка, смена языка, другой шард) — свой бюджет
+    // ожидания на status=6: иначе накопленный sixSince мгновенно уводил бы её
+    // в эскалацию, не дав подождать.
+    state.sixSince = 0;
+    state.sixWaits = 0;
     // Пользователь выключил перевод кнопкой в баре именно для этого ролика.
     if (state.offForId === id) { state.busy = false; log('translate skipped: off by button id=' + id); return; }
     if (uiPref('translate.enabled', true) === false) {
@@ -1351,17 +1348,22 @@
       function (e) { state.busy = false; setStatus('Перевод: ошибка запроса\n' + e, '#e53935'); log('translate ERR ' + e); });
   }
 
-  function poll(id, dur, remaining) {
+  function poll(id, dur, remaining, holdMs) {
     // Перевод отменён (язык исключён) — не тратим запросы и поллинг.
     if (state.skipLangBlock === id) { state.busy = false; return; }
     // remaining приходит из ответа (поле 5) и может отсутствовать. Раньше
     // «нет подсказки» превращалось в Math.min(..., >NaN<) и setTimeout(NaN) =
     // мгновенный повтор: шторм запросов к Яндексу. Теперь «неизвестно» = -1.
     var rem = (typeof remaining === 'number' && isFinite(remaining)) ? remaining : -1;
-    if (rem === 0) { state.busy = false; setStatus('Перевод: нет готового перевода', '#e53935'); return; }
+    if (rem === 0 && !(holdMs > 0)) { state.busy = false; setStatus('Перевод: нет готового перевода', '#e53935'); return; }
     state.polls = (state.polls || 0) + 1;
     var delay;
-    if (rem < 0) {
+    if (holdMs > 0) {
+      // status=6: сервер сам тянет звук. Пауза фиксированная и длинная, чтобы
+      // не долбить /translate, и не зависит от rem (он там врёт: 57 → 1 через
+      // считанные минуты).
+      delay = holdMs;
+    } else if (rem < 0) {
       delay = (state.polls <= POLL_FAST_TRIES)
         ? POLL_NO_HINT
         : Math.min(POLL_SLOW * (state.polls - POLL_FAST_TRIES), POLL_SLOW_MAX);
@@ -1370,7 +1372,9 @@
       // translation shows up much sooner, so never sleep longer than POLL_MAX.
       delay = Math.min(Math.max(POLL_BASE, rem * 1000), POLL_MAX);
     }
-    setStatus((state.active ? 'Перевод: играю, доготовится…' : 'Перевод: в очереди/переводится…') +
+    setStatus((holdMs > 0
+      ? 'Перевод: сервер готовит звук…'
+      : (state.active ? 'Перевод: играю, доготовится…' : 'Перевод: в очереди/переводится…')) +
       (rem > 0 ? ' (~' + rem + 'с)' : ''), '#f5a623', rem > 0 ? rem : 'wait');
     log('poll in ' + (delay / 1000).toFixed(0) + 's rem=' + rem + ' n=' + state.polls);
     setTimeout(function () {
@@ -1701,7 +1705,6 @@
     state.audioIdx = 0;
     state.uploading = false;
     state.retried = false;
-    state.faTried = false;
     state.pcTried = false;
     state.pcDeadline = 0;
     state.pcFailed = false;
@@ -1713,7 +1716,8 @@
     state.capFailed = false;
     state.capTries = 0;
     state.capSentSize = 0;
-    state.sixTries = 0;
+    state.sixSince = 0;
+    state.sixWaits = 0;
     state.polls = 0;
     state.livelyVoice = false;
     state.playedOnce = false;
