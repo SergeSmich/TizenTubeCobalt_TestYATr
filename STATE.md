@@ -5,12 +5,37 @@
 `io.gh.reisxd.tizentube.cobalt`, активити `…/dev.cobalt.app.MainActivity`): быстрый старт,
 без отказов и заикания. UI — только JS-оверлей (без пересборки APK).
 
+## 1a. Синхронизация с GitHub (25.10) — ВЫПОЛНЕНО
+- Ветка `fix-vot-runtime-injection`: наши 12 коммитов пересажены **rebase**'ом на удалённые 10
+  (линейная история, без merge) ⇒ `0 behind / 12 ahead`, push fast-forward
+  `f112235662d..2d8e4215249`. На `origin` теперь `2d8e42152498d64a9d156ca1139870fc2c4a02e9`.
+- Единственный конфликт — `patch_tizentube_userscript_url.py`: сохранены наш env-override
+  (`DEV_URL_ENV="VOT_SCRIPT_URL"` → локальный дев-сервер) и свежий URL с удалёнки (`@6543a34`);
+  `ast.parse` OK.
+- Содержимое пересаженных коммитов сверено по blob-хэшам со старыми — идентично (`vot.js`,
+  `vot_ui.js`, `serve_vot.py`, `Bridge.java`, `fill_audio.py`, `yt_lang.py` = SAME), правки
+  удалённых 10 коммитов не потеряны.
+- Новые SHA (старые `ae419c0`, `f2e39b82fae`, `a6cca6dca0c`, `2e12e86e670`, `5d5053e6302`,
+  `96bce92eb50` в ветке больше НЕ существуют, в тексте ниже проставлены новые):
+  `89f309220bf` филлер/шарды · `9f5afe8703e` кнопка+панель · `0a824e9782f` STATE ·
+  `8d36f60a9f6` пункт в шестерёнке · `1d5697b20c2` нативная панель+громкость · `96bcf367e1e` STATE ·
+  `d44a136de95` флаги протокола · `758ce2132d5` STATE · `40697a4ed9a` шкала+гейт языка ·
+  `0ba220c1cc1` STATE · `6400f72ff79` фикс интерфейса · `2d8e4215249` `/temp/` в `.gitignore`.
+- Бэкап до синхронизации: `backup/pre-sync-2026-10-25` (`1054f54d5b7`). PR в `main` — позже.
+- **Грабли (важно)**: репо в sparse-checkout (non-cone), наших путей в списке не было ⇒ после
+  `git rebase`/checkout файлы `dev_server/*`, `STATE.md`, `*.py` в корне исчезли с диска
+  (в коммитах целы). В `.git/info/sparse-checkout` дописаны `/.gitignore`, `/*.py`, `/*.ps1`,
+  `/*.md`, `/dev_server/**`, `/vot_bridge/**`, `/.github/**` + `git sparse-checkout reapply`.
+  Бэкап старого списка: `%TEMP%\sparse-checkout.bak`. Новый файл вне списка — либо
+  `git add --sparse`, либо сначала дописать путь в sparse-checkout.
+
 ## 3zv. (25.10) «Пропадает интерфейс плеера, все кнопки» — фикс + диагностика
 Жалоба: «иногда в какой-то момент пропадает интерфейс плеера, все кнопки, помогает
 перезапуск приложения». Лог `vot_ui_gone.log` (23:17–23:20) ошибок Cobalt не дал; за весь
 ролик `_XXwZROjckI` не было ни `paint on`, ни `paint: node not found` (тик молчит, когда
 состояние совпадает, — по логу причину не увидеть). Пока ТВ не трогаем (ждём команду).
-Сделано в рабочей копии (не закоммичено):
+Закоммичено `6400f72ff79` (+ `2d8e4215249` — `/temp/` в `.gitignore`), запушено в
+`origin/fix-vot-runtime-injection` 25.10:
 - **Причина №1 (главная гипотеза): перехват стрелок.** `votSliderKeys` гасил LEFT/RIGHT
   (`preventDefault`+`stopPropagation`), если `volKeyOf(document.activeElement)` совпал с
   «громкость перевода»/«оригинал при переводе». После закрытия нативной панели её DOM
@@ -29,8 +54,11 @@
   раз в два тика, лог только при изменении:
   `ui rows=1 btn=4 lb=9 vis=1 432x72 our=1 panel=0 toast=0 af=body` — по `btn/vis/our/panel`
   видно, исчез ли ряд кнопок, скрыт ли он и не залип ли наш слой.
-Проверено: `node --check` оба файла OK, dev-сервер отдаёт `/vot.js` 146 162 B с новыми
-маркерами (применится после перезапуска приложения). На ТВ НЕ проверялось.
+Проверено: `node --check` оба файла OK; содержимое в HEAD совпадает с проверенной рабочей копией
+(`vot.js` 139 345 B, `vot_ui.js` 22 115 B); в `raw.githubusercontent.com/.../fix-vot-runtime-injection`
+все маркеры на месте (`nodeOnScreen`, `uiWatch`, `__VOT_OVERLAY_MARK`, `gateReady`, `closeGen`).
+На ТВ НЕ проверялось. Dev-сервер сейчас НЕ запущен — перед прогоном поднять
+(`C:\Program Files\Python311\python.exe dev_server\serve_vot.py`).
 Следующий шаг: по команде пользователя перезапустить приложение, довести до пропажи UI,
 снять `logcat -d -s VotBridge` и смотреть строки `ui …` / `vol slide ignored`.
 
@@ -313,11 +341,11 @@ actionPanel.overlayPanelRenderer.content.overlayPanelItemListRenderer.items`),
   `skipLang` — иначе русский ролик с тегом региона уезжал в перевод (замечание ревью).
 - Ревью: blocker/major нет; закрыты minor (пер-запуск копия куки + удаление в `finally`,
   `langBase` и в первичной проверке `skip`).
-- **Закоммичено 24.10 21:2x — `a6cca6dca0c`** (ветка `fix-vot-runtime-injection`), 6 файлов.
+- **Закоммичено 24.10 21:2x — `89f309220bf`** (ветка `fix-vot-runtime-injection`), 6 файлов.
 - Осталось: прогон на ТВ длинного ролика (должен дойти до `status=1` после `fill timeout`).
 
 ## 3z. Громкость: два уровня (24.10, ГОТОВО и закоммичено)
-Коммит `f2e39b82fae`.
+Коммит `1d5697b20c2`.
 Перевод играет нативный `MediaPlayer` в мосте ⇒ из JS его не приглушить: добавлен `POST /volume`
 (`Bridge.java`: `sVol`, `setAudioVolume`, `mp.setVolume(sVol,sVol)` при создании плеера) — нужна
 пересборка dex+APK моста. В `dev_server/vot.js`:
@@ -408,7 +436,7 @@ actionPanel.overlayPanelRenderer.content.overlayPanelItemListRenderer.items`),
   `play https` заново, `vol active=1`; ru-ролик — `meta lang=ru` +87 мс → `translate skip`,
   `play`/`abort`=0; `ERR`/`unhandled`=0 (кроме известного Cobalt `onerror Script error. @:` на
   старте приложения до первого ролика).
-- **Закоммичено 2e12e86e670** (ветка `fix-vot-runtime-injection`), 4 файла.
+- **Закоммичено 40697a4ed9a** (ветка `fix-vot-runtime-injection`), 4 файла.
 
 ## 4. Клавиши (Android keycode → web keyCode)
 `134`→`115` (F4, панель), `133`→`114` (F3, вкл/выкл перевода), `82`→`18` (MENU — тоже панель),
@@ -425,7 +453,7 @@ actionPanel.overlayPanelRenderer.content.overlayPanelItemListRenderer.items`),
 - Bridge тянет `/vot.js` каждые 8 с; новый код применяется после перезапуска приложения.
 
 ## 6. Дальше
-**Сделано 24.10 (коммит `f2e39b82fae`)**: нативная панель «Перевод Яндекс» в шестерёнке
+**Сделано 24.10 (коммит `1d5697b20c2`)**: нативная панель «Перевод Яндекс» в шестерёнке
 (пункты вложены в команду корня `playback-settings`), стрелка `>` у пункта, радио-галочки,
 панель «Громкость» = два ползунка (перевод / оригинал при переводе, шаг 10 %, значение
 перерисовывается в строке), мост `POST /volume` (`sVol`), префы v3, диагностика удалена.
@@ -463,7 +491,7 @@ actionPanel.overlayPanelRenderer.content.overlayPanelItemListRenderer.items`),
 2b. Ждёт подтверждения: после защиты `isToggleLabel`/`inOverlay` проверить, что подсветка кнопки
    по-прежнему ставится (`paint on via label`), а кружок НЕ появляется на пункте меню «Перевод».
 3. Техдолг: корневой `vot.js` (v2, 449 строк) устарел — решить, удалять ли.
-4. СДЕЛАНО (14:10): коммит `ae419c0` — кнопка в баре + панель, `skipLang=ru` по умолчанию,
+4. СДЕЛАНО (14:10): коммит `9f5afe8703e` — кнопка в баре + панель, `skipLang=ru` по умолчанию,
    язык через `/fill_status`, фиксы ревью, `vot_ui.js` в индексе.
 
 ## 7. Операционное
