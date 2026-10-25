@@ -124,6 +124,7 @@ public final class Bridge {
             android.util.Log.w("VotBridge", "dirs failed: " + e);
         }
         android.util.Log.i("VotBridge", "dirs data=" + sDataDir + " cache=" + sCacheDir);
+        capCleanupStale();
         Thread t = new Thread(Bridge::serve, "vot-bridge");
         t.setDaemon(true);
         t.start();
@@ -892,6 +893,23 @@ public final class Bridge {
                 } else if (path.startsWith("/failaudio")) {
                     JSONObject req = body.length > 0 ? new JSONObject(new String(body, StandardCharsets.UTF_8)) : new JSONObject();
                     resp = handleFailAudio(req).toString();
+                } else if (path.startsWith("/cap/begin")) {
+                    resp = capBegin(queryParam(path, "videoId"), body).toString();
+                } else if (path.startsWith("/cap/chunk")) {
+                    resp = capChunk(body).toString();
+                } else if (path.startsWith("/cap/end")) {
+                    resp = capEnd().toString();
+                } else if (path.startsWith("/cap/drop")) {
+                    resp = capDrop().toString();
+                } else if (path.startsWith("/cap/status")) {
+                    resp = capStatus(queryParam(path, "videoId")).toString();
+                } else if (path.startsWith("/cap/upload")) {
+                    int itag = 140;
+                    try {
+                        itag = Integer.parseInt(queryParam(path, "itag"));
+                    } catch (Throwable ignore) { }
+                    resp = capUpload(queryParam(path, "videoId"),
+                            queryParam(path, "translationId"), itag).toString();
                 } else if (path.startsWith("/audio")) {
                     JSONObject req = body.length > 0 ? new JSONObject(new String(body, StandardCharsets.UTF_8)) : new JSONObject();
                     resp = handleAudio(req).toString();
@@ -1097,6 +1115,237 @@ public final class Bridge {
         if (p.containsKey(11)) out.put("allow", num(p.get(11)) != 0);
         if (p.containsKey(12)) out.put("shouldRetry", num(p.get(12)) != 0);
         return out;
+    }
+
+    // ---- MSE audio capture (path E) -------------------------------------
+    // Youtube has removed direct audio urls: the player response for a normal
+    // TV session carries adaptiveFormats but url=0 / audioUrl=0, SABR only. The
+    // page therefore tees the bytes the stock player already feeds into its
+    // audio SourceBuffer and posts them here. Init segment (ftyp+moov) comes
+    // first, then media fragments (moof+mdat) in playback order, so a plain
+    // append of everything is a valid fragmented MP4 that Yandex accepts.
+    private static final Object CAP_LOCK = new Object();
+    private static final long CAP_MAX = 64L * 1024L * 1024L;
+    private static java.io.OutputStream sCapOut;
+    private static File sCapFile;
+    private static long sCapSize;
+    private static String sCapVid = "";
+    private static boolean sCapFull;
+
+    private static void capCloseLocked() {
+        if (sCapOut != null) {
+            try { sCapOut.flush(); sCapOut.close(); } catch (Throwable ignore) { }
+            sCapOut = null;
+        }
+    }
+
+    private static JSONObject capBegin(String vid, byte[] data) throws Exception {
+        synchronized (CAP_LOCK) {
+            capCloseLocked();
+            if (sCacheDir == null || sCacheDir.isEmpty()) throw new IOException("no cache dir");
+            String safe = String.valueOf(vid).replaceAll("[^A-Za-z0-9_-]", "");
+            if (safe.isEmpty()) safe = "vid";
+            sCapFile = new File(sCacheDir, "cap_" + safe + ".mp4");
+            sCapVid = safe;
+            sCapSize = 0;
+            sCapFull = false;
+            sCapOut = new java.io.BufferedOutputStream(new java.io.FileOutputStream(sCapFile, false), 65536);
+            if (data != null && data.length > 0) {
+                sCapOut.write(data);
+                sCapSize += data.length;
+            }
+            // Cache hygiene: a 486 MB TV should not accumulate captures. Upload
+            // happens in the same video session, so older files are dead weight.
+            try {
+                File[] old = new File(sCacheDir).listFiles();
+                if (old != null) {
+                    for (File f : old) {
+                        String n = f.getName();
+                        if (n.startsWith("cap_") && n.endsWith(".mp4") && !f.equals(sCapFile)) {
+                            //noinspection ResultOfMethodCallIgnored
+                            f.delete();
+                        }
+                    }
+                }
+            } catch (Throwable ignore) { }
+            android.util.Log.i("VotBridge", "cap begin vid=" + safe
+                    + " init=" + (data == null ? 0 : data.length));
+            JSONObject o = new JSONObject();
+            o.put("ok", 1);
+            o.put("vid", safe);
+            o.put("size", sCapSize);
+            return o;
+        }
+    }
+
+    private static JSONObject capChunk(byte[] data) throws Exception {
+        synchronized (CAP_LOCK) {
+            JSONObject o = new JSONObject();
+            if (sCapOut == null) {
+                o.put("ok", 0);
+                o.put("error", "not started");
+                return o;
+            }
+            if (sCapFull || sCapSize >= CAP_MAX) {
+                sCapFull = true;
+                o.put("ok", 0);
+                o.put("full", 1);
+                o.put("size", sCapSize);
+                return o;
+            }
+            if (data != null && data.length > 0) {
+                sCapOut.write(data);
+                sCapSize += data.length;
+            }
+            o.put("ok", 1);
+            o.put("size", sCapSize);
+            return o;
+        }
+    }
+
+    private static JSONObject capEnd() throws Exception {
+        synchronized (CAP_LOCK) {
+            capCloseLocked();
+            android.util.Log.i("VotBridge", "cap end vid=" + sCapVid + " bytes=" + sCapSize);
+            JSONObject o = new JSONObject();
+            o.put("ok", 1);
+            o.put("vid", sCapVid);
+            o.put("size", sCapSize);
+            return o;
+        }
+    }
+
+    private static JSONObject capStatus(String vid) throws Exception {
+        synchronized (CAP_LOCK) {
+            JSONObject o = new JSONObject();
+            o.put("vid", sCapVid);
+            o.put("size", sCapSize);
+            o.put("open", sCapOut == null ? 0 : 1);
+            o.put("full", sCapFull ? 1 : 0);
+            o.put("exists", sCapFile != null && sCapFile.isFile() ? 1 : 0);
+            // Also report the file of a concrete videoId: after a channel switch
+            // "the current capture" belongs to a different video.
+            if (vid != null && !vid.isEmpty()) {
+                File f = capFileFor(vid);
+                if (f != null && f.isFile()) {
+                    boolean current = f.equals(sCapFile) && sCapOut != null;
+                    long n = f.length();
+                    if (current) {
+                        try { sCapOut.flush(); } catch (Throwable ignore) { }
+                        n = Math.max(n, sCapSize);
+                    }
+                    o.put("fileSize", n);
+                    o.put("fileCurrent", current ? 1 : 0);
+                }
+            }
+            return o;
+        }
+    }
+
+    private static JSONObject capStatus() throws Exception {
+        return capStatus("");
+    }
+
+    private static JSONObject capDrop() throws Exception {
+        synchronized (CAP_LOCK) {
+            capCloseLocked();
+            if (sCapFile != null) {
+                //noinspection ResultOfMethodCallIgnored
+                sCapFile.delete();
+            }
+            JSONObject o = new JSONObject();
+            o.put("ok", 1);
+            o.put("dropped", true);
+            sCapSize = 0;
+            sCapVid = "";
+            sCapFull = false;
+            return o;
+        }
+    }
+
+    private static File capFileFor(String vid) {
+        if (sCacheDir == null || sCacheDir.isEmpty()) return null;
+        String safe = String.valueOf(vid).replaceAll("[^A-Za-z0-9_-]", "");
+        if (safe.isEmpty()) return null;
+        return new File(sCacheDir, "cap_" + safe + ".mp4");
+    }
+
+    // Capture files are per-video and nothing removes them on the next start, so
+    // a 6+ MB cap_*.mp4 can sit in the TV cache for days. Wipe them at boot.
+    private static void capCleanupStale() {
+        try {
+            if (sCacheDir == null || sCacheDir.isEmpty()) return;
+            File dir = new File(sCacheDir);
+            File[] list = dir.listFiles();
+            if (list == null) return;
+            int n = 0;
+            long bytes = 0;
+            for (int i = 0; i < list.length; i++) {
+                File f = list[i];
+                if (f == null) continue;
+                String name = f.getName();
+                if (name == null || !name.startsWith("cap_") || !name.endsWith(".mp4")) continue;
+                long len = f.length();
+                try {
+                    if (f.delete()) {
+                        n++;
+                        bytes += len;
+                    }
+                } catch (Throwable ignore) { }
+            }
+            android.util.Log.i("VotBridge", "cap cleanup files=" + n + " bytes=" + bytes);
+        } catch (Throwable e) {
+            android.util.Log.w("VotBridge", "cap cleanup failed: " + e);
+        }
+    }
+
+    private static byte[] capReadFile(File f) throws IOException {
+        if (f == null || !f.isFile()) throw new IOException("no capture file");
+        long n = f.length();
+        if (n <= 0) throw new IOException("capture empty");
+        byte[] out = new byte[(int) n];
+        java.io.DataInputStream in = new java.io.DataInputStream(
+                new java.io.BufferedInputStream(new java.io.FileInputStream(f), 65536));
+        try {
+            in.readFully(out);
+        } finally {
+            try { in.close(); } catch (Throwable ignore) { }
+        }
+        return out;
+    }
+
+    // One capture file per video: the TV switches videos on its own (autoplay,
+    // resume, user click), so "the current capture" is not the one the caller
+    // asked for. Upload strictly by videoId.
+    private static JSONObject capUpload(String vid, String tid, int itag) throws Exception {
+        if (vid == null || vid.isEmpty()) throw new IOException("missing videoId");
+        if (tid == null || tid.isEmpty()) throw new IOException("missing translationId");
+        File wanted = capFileFor(vid);
+        byte[] data;
+        synchronized (CAP_LOCK) {
+            boolean current = wanted != null && wanted.equals(sCapFile) && sCapOut != null;
+            if (current) {
+                // Still recording this very video: flush, do not close, the tee
+                // keeps feeding the player.
+                try { sCapOut.flush(); } catch (Throwable ignore) { }
+            }
+            data = capReadFile(current ? sCapFile : wanted);
+        }
+        YandexSession se = YandexClient.ensureSession();
+        if (se == null) throw new IOException("no session");
+        String videoUrl = "https://www.youtube.com/watch?v=" + vid;
+        String fileId = YandexClient.buildFileId(itag, String.valueOf(data.length));
+        long t0 = System.currentTimeMillis();
+        YandexClient.uploadStreamedAudio(se, videoUrl, tid, fileId, data);
+        android.util.Log.i("VotBridge", "cap uploaded vid=" + vid + " bytes=" + data.length
+                + " itag=" + itag + " tid=" + tid + " in " + (System.currentTimeMillis() - t0) + "ms");
+        JSONObject o = new JSONObject();
+        o.put("ok", 1);
+        o.put("vid", vid);
+        o.put("size", data.length);
+        o.put("itag", itag);
+        o.put("ms", System.currentTimeMillis() - t0);
+        return o;
     }
 
     // Download source audio (DASH itag URL) and upload it to Yandex VOT so the

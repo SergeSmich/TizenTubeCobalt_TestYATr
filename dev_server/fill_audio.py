@@ -48,6 +48,88 @@ BOT_GATE = (
 
 
 # ---------------------------------------------------------------- yt-dlp
+# Cookies that carry the Google/YouTube login. A real browser holds them for
+# both .google.com and .youtube.com.
+AUTH_NAMES = (
+    "SID",
+    "HSID",
+    "SSID",
+    "APISID",
+    "SAPISID",
+    "SIDCC",
+    "LOGIN_INFO",
+    "__Secure-1PSID",
+    "__Secure-3PSID",
+    "__Secure-1PAPISID",
+    "__Secure-3PAPISID",
+    "__Secure-1PSIDTS",
+    "__Secure-3PSIDTS",
+)
+
+
+def _promote_youtube_domain(jar_path):
+    """Mirror google.com auth cookies onto .youtube.com inside our private copy.
+
+    The owner's export can miss the youtube-scoped duplicates (verified 25.10:
+    SID/SAPISID/APISID/LOGIN_INFO only on .google.com, so youtube.com answered
+    `LOGGED_IN:false` and yt-dlp hit "Sign in to confirm you're not a bot" even
+    with a live Google session). Adding the duplicates never touches the master
+    file and is exactly what the browser itself stores after a normal login.
+
+    Returns the number of mirrored cookies.
+    """
+    try:
+        with open(jar_path, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return 0
+    present = set()
+    mirrors = []
+    for line in lines:
+        raw = line
+        body = raw[len("#HttpOnly_") :] if raw.startswith("#HttpOnly_") else raw
+        if body.startswith("#") or not body.strip():
+            continue
+        parts = body.split("\t")
+        if len(parts) < 7:
+            continue
+        domain, _flag, path, secure, expiry, name, value = parts[:7]
+        host = domain.lstrip(".").lower()
+        if host.endswith("youtube.com"):
+            present.add(name)
+        elif host.endswith("google.com") and name in AUTH_NAMES:
+            mirrors.append((name, path, secure, expiry, value))
+    added = 0
+    out = []
+    for name, path, secure, expiry, value in mirrors:
+        if name in present:
+            continue
+        out.append(
+            "\t".join(
+                [
+                    ".youtube.com",
+                    "TRUE",
+                    path or "/",
+                    secure or "TRUE",
+                    expiry,
+                    name,
+                    value,
+                ]
+            )
+        )
+        present.add(name)
+        added += 1
+    if not added:
+        return 0
+    try:
+        with open(jar_path, "a", encoding="utf-8") as fh:
+            fh.write(("\n" if lines else "") + "\n".join(out) + "\n")
+    except OSError as e:
+        print(f"fill: youtube cookie mirror failed ({e})", flush=True)
+        return 0
+    return added
+
+
 def _cookie_args(cookies_file, browser):
     """--cookies wins; otherwise let yt-dlp read (and dump) the browser jar.
 
@@ -75,6 +157,12 @@ def _cookie_args(cookies_file, browser):
                 tmp_dir, f"yt_cookies_run_{os.getpid()}_{uuid.uuid4().hex[:6]}.txt"
             )
             shutil.copyfile(cookies_file, tmp)
+            mirrored = _promote_youtube_domain(tmp)
+            if mirrored:
+                print(
+                    f"fill: mirrored {mirrored} auth cookie(s) to .youtube.com",
+                    flush=True,
+                )
             return (
                 ["--cookies", tmp],
                 "file:" + os.path.basename(cookies_file) + " (copy)",

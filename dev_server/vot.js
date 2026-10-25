@@ -118,7 +118,16 @@
     pcExtends: 0,
     // Сколько опросов сделано для текущего ролика: по нему растёт пауза, когда
     // сервер не прислал подсказку remaining (иначе спали бы опросы подряд).
-    polls: 0
+    polls: 0,
+    // Путь E (audioMode:"capture"): звук, который штатный плеер уже получил по
+    // SABR и отдал в MSE, пишется в мост как cache/cap_<videoId>.mp4.
+    capTried: false,
+    capBusy: false,
+    capFailed: false,
+    capTries: 0,
+    capSentSize: 0,
+    // Повторы запроса при status=6 (свой загрузчик Яндекса не смог достать звук).
+    sixTries: 0
   };
 
   var statusEl = null;
@@ -711,6 +720,141 @@
       });
   }
 
+  // ---- Путь E: звук из MSE -------------------------------------------------
+  // Player-ответ больше не содержит прямых googlevideo-ссылок (url=0/audioUrl=0,
+  // только SABR), поэтому скачать дорожку самим нельзя. Зато штатный плеер уже
+  // качает её и отдаёт в MSE: vot_net.js перехватывает appendBuffer аудио и
+  // пишет байты в мост (cache/cap_<videoId>.mp4). Здесь мы ждём, пока наберётся
+  // достаточно, и отдаём файл Яндексу как исходный звук.
+  var CAP_STEP_MS = 4000;   // шаг опроса размера файла
+  var CAP_MIN_MS = 12000;   // раньше не отдаём: init + первые сегменты
+  var CAP_MAX_MS = 45000;   // дольше ждать нельзя: окно Яндекса ~90 с
+  var CAP_ENOUGH = 4000000; // 4 МБ ≈ 4 мин AAC 128k — дальше не ждём
+  var CAP_STABLE = 120 * 1024; // рост меньше этого = плеер упёрся в буфер
+  var CAP_MIN_BYTES = 250000;
+
+  function capStatus(id, cb) {
+    http('GET', '/cap/status?videoId=' + encodeURIComponent(id), null,
+      function (j) { cb(null, j || {}); },
+      function (e) { cb(e || new Error('capture status')); });
+  }
+
+  function capFillAllowed() {
+    if (!state.cfg || state.cfg.audioMode !== 'capture') return false;
+    if (uiPref('capture.enabled', true) === false) return false;
+    if (state.capFailed) return false;
+    if (state.capBusy) return false;
+    // Одна загрузка на ролик: повторный PUT в тот же translationId может
+    // испортить уже идущую задачу Яндекса.
+    if ((state.capTries || 0) >= 1) return false;
+    return true;
+  }
+
+  function capUpload(id, dur, tid, size) {
+    if (state.curId !== id) return;
+    state.capBusy = false;
+    state.capTries = (state.capTries || 0) + 1;
+    state.capSentSize = size;
+    log('capture upload id=' + id + ' size=' + size + ' tid=' + tid);
+    setStatus('Перевод: загружаю звук (' + Math.round(size / 1024) + ' КБ)…', '#f5a623', 'wait');
+    http('POST', '/cap/upload?videoId=' + encodeURIComponent(id) +
+      '&translationId=' + encodeURIComponent(tid) + '&itag=140', null,
+      function (j) {
+        if (state.curId !== id) return;
+        state.audioUploaded = true;
+        log('capture upload ok size=' + (j && j.size) + ' ms=' + (j && j.ms));
+        setStatus('Перевод: звук загружен, жду перевод…', '#f5a623', 'wait');
+        poll(id, dur, 5);
+      },
+      function (e) {
+        if (state.curId !== id) return;
+        state.capFailed = true;
+        state.busy = false;
+        log('capture upload ERR ' + e);
+        setStatus('Перевод: не удалось загрузить звук\n' + e, '#e53935');
+      });
+  }
+
+  // Returns true if it took over the recovery; false lets the caller run the
+  // usual ladder (other shard -> PC filler).
+  function capFill(id, dur, r, why) {
+    if (state.curId !== id) return true;
+    var tid = String((r && r.translationId) || state.translationId || '');
+    if (!tid) return false;
+    state.capTried = true;
+    state.capBusy = true;
+    state.busy = false;
+    state.translationId = tid;
+    log(why + ' -> capture id=' + id + ' tid=' + tid + ' lang=' + state.lang);
+    setStatus('Перевод: записываю звук с плеера…', '#f5a623', 'wait');
+    var t0 = Date.now();
+    var prev = -1;
+    var step = function () {
+      if (state.curId !== id || !state.capBusy) return;
+      capStatus(id, function (err, j) {
+        if (state.curId !== id || !state.capBusy) return;
+        var size = err ? 0 : Number(j.fileCurrent ? j.size : (j.fileSize || 0)) || 0;
+        var el = Date.now() - t0;
+        var grew = prev >= 0 ? size - prev : size;
+        prev = size;
+        if (size > 0) {
+          var enough = size >= CAP_ENOUGH
+            || (size >= CAP_MIN_BYTES && grew >= 0 && grew < CAP_STABLE);
+          if (el >= CAP_MAX_MS || (el >= CAP_MIN_MS && enough)) {
+            capUpload(id, dur, tid, size);
+            return;
+          }
+          setStatus('Перевод: записываю звук с плеера…\n' + Math.round(size / 1024) + ' КБ',
+            '#f5a623', 'wait');
+          setTimeout(step, CAP_STEP_MS);
+          return;
+        }
+        if (el >= CAP_MAX_MS) {
+          // Плеер не отдал ни байта (ролик на паузе, другой контейнер): обычная
+          // лестница — другой шард, затем ПК-филлер.
+          state.capBusy = false;
+          state.capFailed = true;
+          log('capture empty after ' + Math.round(el / 1000) + 's -> ladder');
+          if (escalate(id, dur, r, why)) return;
+          state.busy = false;
+          setStatus('Перевод: не удалось получить звук\nролик пропущен', '#e53935');
+          return;
+        }
+        setTimeout(step, CAP_STEP_MS);
+      });
+    };
+    step();
+    return true;
+  }
+
+  // status=6 (AUDIO_REQUESTED) означает, что СВОЙ загрузчик Яндекса не смог
+  // достать звук именно сейчас: повторный запрос через полминуты попадает на
+  // живой воркер и перевод приходит сам (замер: 8 из 8 холодных (ролик, язык)
+  // отдали status=2 без единого байта от нас). Частичная загрузка fMP4 хуже
+  // ожидания: задача навсегда застревает в status=3 без url (замер: 10+ минут).
+  var SIX_RETRY_MS = [15000, 45000, 120000];
+
+  function retrySix(id, dur, r, why) {
+    var n = state.sixTries || 0;
+    if (n >= SIX_RETRY_MS.length) return false;
+    state.sixTries = n + 1;
+    var wait = SIX_RETRY_MS[n];
+    state.busy = false;
+    // Даём лестнице шанс снова: следующий 6 опять проверит другой шард.
+    state.altLangTried = false;
+    log(why + ' -> retry ' + state.sixTries + '/' + SIX_RETRY_MS.length
+      + ' in ' + Math.round(wait / 1000) + 's');
+    setStatus('Перевод: сервер готовит звук…\nпопытка ' + state.sixTries
+      + ' из ' + SIX_RETRY_MS.length, '#f5a623', 'wait');
+    var lang0 = state.lang;
+    setTimeout(function () {
+      if (state.curId !== id) return;
+      // Язык мог смениться за время ожидания (ползунок/меню) — берём актуальный.
+      startTranslation(id, dur, state.lang || lang0);
+    }, wait);
+    return true;
+  }
+
   function pcFillAllowed() {
     // Лог и решение должны совпадать: раньше отсутствие конфига писалось как
     // «cfg_off=1», хотя филлер в этом случае разрешён.
@@ -907,7 +1051,12 @@
       // ответ для ролика без кэша, и ПК-филлер его лечит. Только пишем в лог,
       // чтобы по прогонам понять, приходит ли флаг вместе с 6.
       if (r.allow === false) log('status=6 allow=0 (ignored: audio can still be supplied) msg=' + (r.message || ''));
+      // Путь E идёт первым: звук уже на ТВ, запросы к YouTube не нужны, бот-гейт
+      // не участвует, а translationId остаётся тем самым, который опрашивает ТВ.
+      var tid6 = r.translationId || state.translationId;
+      if (tid6 && capFillAllowed() && capFill(id, dur, r, 'status=6')) return;
       if (escalate(id, dur, r, 'status=6')) return;
+      if (retrySix(id, dur, r, 'status=6')) return;
       state.busy = false;
       // Both shards are empty. Handing Yandex the real audio is what the browser
       // extension does, but on this TV it cannot work: every innerTube client
@@ -915,7 +1064,6 @@
       // poToken, and the player itself never sends one (it plays through MSE from
       // SABR, where the token lives inside the native stack). Kept behind
       // `audioMode:"on"` only, so the normal path stays instant.
-      var tid6 = r.translationId || state.translationId;
       if (tid6 && !state.audioTried && state.cfg && state.cfg.audioMode === 'on') {
         state.audioTried = true;
         state.busy = false;
@@ -1560,6 +1708,12 @@
     state.pcDone = false;
     state.pcWaits = 0;
     state.pcExtends = 0;
+    state.capTried = false;
+    state.capBusy = false;
+    state.capFailed = false;
+    state.capTries = 0;
+    state.capSentSize = 0;
+    state.sixTries = 0;
     state.polls = 0;
     state.livelyVoice = false;
     state.playedOnce = false;
@@ -1789,7 +1943,24 @@
     var id = state.curId;
     if (!id) { uiToast('Нет активного ролика'); return; }
     http('GET', '/fill_status?videoId=' + encodeURIComponent(id), null, function (j) {
-      uiToast('ПК: ' + String((j && j.state) || '?') + ((j && j.status) ? ' · status=' + j.status : ''));
+      // 'none' is not a failure: the PC keeps jobs in memory only, and a job
+      // exists solely after POST /fill for this very videoId. Say that plainly.
+      var st = String((j && j.state) || '');
+      var text;
+      if (st === 'run') {
+        text = 'ПК: качает и синтезирует…';
+      } else if (st === 'ok') {
+        text = 'ПК: готово';
+      } else if (st === 'err') {
+        var why = String((j && (j.error || j.why)) || '');
+        text = 'ПК: не смог' + (why ? ' — ' + why.slice(0, 70) : '');
+      } else if (st === 'offline') {
+        text = 'ПК: недоступен';
+      } else {
+        text = 'ПК: этот ролик не отправляли';
+      }
+      if (j && j.status) { text += ' · status=' + j.status; }
+      uiToast(text);
     }, function (e) { uiToast('ПК недоступен: ' + (e && e.message)); });
   }
 

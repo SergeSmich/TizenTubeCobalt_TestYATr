@@ -154,6 +154,46 @@ def _meta_prefetch(vid):
             META_PENDING.discard(vid)
 
 
+def _resolve_fill_meta(vid, duration, lang):
+    """Yandex refuses translate with duration=0 (HTTP 400), and a wrong language
+    shard leaves the TV polling status=6 forever. The TV normally sends both, but
+    a manual "fill" from the panel has neither: recover them from the meta cache
+    or from one yt-dlp metadata run (no media download)."""
+    dur = 0.0
+    try:
+        dur = float(duration or 0)
+    except Exception:  # noqa: BLE001 - dev tool
+        dur = 0.0
+    lng = str(lang or "").strip()
+    if dur > 0 and lng:
+        return dur, lng
+    with META_LOCK:
+        cached = dict(META_CACHE.get(vid) or {})
+    if cached:
+        if dur <= 0:
+            try:
+                dur = float(cached.get("duration") or 0)
+            except Exception:  # noqa: BLE001 - dev tool
+                dur = 0.0
+        lng = lng or str(cached.get("lang") or "").strip()
+    if dur > 0 and lng:
+        return dur, lng
+    try:
+        meta = _meta_worker(vid)
+    except Exception:  # noqa: BLE001 - dev tool
+        return dur, lng
+    if meta and meta.get("ok"):
+        with META_LOCK:
+            META_CACHE[vid] = meta
+    if dur <= 0:
+        try:
+            dur = float((meta or {}).get("duration") or 0)
+        except Exception:  # noqa: BLE001 - dev tool
+            dur = 0.0
+    lng = lng or str((meta or {}).get("lang") or "").strip()
+    return dur, lng
+
+
 def _fill_worker(vid, duration, tid, lang):
     """Runs in its own thread: download the audio on the PC and hand it to
     Yandex, so the TV's own translationId can reach status=1."""
@@ -161,6 +201,11 @@ def _fill_worker(vid, duration, tid, lang):
     try:
         import fill_audio
 
+        duration, lang = _resolve_fill_meta(vid, duration, lang)
+        if duration <= 0:
+            # Yandex answers 400 on duration=0, which used to surface as the
+            # cryptic "no translationId from translate". Say what is wrong.
+            raise RuntimeError("duration unknown: YouTube meta unavailable")
         res = fill_audio.fill(
             vid,
             duration,

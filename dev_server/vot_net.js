@@ -14,6 +14,7 @@
   window.__VOT_NET_STARTED = 1;
 
   var MARK = '[VOT-net]';
+  var BRIDGE = 'http://127.0.0.1:8013';
   var LIMIT = 40;
   var sent = 0;
   var seen = {};
@@ -23,7 +24,7 @@
     sent++;
     try {
       var x = new XMLHttpRequest();
-      x.open('POST', 'http://127.0.0.1:8013/log', true);
+      x.open('POST', BRIDGE + '/log', true);
       x.setRequestHeader('Content-Type', 'text/plain');
       x.send(MARK + ' ' + String(text).slice(0, 200));
     } catch (e) { }
@@ -174,17 +175,207 @@
     }
   }
 
+  // Отправка перехваченных байтов в мост: /cap/begin (init), /cap/chunk, /cap/end.
+  // Очередь строго последовательная (begin должен лечь первым), буфер ограничен,
+  // при переполнении чанки дропаются — плеер важнее.
+  var CAP_LIMIT = 24 * 1024 * 1024;
+  var CAP_QBUF = 8 * 1024 * 1024;
+  // Захват включается только конфигом моста (audioMode:"capture"): он копирует
+  // каждый аудиосегмент и держит до 24 МБ в кэше ТВ, а нужен редко.
+  var CAP_ON = false;
+  var CAP = { vid: '', started: 0, sent: 0, qbytes: 0, q: [], busy: 0, dropped: 0, done: 0 };
+
+  function capVideoId() {
+    // На ТВ (LIVING_ROOM) id живёт в hash: `#/watch?v=...`, а не в search.
+    try {
+      var m = /[?&]v=([A-Za-z0-9_-]{6,})/.exec(String(location.href || ''));
+      if (m) return m[1];
+    } catch (e) { }
+    try {
+      if (window.ytcfg && ytcfg.get) {
+        var v = String(ytcfg.get('VIDEO_ID') || '');
+        if (v) return v;
+      }
+    } catch (e) { }
+    return '';
+  }
+
+  function capBytes(buf) {
+    try {
+      if (!buf) return null;
+      if (buf instanceof ArrayBuffer) return new Uint8Array(buf.slice(0));
+      if (buf.buffer) {
+        return new Uint8Array(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
+      }
+    } catch (e) { }
+    return null;
+  }
+
+  function capSend(path, bytes, cb) {
+    var x = new XMLHttpRequest();
+    CAP.busy++;
+    x.onloadend = function () {
+      CAP.busy--;
+      if (cb) { try { cb(x.responseText || ''); } catch (e) { } }
+    };
+    try {
+      x.open('POST', BRIDGE + path, true);
+      x.setRequestHeader('Content-Type', 'application/octet-stream');
+      x.send(bytes || null);
+    } catch (e) { CAP.busy--; }
+  }
+
+  function capNext() {
+    if (!CAP.started || CAP.busy > 0 || !CAP.q.length) return;
+    var b = CAP.q.shift();
+    CAP.qbytes -= b.length;
+    capSend('/cap/chunk', b, capNext);
+  }
+
+  function capPush(bytes) {
+    if (!CAP_ON) return;
+    if (!bytes || !bytes.length || CAP.done) return;
+    var id = capVideoId();
+    if (!id) return;
+    if (id !== CAP.vid) {
+      CAP.vid = id;
+      CAP.started = 1;
+      CAP.sent = bytes.length;
+      CAP.dropped = 0;
+      CAP.done = 0;
+      CAP.q.length = 0;
+      CAP.qbytes = 0;
+      var init = bytes;
+      capSend('/cap/begin?videoId=' + encodeURIComponent(id), init, function (r) {
+        post('cap begin vid=' + id + ' init=' + init.length + ' r=' + String(r).slice(0, 70));
+        capNext();
+      });
+      return;
+    }
+    if (CAP.sent + bytes.length > CAP_LIMIT) {
+      CAP.done = 1;
+      capSend('/cap/end', null, function (r) {
+        post('cap limit vid=' + id + ' sent=' + CAP.sent + ' dropped=' + CAP.dropped + ' r=' + String(r).slice(0, 70));
+      });
+      return;
+    }
+    if (CAP.qbytes + bytes.length > CAP_QBUF) { CAP.dropped++; return; }
+    CAP.q.push(bytes);
+    CAP.qbytes += bytes.length;
+    CAP.sent += bytes.length;
+    capNext();
+  }
+
+  // Путь E: плеер уже получает звук по SABR и отдаёт его в MSE. Перехватываем
+  // appendBuffer у аудио-SourceBuffer: прямых googlevideo-ссылок в player-ответе
+  // нет вообще (url=0/audioUrl=0), значит единственный источник байтов — MSE.
+  // Пока только считаем размеры: подтверждаем, что hook живой и трек AAC идёт.
+  var MSE = { hooked: 0, sb: 0, ap: 0, bytes: 0, init: 0 };
+  function isAudioMime(m) {
+    return /audio\/mp4|mp4a|opus/i.test(String(m || ''));
+  }
+  function hookMse() {
+    try {
+      var MS = window.MediaSource;
+      if (!MS || !MS.prototype || !MS.prototype.addSourceBuffer) return 0;
+      if (MS.prototype.__votHooked) return 1;
+      var oa = MS.prototype.addSourceBuffer;
+      MS.prototype.addSourceBuffer = function (m) {
+        var sb = oa.apply(this, arguments);
+        try {
+          if (sb && isAudioMime(m)) {
+            MSE.sb++;
+            once('mse-sb' + MSE.sb, 'mse addSourceBuffer ' + String(m).slice(0, 60));
+            var ap = sb.appendBuffer;
+            if (ap) {
+              sb.appendBuffer = function (buf) {
+                try {
+                  var n = (buf && (buf.byteLength || buf.length)) || 0;
+                  MSE.ap++;
+                  MSE.bytes += n;
+                  capPush(capBytes(buf));
+                  if (MSE.ap === 1) {
+                    MSE.init = n;
+                    post('mse first append ' + n + 'B mime=' + String(m).slice(0, 40));
+                  } else if (MSE.ap % 20 === 0) {
+                    post('mse appends=' + MSE.ap + ' bytes=' + MSE.bytes + ' init=' + MSE.init
+                      + ' cap=' + CAP.sent + ' drop=' + CAP.dropped);
+                  }
+                } catch (e) { }
+                return ap.apply(this, arguments);
+              };
+            }
+          }
+        } catch (e) { }
+        return sb;
+      };
+      MS.prototype.__votHooked = 1;
+      MSE.hooked = 1;
+      return 1;
+    } catch (e) { return 0; }
+  }
+
+  // Путь E требует AAC: Яндекс принимает только mp4/aac, а ТВ по умолчанию
+  // получает opus/webm (проверено: `audio/webm; codecs="opus"`). Заставляем
+  // плеер выбрать AAC, отказывая в audio/webm|opus, не трогая видеокодеки.
+  function isAudioCodec(s, m) {
+    return s.indexOf('audio/') === 0 || /codecs="?opus/.test(s);
+  }
+  function patchCodecs() {
+    // Принудительный AAC нужен только захвату (путь E). При audioMode:"off"
+    // выбор кодека плеера не трогаем: иначе мы отбираем opus у обычного
+    // воспроизведения без всякой пользы.
+    if (!CAP_ON) return 0;
+    try {
+      var MS = window.MediaSource;
+      if (!MS || MS.__votCodec || !MS.isTypeSupported) return 0;
+      var orig = MS.isTypeSupported;
+      MS.isTypeSupported = function (m) {
+        var s = String(m || '').toLowerCase();
+        try {
+          if (isAudioCodec(s, m) && /webm|ogg|opus/.test(s)) {
+            once('codec-r-' + s.slice(0, 40), 'codec reject ' + String(m).slice(0, 70));
+            return false;
+          }
+          if (isAudioCodec(s, m)) {
+            once('codec-a-' + s.slice(0, 40), 'codec ask ' + String(m).slice(0, 70)
+              + ' -> ' + orig.apply(MS, arguments));
+          }
+        } catch (e) { }
+        return orig.apply(MS, arguments);
+      };
+      MS.__votCodec = 1;
+      return 1;
+    } catch (e) { return 0; }
+  }
+
   function report() {
     var pir = 0, cfg = 0, mse = 0;
     try { pir = window.ytInitialPlayerResponse ? 1 : 0; } catch (e) { }
     try { cfg = (window.ytcfg && ytcfg.get) ? 1 : 0; } catch (e) { }
     try { mse = window.MediaSource ? 1 : 0; } catch (e) { }
     post('boot pir=' + pir + ' ytcfg=' + cfg + ' mse=' + mse
-      + ' xhr=' + (patchXhr() ? 1 : 0) + ' fetch=' + (patchFetch() ? 1 : 0));
+      + ' xhr=' + (patchXhr() ? 1 : 0) + ' fetch=' + (patchFetch() ? 1 : 0)
+      + ' mseh=' + (hookMse() ? 1 : 0) + ' codec=' + (patchCodecs() ? 1 : 0));
   }
 
   report();
   tryYtcfg();
+
+  // Захват в MSE (путь E) включаем только если конфиг моста этого просит.
+  try {
+    var cx = new XMLHttpRequest();
+    cx.open('GET', BRIDGE + '/config', true);
+    cx.onreadystatechange = function () {
+      if (cx.readyState !== 4 || cx.status !== 200) return;
+      try { CAP_ON = (JSON.parse(cx.responseText) || {}).audioMode === 'capture'; } catch (e) { }
+      if (!CAP_ON) return;
+      post('cap on');
+      // Принудительный AAC имеет смысл только теперь (см. patchCodecs).
+      patchCodecs();
+    };
+    cx.send(null);
+  } catch (e) { }
 
   // Плеер поднимается позже и может заменить конструктор — дооборачиваем.
   var tries = 0;
@@ -192,6 +383,7 @@
     tries++;
     patchXhr();
     patchFetch();
+    hookMse();
     if (tries === 2 || tries === 4) tryYtcfg();
     if (tries >= 20) clearInterval(t);
   }, 1500);
