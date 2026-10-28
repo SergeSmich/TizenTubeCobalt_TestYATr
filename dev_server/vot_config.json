@@ -4,7 +4,7 @@
   "mediaProxy": "",
   "proxyMode": "off",
   "faMode": "skip",
-  "audioMode": "off",
+  "audioMode": "capture",
   "pcFill": false,
   "fillLang": "en",
   "fillFormat": "140/bestaudio[ext=m4a]",

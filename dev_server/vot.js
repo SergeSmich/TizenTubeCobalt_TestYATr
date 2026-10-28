@@ -668,6 +668,41 @@
     else innertubeAudio(id, onSrc, onErr);
   }
 
+  // Serverless-путь для status=6: мост сам минтит poToken, берёт аудио-URL у
+  // InnerTube (ANDROID_VR → WEB), скачивает дорожку и грузит её в Яндекс
+  // (/audiosrc). Ни ПК, ни скачивания в странице не участвуют. Возвращает true,
+  // если запрос ушёл (дальше ждём поллингом).
+  function bridgeAudioSrc(id, dur, tid) {
+    if (!tid) { state.busy = false; setStatus('Перевод: нет translationId для аудио', '#e53935'); return false; }
+    if (state.uploading) return true;
+    if (state.audioUploaded) return false;
+    state.uploading = true;
+    state.translationId = String(tid);
+    log('audiosrc id=' + id + ' tid=' + tid);
+    setStatus('Перевод: готовлю звук ролика…\nэто займёт до минуты', '#f5a623', 'wait');
+    http('POST', '/audiosrc',
+      { videoId: id, translationId: String(tid), videoUrl: watchUrl(id) },
+      function (r) {
+        state.uploading = false;
+        state.audioUploaded = true;
+        state.busy = false;
+        log('audiosrc ok client=' + (r && r.client || '?') + ' itag=' + (r && r.itag) +
+            ' size=' + (r && r.size));
+        setStatus('Перевод: звук загружен, жду перевод…', '#f5a623', 'wait');
+        poll(id, dur, 5);
+      },
+      function (e) {
+        state.uploading = false;
+        state.busy = false;
+        log('audiosrc ERR ' + e);
+        if (state.curId !== id) return;
+        // Звук не ушёл — не сдаёмся, держим живой tid как раньше.
+        setStatus('Перевод: звук не отправился, жду сервер…', '#f5a623', 'wait');
+        holdSix(id, dur, {}, 'audiosrc-failed');
+      });
+    return true;
+  }
+
   // Ask the PC dev server to download the track and push it into the Yandex
   // cache for the shard the TV is currently polling (state.lang). Shared by the
   // status=6 and status=0 ladders so both failures end in the same recovery.
@@ -810,7 +845,8 @@
   // через 51 с уходит в терминальный 0 (fid роли не играет) — хуже ожидания,
   // поэтому не отправляем (см. STATE.md).
   var SIX_HOLD_MS = 30000;    // пауза между опросами, пока сервер «готовит звук»
-  var SIX_HOLD_MAX = 600000;  // 10 мин на один шард, дальше — другой шард/ПК
+  var SIX_HOLD_MAX = 240000;  // 4 мин на один шард: с загруженным звуком сервер
+                              // отвечает за ~1 мин, дальше — другой шард/ПК
 
   function holdSix(id, dur, r, why) {
     var tid6 = r.translationId || state.translationId;
@@ -1043,6 +1079,11 @@
       // Путь E идёт первым: звук уже на ТВ, запросы к YouTube не нужны, бот-гейт
       // не участвует, а translationId остаётся тем самым, который опрашивает ТВ.
       var tid6 = r.translationId || state.translationId;
+      // Serverless: мост сам скачивает звук и грузит его в Яндекс, ПК не нужен.
+      if (tid6 && !state.audioTried && state.cfg && state.cfg.audioMode === 'local') {
+        state.audioTried = true;
+        if (bridgeAudioSrc(id, dur, tid6)) return;
+      }
       if (tid6 && capFillAllowed() && capFill(id, dur, r, 'status=6')) return;
       // Держим тот же translationId и опрашиваем: новый firstRequest здесь
       // только вредит — он создаёт новую задачу и бросает живую (замер: тот же
@@ -1878,13 +1919,20 @@
   // Пока ПК не успел — повторяем опрос по META_GAPS.
   // Serverless: язык оригинала спрашивает мост (/meta_local = порт yt_lang.py).
   // Если мост не смог — тихо откатываемся на прежний путь через ПК.
+  // Serverless-приоритет: когда ПК-филлер выключен (pcFill:false) или мост работает
+  // в режиме local, язык спрашиваем у моста (/meta_local, порт player-ответа). Путь
+  // через ПК (/fill_status) при выключенном ПК — это до 10 запросов по META_GAPS
+  // (~17 с) на каждый ролик и гарантированный таймаут. Фолбэк на ПК оставляем
+  // только если pcFill явно разрешён.
   function fetchMeta(id, tries) {
     var n = tries || 0;
-    if (state.cfg && state.cfg.audioMode === 'local') { fetchMetaLocal(id, n); return; }
+    var cfg = state.cfg || {};
+    var pcOk = cfg.pcFill === true;
+    if (cfg.audioMode === 'local' || !pcOk) { fetchMetaLocal(id, n, pcOk); return; }
     fetchMetaPC(id, n);
   }
 
-  function fetchMetaLocal(id, n) {
+  function fetchMetaLocal(id, n, pcFallback) {
     http('GET', '/meta_local?videoId=' + encodeURIComponent(id), null, function (j) {
       if (state.curId !== id) return;
       var lang = String((j && j.lang) || '');
@@ -1897,10 +1945,20 @@
         }
         return;
       }
+      // Без ПК повторять бессмысленно: язык доберём из ответа Яндекса (поле 8)
+      // в maybeSkipNow, а перевод всё равно стартует (source lang unknown).
+      if (!pcFallback) {
+        log('meta_local fail ' + String((j && j.err) || 'no lang') + ' (serverless, no pc meta)');
+        return;
+      }
       log('meta_local fail ' + String((j && j.err) || 'no lang') + ' -> pc meta');
       fetchMetaPC(id, n);
     }, function (e) {
       if (state.curId !== id) return;
+      if (!pcFallback) {
+        log('meta_local ERR ' + (e && e.message) + ' (serverless, no pc meta)');
+        return;
+      }
       log('meta_local ERR ' + (e && e.message) + ' -> pc meta');
       fetchMetaPC(id, n);
     });

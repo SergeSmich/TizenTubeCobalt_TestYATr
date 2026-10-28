@@ -66,10 +66,15 @@ public final class Bridge {
 
     private static volatile boolean started;
 
-    // ---- overlay serving (mutable JS pulled from PC dev server) ----
+    // ---- overlay serving ----
+    // The overlay ships inside the APK (assets/vot.js = ui + vot + net glued at
+    // build time), so a fresh install works with no PC on the network. The dev
+    // server stays as an optional live override: when it answers, its file wins
+    // and is cached, so the next build picks the same code.
     private static final String PC_BASE = "http://192.168.1.186:8013";
     private static final String OVERLAY_SOURCE = PC_BASE + "/vot.js";
     private static final String CONFIG_SOURCE = PC_BASE + "/vot_config.json";
+    private static final String OVERLAY_ASSET = "vot.js";
     private static volatile byte[] sOverlay;
     private static volatile String sLastConfig = "";
 
@@ -103,13 +108,17 @@ public final class Bridge {
     // Serverless switches handed to the overlay via /config:
     // audioMode : "off" (PC filler as before) | "local" (bridge resolves the
     //             audio URL itself and feeds it to Yandex without a PC)
+    //             "capture" (harvest the player's own MSE audio — default: it is
+    //             the only path Google does not gate)
     // pcFill    : may the overlay ask the PC dev server for the source audio
-    private static volatile String sAudioMode = "off";
-    private static volatile boolean sPcFill = true;
+    private static volatile String sAudioMode = "capture";
+    private static volatile boolean sPcFill = false;
 
     // ---- TV-side paths (needed to read Cobalt's cookie store) ----
     private static volatile String sDataDir = "";
     private static volatile String sCacheDir = "";
+    // Application context, needed by the poToken WebView generator.
+    private static volatile android.content.Context sAppCtx;
 
     private Bridge() {}
 
@@ -117,6 +126,7 @@ public final class Bridge {
         if (started) return;
         started = true;
         try {
+            sAppCtx = ctx.getApplicationContext() != null ? ctx.getApplicationContext() : ctx;
             sDataDir = ctx.getApplicationInfo().dataDir;
             File cd = ctx.getCacheDir();
             sCacheDir = cd == null ? sDataDir : cd.getAbsolutePath();
@@ -125,6 +135,8 @@ public final class Bridge {
         }
         android.util.Log.i("VotBridge", "dirs data=" + sDataDir + " cache=" + sCacheDir);
         capCleanupStale();
+        loadOverlayFromAssets();
+        loadCachedConfig();
         Thread t = new Thread(Bridge::serve, "vot-bridge");
         t.setDaemon(true);
         t.start();
@@ -134,35 +146,99 @@ public final class Bridge {
         android.util.Log.i("VotBridge", "bridge starting on 127.0.0.1:8013");
     }
 
+    // The overlay compiled into the APK: works offline, on a fresh install, with
+    // no dev server anywhere. /vot.js serves these bytes until a PC override
+    // shows up.
+    private static void loadOverlayFromAssets() {
+        try {
+            InputStream in = sAppCtx.getAssets().open(OVERLAY_ASSET);
+            byte[] b = YandexClient.readAll(in);
+            try { in.close(); } catch (Throwable e) { }
+            if (b != null && b.length > 0) {
+                sOverlay = b;
+                android.util.Log.i("VotBridge", "overlay from assets " + b.length + " bytes");
+            }
+        } catch (Throwable e) {
+            android.util.Log.w("VotBridge", "no overlay asset: " + e);
+        }
+    }
+
+    private static String configCachePath() {
+        return (sDataDir == null || sDataDir.isEmpty() ? "" : sDataDir + "/") + "vot_config_cache.json";
+    }
+
+    // Config that came from the dev server once is cached on the TV, so the
+    // device keeps its settings (token, audioMode, ...) with the PC switched off.
+    private static void loadCachedConfig() {
+        try {
+            File f = new File(configCachePath());
+            if (!f.isFile() || f.length() == 0) return;
+            byte[] b;
+            FileInputStream fi = new FileInputStream(f);
+            try { b = YandexClient.readAll(fi); } finally { try { fi.close(); } catch (Throwable e) { } }
+            if (b == null || b.length == 0) return;
+            String s = new String(b, StandardCharsets.UTF_8).trim();
+            if (s.isEmpty()) return;
+            sLastConfig = s;
+            handleConfig(new JSONObject(s));
+            android.util.Log.i("VotBridge", "config from cache " + s.length() + "B");
+        } catch (Throwable e) {
+            android.util.Log.w("VotBridge", "config cache read failed: " + e);
+        }
+    }
+
+    private static void saveConfigCache(String s) {
+        try {
+            FileOutputStream fo = new FileOutputStream(configCachePath());
+            fo.write(s.getBytes(StandardCharsets.UTF_8));
+            fo.close();
+        } catch (Throwable e) {
+            android.util.Log.w("VotBridge", "config cache write failed: " + e);
+        }
+    }
+
     private static void overlayFetcher() {
+        int fails = 0;
         while (true) {
             try {
                 byte[] b = httpGet(OVERLAY_SOURCE);
                 if (b != null && b.length > 0) {
                     sOverlay = b;
+                    fails = 0;
                     android.util.Log.i("VotBridge", "overlay refreshed " + b.length + " bytes");
+                } else {
+                    fails++;
                 }
             } catch (Throwable e) {
-                android.util.Log.w("VotBridge", "overlay fetch failed: " + e);
+                fails++;
+                if (fails < 3) android.util.Log.w("VotBridge", "overlay fetch failed: " + e);
             }
-            reloadConfig();
-            try { Thread.sleep(8000); } catch (InterruptedException e) { return; }
+            if (reloadConfig()) fails = 0;
+            // No dev server is the normal case for a shipped build: back off
+            // instead of hammering a dead LAN address every 8 seconds.
+            long wait = fails >= 3 ? 300000L : 8000L;
+            try { Thread.sleep(wait); } catch (InterruptedException e) { return; }
         }
     }
 
-    // Settings live in vot_config.json next to vot.js on the PC dev server, so
-    // the OAuth token / worker can be changed without rebuilding the APK.
-    private static void reloadConfig() {
+    // Settings normally live in vot_config.json next to vot.js on the PC dev
+    // server; every accepted config is also cached on the TV (see
+    // loadCachedConfig) so the box is self-sufficient once it has seen one.
+    private static boolean reloadConfig() {
         try {
             byte[] b = httpGet(CONFIG_SOURCE);
-            if (b == null || b.length == 0) return;
+            if (b == null || b.length == 0) return false;
             String s = new String(b, StandardCharsets.UTF_8).trim();
-            if (s.isEmpty() || s.equals(sLastConfig)) return;
+            if (s.isEmpty()) return false;
+            if (s.equals(sLastConfig)) return true;
             JSONObject o = new JSONObject(s);
             sLastConfig = s;
             handleConfig(o);
+            saveConfigCache(s);
+            return true;
         } catch (Throwable e) {
             android.util.Log.w("VotBridge", "config fetch failed: " + e);
+            return false;
         }
     }
 
@@ -385,14 +461,27 @@ public final class Bridge {
 
     private static final String INNERTUBE = "https://www.youtube.com/youtubei/v1/player";
     private static final String INNERTUBE_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
-    private static final String WEB_VERSION = "2.20240101.00.00";
+    private static final String WEB_VERSION = "2.20260708.00.00";
     private static final String WEB_UA =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-            "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
-    private static final String VR_VERSION = "1.62.27";
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+    private static final String VR_VERSION = "1.65.10";
+    // Byte-for-byte copy of the fork's CLIENTS.ANDROID_VR.USER_AGENT: googlevideo
+    // ties the media URL to the UA of the client that asked for it, a different
+    // string is answered with 403 + empty body even though the URL is valid.
     private static final String VR_UA =
-            "com.google.android.apps.youtube.vr.oculus/1.62.27 (Linux; U; Android 12; en_US; " +
-            "Quest 3 Build/SQ3A.220605.009.A1;) gzip";
+            "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; " +
+            "eureka-user Build/SQ3A.220605.009.A1) gzip";
+    private static final String IOS_VERSION = "21.26.4";
+    private static final String IOS_UA =
+            "com.google.ios.youtube/21.26.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)";
+    private static final String VISIONOS_VERSION = "1.02";
+    private static final String VISIONOS_UA =
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 " +
+            "(KHTML, like Gecko) Version/26.0 Safari/605.1.15";
+    private static final String ANDROID_VERSION = "20.10.38";
+    private static final String ANDROID_UA =
+            "com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip";
 
     private static final class MetaEntry {
         final long at;
@@ -529,23 +618,97 @@ public final class Bridge {
         }
     }
 
+    // One InnerTube client. Version and UA must stay byte-identical to the fork
+    // (Constants.kt / AppClient.kt): googlevideo ties the media URL to the UA of
+    // the client that asked for it, a different string gives 403 + empty body.
+    private static final class Client {
+        final String name;
+        final String version;
+        final String num;       // X-Youtube-Client-Name
+        final String ua;
+        final boolean potInBody; // WEB family only: adds SAPISID Authorization
+        final String make;
+        final String model;
+        final String osName;
+        final String osVersion;
+        final int sdk;
+
+        Client(String name, String version, String num, String ua, boolean potInBody,
+               String make, String model, String osName, String osVersion, int sdk) {
+            this.name = name;
+            this.version = version;
+            this.num = num;
+            this.ua = ua;
+            this.potInBody = potInBody;
+            this.make = make;
+            this.model = model;
+            this.osName = osName;
+            this.osVersion = osVersion;
+            this.sdk = sdk;
+        }
+
+        String uaOrWeb() {
+            return ua == null ? WEB_UA : ua;
+        }
+    }
+
+    private static final Client C_WEB = new Client("WEB", WEB_VERSION, "1", WEB_UA,
+            true, null, null, null, null, 0);
+    private static final Client C_VR = new Client("ANDROID_VR", VR_VERSION, "28", VR_UA,
+            false, "Oculus", "Quest 3", "Android", "12", 32);
+    private static final Client C_VISIONOS = new Client("VISIONOS", VISIONOS_VERSION, "101",
+            VISIONOS_UA, false, "Apple", "RealityDevice14,1", "visionOS", "1.3.0.0.0", 0);
+    private static final Client C_IOS = new Client("IOS", IOS_VERSION, "5", IOS_UA,
+            false, "Apple", "iPhone16,2", "iPhone", "18.3.2.18.1", 0);
+    private static final Client C_ANDROID = new Client("ANDROID", ANDROID_VERSION, "3", ANDROID_UA,
+            false, "Google", "Pixel 7", "Android", "11", 30);
+
+    // Order matters: ANDROID_VR still hands out plain adaptiveFormats urls with a
+    // contentLength and no "n", the visionOS/iOS ones are the fork's favourites.
+    private static final Client[] AUDIO_CLIENTS =
+            new Client[]{C_VR, C_VISIONOS, C_IOS, C_ANDROID, C_WEB};
+
+    private static Client clientByName(String s) {
+        if (s == null) return null;
+        if (s.equalsIgnoreCase("web") || s.equalsIgnoreCase("mweb")) return C_WEB;
+        if (s.equalsIgnoreCase("vr") || s.equalsIgnoreCase("android_vr")) return C_VR;
+        if (s.equalsIgnoreCase("visionos") || s.equalsIgnoreCase("vision")) return C_VISIONOS;
+        if (s.equalsIgnoreCase("ios")) return C_IOS;
+        if (s.equalsIgnoreCase("android") || s.equalsIgnoreCase("reel")
+                || s.equalsIgnoreCase("android_reel")) return C_ANDROID;
+        return null;
+    }
+
     private static JSONObject itPlayer(String videoId, boolean vr) throws Exception {
+        return itPlayer(videoId, vr ? C_VR : C_WEB, null, null);
+    }
+
+    private static JSONObject itPlayer(String videoId, boolean vr, String visitorData, String playerPot)
+            throws Exception {
+        return itPlayer(videoId, vr ? C_VR : C_WEB, visitorData, playerPot);
+    }
+
+    // visitorData + player poToken go into EVERY client request, not just WEB: the
+    // media URL is signed against the visitorData/poToken pair of the player call
+    // that produced it. Sending them for WEB only was the reason ANDROID_VR URLs
+    // came back "valid" and then answered 403 with an empty body on the range GET
+    // (the pot we appended was minted for a visitor the request never declared).
+    private static JSONObject itPlayer(String videoId, Client cl, String visitorData, String playerPot)
+            throws Exception {
         refreshCookies(false);
         JSONObject client = new JSONObject();
         JSONObject body = new JSONObject();
         JSONObject ctx = new JSONObject();
-        if (vr) {
-            client.put("clientName", "ANDROID_VR");
-            client.put("clientVersion", VR_VERSION);
-            client.put("deviceMake", "Oculus");
-            client.put("deviceModel", "Quest 3");
-            client.put("androidSdkVersion", 32);
-            client.put("osName", "Android");
-            client.put("osVersion", "12");
-            client.put("userAgent", VR_UA);
-        } else {
-            client.put("clientName", "WEB");
-            client.put("clientVersion", WEB_VERSION);
+        client.put("clientName", cl.name);
+        client.put("clientVersion", cl.version);
+        if (cl.make != null) client.put("deviceMake", cl.make);
+        if (cl.model != null) client.put("deviceModel", cl.model);
+        if (cl.sdk > 0) client.put("androidSdkVersion", cl.sdk);
+        if (cl.osName != null) client.put("osName", cl.osName);
+        if (cl.osVersion != null) client.put("osVersion", cl.osVersion);
+        if (cl.ua != null) client.put("userAgent", cl.ua);
+        if (visitorData != null && !visitorData.isEmpty()) {
+            client.put("visitorData", visitorData);
         }
         client.put("hl", "en");
         client.put("gl", "US");
@@ -555,8 +718,13 @@ public final class Bridge {
         body.put("videoId", videoId);
         body.put("contentCheckOk", true);
         body.put("racyCheckOk", true);
+        if (playerPot != null && !playerPot.isEmpty()) {
+            JSONObject sid = new JSONObject();
+            sid.put("poToken", playerPot);
+            body.put("serviceIntegrityDimensions", sid);
+        }
 
-        String ua = vr ? VR_UA : WEB_UA;
+        String ua = cl.ua != null ? cl.ua : WEB_UA;
         HttpURLConnection c = (HttpURLConnection) new URL(
                 INNERTUBE + "?key=" + INNERTUBE_KEY + "&prettyPrint=false").openConnection();
         c.setConnectTimeout(8000);
@@ -565,14 +733,17 @@ public final class Bridge {
         c.setDoOutput(true);
         c.setRequestProperty("Content-Type", "application/json");
         c.setRequestProperty("User-Agent", ua);
-        c.setRequestProperty("X-Youtube-Client-Name", vr ? "28" : "1");
-        c.setRequestProperty("X-Youtube-Client-Version", vr ? VR_VERSION : WEB_VERSION);
+        c.setRequestProperty("X-Youtube-Client-Name", cl.num);
+        c.setRequestProperty("X-Youtube-Client-Version", cl.version);
         c.setRequestProperty("Accept-Language", "en");
         c.setRequestProperty("Origin", "https://www.youtube.com");
         c.setRequestProperty("Referer", "https://www.youtube.com/");
         String ck = sCookieHeader;
         if (ck != null && !ck.isEmpty()) c.setRequestProperty("Cookie", ck);
-        if (!vr) {
+        if (visitorData != null && !visitorData.isEmpty()) {
+            c.setRequestProperty("X-Goog-Visitor-Id", visitorData);
+        }
+        if (cl.potInBody) {
             String sap = cookie("SAPISID");
             if (sap.isEmpty()) sap = cookie("__Secure-3PAPISID");
             if (sap.isEmpty()) sap = cookie("__Secure-1PAPISID");
@@ -592,10 +763,28 @@ public final class Bridge {
             try { c.disconnect(); } catch (Throwable e) { }
         }
         JSONObject ps = j.optJSONObject("playabilityStatus");
-        android.util.Log.i("VotBridge", "it player " + (vr ? "VR" : "WEB") + " id=" + videoId
+        android.util.Log.i("VotBridge", "it player " + cl.name + " id=" + videoId
                 + " status=" + (ps == null ? "?" : ps.optString("status", "?"))
-                + " login=" + (sCookieLoggedIn ? 1 : 0));
+                + " login=" + (sCookieLoggedIn ? 1 : 0)
+                + " pot=" + (playerPot != null && !playerPot.isEmpty() ? 1 : 0)
+                + " vd=" + (visitorData != null && !visitorData.isEmpty() ? 1 : 0));
         return j;
+    }
+
+    // Query parameter names only (no values) — enough to see whether gvs gave us
+    // an "n", an expire, an ip lock, etc.
+    private static String queryKeys(String url) {
+        int q = url.indexOf('?');
+        if (q < 0) return "";
+        String[] kv = url.substring(q + 1).split("&");
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < kv.length; i++) {
+            int eq = kv[i].indexOf('=');
+            String k = eq < 0 ? kv[i] : kv[i].substring(0, eq);
+            if (sb.length() > 0) sb.append(',');
+            sb.append(k);
+        }
+        return sb.toString();
     }
 
     private static boolean hasParam(String url, String param) {
@@ -651,11 +840,33 @@ public final class Bridge {
     // googlevideo link (and whether it still needs the "n" transform) instead
     // of asking the PC to run yt-dlp.
     private static JSONObject handleYtUrl(String videoId, boolean vr) throws Exception {
-        JSONObject j = itPlayer(videoId, vr);
+        return handleYtUrl(videoId, vr ? C_VR : C_WEB, false);
+    }
+
+    // withPot: mint visitorData + poToken and let the WEB client sign the
+    // request with it (serviceIntegrityDimensions), then append
+    // "&pot=<streamingPot>" to every returned audio URL. Without pot googlevideo
+    // answers 403 with an empty body, so this is the only path that downloads.
+    private static JSONObject handleYtUrl(String videoId, Client cl, boolean withPot) throws Exception {
+        String visitorData = null;
+        String playerPot = null;
+        String streamPot = null;
+        if (withPot) {
+            try {
+                PoToken.Tokens t = PoToken.get(sAppCtx, videoId);
+                visitorData = t.visitorData;
+                playerPot = t.playerPot;
+                streamPot = t.streamingPot;
+            } catch (Throwable e) {
+                android.util.Log.e("VotBridge", "pot unavailable for " + videoId + ": " + e);
+            }
+        }
+        JSONObject j = itPlayer(videoId, cl, visitorData, playerPot);
         JSONObject out = new JSONObject();
         out.put("videoId", videoId);
-        out.put("client", vr ? "ANDROID_VR" : "WEB");
+        out.put("client", cl.name);
         out.put("loggedIn", sCookieLoggedIn);
+        out.put("pot", streamPot != null && !streamPot.isEmpty());
         JSONObject ps = j.optJSONObject("playabilityStatus");
         String st = ps == null ? "" : ps.optString("status", "");
         out.put("status", st);
@@ -691,6 +902,10 @@ public final class Bridge {
                 long clen = f.optLong("contentLength", 0L);
                 if (clen <= 0) clen = qclen(url);
                 o.put("clen", clen);
+                if (playerPot != null && !playerPot.isEmpty()
+                        && !hasParam(url, "pot")) {
+                    url = url + "&pot=" + PoToken.urlEnc(playerPot);
+                }
                 o.put("url", url);
                 boolean n = hasParam(url, "n");
                 o.put("n", n);
@@ -704,6 +919,300 @@ public final class Bridge {
         out.put("sabr", sd != null && sd.has("serverAbrStreamingUrl"));
         return out;
     }
+
+    // /potest: does the poToken machinery work in this process at all?
+    private static JSONObject handlePotest(String videoId) {
+        JSONObject out = new JSONObject();
+        try {
+            long t0 = System.currentTimeMillis();
+            PoToken.Tokens t = PoToken.get(sAppCtx, videoId);
+            out.put("ok", 1);
+            out.put("ms", System.currentTimeMillis() - t0);
+            out.put("vdLen", t.visitorData.length());
+            out.put("vd", t.visitorData.length() > 24 ? t.visitorData.substring(0, 24) : t.visitorData);
+            out.put("playerLen", t.playerPot.length());
+            out.put("streamLen", t.streamingPot.length());
+            out.put("stream", t.streamingPot.length() > 16
+                    ? t.streamingPot.substring(0, 16) : t.streamingPot);
+        } catch (Throwable e) {
+            try {
+                out.put("ok", 0);
+                out.put("error", String.valueOf(e));
+            } catch (Throwable ignored) { }
+            android.util.Log.e("VotBridge", "potest failed: " + e);
+        }
+        return out;
+    }
+
+    // Pick the best audio format out of a WEB player response: opus 251 first,
+    // then m4a 140, then whatever audio track has a plain URL.
+    private static JSONObject pickAudio(JSONObject playerJson) {
+        JSONObject sd = playerJson.optJSONObject("streamingData");
+        JSONArray fmts = sd == null ? null : sd.optJSONArray("adaptiveFormats");
+        if (fmts == null) return null;
+        JSONObject best = null;
+        int bestScore = -1;
+        for (int i = 0; i < fmts.length(); i++) {
+            JSONObject f = fmts.optJSONObject(i);
+            if (f == null) continue;
+            String url = f.optString("url", "");
+            if (url.isEmpty()) continue;
+            int itag = f.optInt("itag", 0);
+            String mime = f.optString("mimeType", "");
+            boolean audio = mime.startsWith("audio/") || (itag >= 139 && itag <= 141)
+                    || itag == 249 || itag == 250 || itag == 251;
+            if (!audio) continue;
+            int score = itag == 251 ? 100 : itag == 140 ? 90 : itag == 250 ? 80
+                    : itag == 249 ? 70 : itag == 139 ? 60 : 10;
+            if (score > bestScore) {
+                bestScore = score;
+                best = f;
+            }
+        }
+        return best;
+    }
+
+    // /audiotest: pot -> player (web or vr) -> Range GET probe, all on the TV.
+    // Probes twice: with "&pot=<playerPot>" and without, so we can tell a
+    // gvs-gate 403 (needs pot) from a dead URL (403 both ways).
+    private static JSONObject handleAudioTest(String videoId, String client) throws Exception {
+        Client cl = clientByName(client);
+        if (cl == null) cl = C_VR;
+        JSONObject out = new JSONObject();
+        out.put("client", cl.name);
+        PoToken.Tokens t = PoToken.get(sAppCtx, videoId);
+        JSONObject j = itPlayer(videoId, cl, t.visitorData, t.playerPot);
+        JSONObject ps = j.optJSONObject("playabilityStatus");
+        out.put("status", ps == null ? "" : ps.optString("status", ""));
+        JSONObject sd = j.optJSONObject("streamingData");
+        out.put("sabr", sd != null && sd.has("serverAbrStreamingUrl"));
+        JSONArray fmts = sd == null ? null : sd.optJSONArray("adaptiveFormats");
+        out.put("nFormats", fmts == null ? 0 : fmts.length());
+        JSONObject f = pickAudio(j);
+        if (f == null) {
+            out.put("ok", 0);
+            out.put("error", "no audio format with a plain url");
+            out.put("reason", ps == null ? "" : ps.optString("reason", ""));
+            return out;
+        }
+        String bare = f.optString("url", "");
+        // Two different token kinds exist (like yt-dlp's web.player vs web.gvs):
+        // the content-bound one signs the player request, the visitor-bound one
+        // ("streaming" pot) is what googlevideo expects as the "pot" url param.
+        String withPlayer = t.playerPot.isEmpty() || hasParam(bare, "pot")
+                ? bare : bare + "&pot=" + PoToken.urlEnc(t.playerPot);
+        String withStream = t.streamingPot.isEmpty() || hasParam(bare, "pot")
+                ? bare : bare + "&pot=" + PoToken.urlEnc(t.streamingPot);
+        int itag = f.optInt("itag", 0);
+        String mime = f.optString("mimeType", "");
+        out.put("itag", itag);
+        out.put("mime", mime);
+        out.put("clen", qclen(bare));
+        out.put("n", hasParam(bare, "n"));
+        String ua = cl.uaOrWeb();
+        int[] playerRes = probeRange(withPlayer, ua);
+        String playerBody = sProbeErrBody;
+        int[] streamRes = probeRange(withStream, ua);
+        String streamBody = sProbeErrBody;
+        int[] bareRes = probeRange(bare, ua);
+        String bareBody = sProbeErrBody;
+        out.put("urlKeys", queryKeys(bare));
+        out.put("playerErr", playerBody);
+        out.put("streamErr", streamBody);
+        out.put("bareErr", bareBody);
+        out.put("playerPotCode", playerRes[0]);
+        out.put("playerPotBytes", playerRes[1]);
+        out.put("streamPotCode", streamRes[0]);
+        out.put("streamPotBytes", streamRes[1]);
+        out.put("noPotCode", bareRes[0]);
+        out.put("noPotBytes", bareRes[1]);
+        boolean ok = (playerRes[0] == 206 || playerRes[0] == 200) && playerRes[1] > 0;
+        boolean okStream = (streamRes[0] == 206 || streamRes[0] == 200) && streamRes[1] > 0;
+        out.put("ok", ok || okStream ? 1 : 0);
+        out.put("best", ok ? "player" : okStream ? "stream" : "");
+        android.util.Log.i("VotBridge", "audiotest " + videoId + " " + cl.name
+                + " itag=" + itag + " playerPot=" + playerRes[0] + "/" + playerRes[1]
+                + " streamPot=" + streamRes[0] + "/" + streamRes[1]
+                + " noPot=" + bareRes[0] + "/" + bareRes[1]);
+        return out;
+    }
+
+    // ?all=1: walk the client list once and report every result, so a single
+    // HTTP call tells us which client still hands out a downloadable url.
+    private static JSONObject handleAudioTestAll(String videoId) throws Exception {
+        PoToken.Tokens t = PoToken.get(sAppCtx, videoId);
+        JSONObject out = new JSONObject();
+        JSONArray arr = new JSONArray();
+        String best = "";
+        for (int i = 0; i < AUDIO_CLIENTS.length; i++) {
+            Client cl = AUDIO_CLIENTS[i];
+            JSONObject r;
+            try {
+                r = handleAudioTest(videoId, cl.name == null ? "" : cl.name);
+            } catch (Throwable e) {
+                r = new JSONObject();
+                r.put("client", cl.name);
+                r.put("ok", 0);
+                r.put("error", String.valueOf(e));
+            }
+            arr.put(r);
+            if (best.isEmpty() && r.optInt("ok", 0) == 1) {
+                best = cl.name + "/" + r.optString("best", "");
+            }
+        }
+        out.put("ok", best.isEmpty() ? 0 : 1);
+        out.put("best", best);
+        out.put("tests", arr);
+        return out;
+    }
+
+    // Range GET of 64 bytes; returns {httpCode, bytesRead}. For a 4xx we also
+    // scrape the first bytes of the error body into sProbeErrBody: googlevideo
+    // explains the reason there ("Sign in to confirm you're not a bot",
+    // "url expired", ...), which is the only way to tell the gates apart.
+    private static volatile String sProbeErrBody = "";
+    private static volatile String sLastProbeUrl = "";
+
+    private static int[] probeRange(String url, String ua) {
+        int code = -1;
+        int got = 0;
+        sProbeErrBody = "";
+        sLastProbeUrl = url;
+        try {
+            HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+            c.setConnectTimeout(8000);
+            c.setReadTimeout(15000);
+            c.setRequestProperty("User-Agent", ua);
+            c.setRequestProperty("Range", "bytes=0-63");
+            code = c.getResponseCode();
+            if (code < 400) {
+                byte[] b = new byte[64];
+                int n = c.getInputStream().read(b);
+                got = n > 0 ? n : 0;
+            } else {
+                sProbeErrBody = errBodySnippet(c);
+            }
+            try { c.disconnect(); } catch (Throwable ignored) { }
+        } catch (Throwable e) {
+            android.util.Log.i("VotBridge", "probe failed: " + e);
+        }
+        return new int[]{code, got};
+    }
+
+    // Up to 220 printable chars of an error body (html tags and newlines folded).
+    private static String errBodySnippet(HttpURLConnection c) {
+        try {
+            InputStream es = c.getErrorStream();
+            if (es == null) return "";
+            byte[] b = new byte[600];
+            int n = es.read(b);
+            es.close();
+            if (n <= 0) return "";
+            String s = new String(b, 0, n, StandardCharsets.UTF_8);
+            s = s.replaceAll("<[^>]*>", " ").replaceAll("\\s+", " ").trim();
+            return s.length() > 220 ? s.substring(0, 220) : s;
+        } catch (Throwable e) {
+            return "";
+        }
+    }
+
+    // Appends "&pot=" unless the url already carries one.
+    private static String withPotParam(String url, String tok) {
+        return tok == null || tok.isEmpty() || hasParam(url, "pot")
+                ? url : url + "&pot=" + PoToken.urlEnc(tok);
+    }
+
+    // Tries the pot variants on a googlevideo url and returns the first payload
+    // that actually downloads. For the non-WEB clients the fork never adds a
+    // token at all, so the bare url is tried first there.
+    private static byte[] downloadWithPot(String url, Client cl, PoToken.Tokens t) {
+        String ua = cl.uaOrWeb();
+        String[] variants = new String[]{withPotParam(url, t.playerPot),
+                withPotParam(url, t.streamingPot), url};
+        String[] names = new String[]{"player", "stream", "none"};
+        for (int i = 0; i < variants.length; i++) {
+            int[] p = probeRange(variants[i], ua);
+            android.util.Log.i("VotBridge", "download probe " + names[i] + " code=" + p[0]
+                    + " bytes=" + p[1]);
+            if (!((p[0] == 206 || p[0] == 200) && p[1] > 0)) continue;
+            try {
+                byte[] d = httpGetFull(variants[i], ua);
+                if (d != null && d.length > 0) {
+                    android.util.Log.i("VotBridge", "download ok via " + names[i]
+                            + " bytes=" + d.length);
+                    return d;
+                }
+            } catch (Throwable e) {
+                android.util.Log.e("VotBridge", "download " + names[i] + " failed: " + e);
+            }
+        }
+        return null;
+    }
+
+    // /audiosrc: no-URL path for status 6. Mint pot, ask the player (VR first:
+    // it still returns plain adaptiveFormats urls, WEB often returns SABR only)
+    // for the audio track, download it from googlevideo and push it to Yandex.
+    private static JSONObject handleAudioSource(JSONObject req) throws Exception {
+        String videoId = req.optString("videoId", "");
+        String videoUrl = req.optString("videoUrl", "");
+        String translationId = req.optString("translationId", "");
+        if (videoId.isEmpty()) throw new IOException("missing videoId");
+        if (translationId.isEmpty()) throw new IOException("missing translationId");
+        if (videoUrl.isEmpty()) videoUrl = "https://www.youtube.com/watch?v=" + videoId;
+
+        YandexSession se = YandexClient.ensureSession();
+        if (se == null) throw new IOException("no session");
+
+        PoToken.Tokens t = PoToken.get(sAppCtx, videoId);
+        String lastErr = "";
+        for (int ci = 0; ci < AUDIO_CLIENTS.length; ci++) {
+            Client cl = AUDIO_CLIENTS[ci];
+            String cv = cl.name;
+            try {
+                JSONObject j = itPlayer(videoId, cl, t.visitorData, t.playerPot);
+                JSONObject f = pickAudio(j);
+                if (f == null) {
+                    JSONObject ps = j.optJSONObject("playabilityStatus");
+                    lastErr = cv + ": no audio format (status="
+                            + (ps == null ? "?" : ps.optString("status", "?")) + ")";
+                    android.util.Log.i("VotBridge", "audiosrc " + lastErr);
+                    continue;
+                }
+                int itag = f.optInt("itag", 0);
+                String url = f.optString("url", "");
+                long clen = f.optLong("contentLength", 0L);
+                if (clen <= 0) clen = qclen(url);
+                android.util.Log.i("VotBridge", "audiosrc " + videoId + " " + cv
+                        + " itag=" + itag + " clen=" + clen);
+
+                byte[] data = downloadWithPot(url, cl, t);
+                if (data == null || data.length == 0) {
+                    lastErr = cv + ": download empty";
+                    continue;
+                }
+                android.util.Log.i("VotBridge", "audiosrc downloaded bytes=" + data.length
+                        + " via " + cv);
+
+                String fileId = YandexClient.buildFileId(itag, String.valueOf(data.length));
+                YandexClient.uploadStreamedAudio(se, videoUrl, translationId, fileId, data);
+                android.util.Log.i("VotBridge", "audiosrc uploaded bytes=" + data.length
+                        + " itag=" + itag + " tid=" + translationId);
+
+                JSONObject out = new JSONObject();
+                out.put("ok", 1);
+                out.put("client", cv);
+                out.put("itag", itag);
+                out.put("clen", clen);
+                out.put("size", data.length);
+                return out;
+            } catch (Throwable e) {
+                lastErr = cv + ": " + e;
+                android.util.Log.e("VotBridge", "audiosrc " + cv + " failed: " + e);
+            }
+        }
+        throw new IOException("no downloadable audio for " + videoId + " (" + lastErr + ")");
+    }
+
 
     // Port of dev_server/yt_lang.py: original language in ~0.5 s without the PC.
     private static String metaLocal(String videoId) {
@@ -910,6 +1419,19 @@ public final class Bridge {
                     } catch (Throwable ignore) { }
                     resp = capUpload(queryParam(path, "videoId"),
                             queryParam(path, "translationId"), itag).toString();
+                } else if (path.startsWith("/audiosrc")) {
+                    JSONObject req = body.length > 0 ? new JSONObject(new String(body, StandardCharsets.UTF_8)) : new JSONObject();
+                    resp = handleAudioSource(req).toString();
+                } else if (path.startsWith("/audiotest")) {
+                    String vid = queryParam(path, "videoId");
+                    if (vid.isEmpty()) throw new IOException("missing videoId");
+                    resp = "1".equals(queryParam(path, "all"))
+                            ? handleAudioTestAll(vid).toString()
+                            : handleAudioTest(vid, queryParam(path, "client")).toString();
+                } else if (path.startsWith("/potest")) {
+                    String vid = queryParam(path, "videoId");
+                    if (vid.isEmpty()) throw new IOException("missing videoId");
+                    resp = handlePotest(vid).toString();
                 } else if (path.startsWith("/audio")) {
                     JSONObject req = body.length > 0 ? new JSONObject(new String(body, StandardCharsets.UTF_8)) : new JSONObject();
                     resp = handleAudio(req).toString();
@@ -965,7 +1487,9 @@ public final class Bridge {
                 } else if (path.startsWith("/yt_url")) {
                     String vid = queryParam(path, "videoId");
                     if (vid.isEmpty()) throw new IOException("missing videoId");
-                    resp = handleYtUrl(vid, !"web".equalsIgnoreCase(queryParam(path, "client"))).toString();
+                    Client urlClient = clientByName(queryParam(path, "client"));
+                    resp = handleYtUrl(vid, urlClient == null ? C_VR : urlClient,
+                            "1".equals(queryParam(path, "pot"))).toString();
                 } else if (path.startsWith("/meta_local")) {
                     String vid = queryParam(path, "videoId");
                     if (vid.isEmpty()) throw new IOException("missing videoId");
