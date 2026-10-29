@@ -669,3 +669,275 @@ actionPanel.overlayPanelRenderer.content.overlayPanelItemListRenderer.items`),
 Логи ТВ только `adb -s 192.168.1.100:5555 logcat -d -s VotBridge`. Секреты
 `dev_server/yt_cookies.txt`, `vot_secret.json` — в `.gitignore`. Репо — sparse-checkout:
 новые файлы вне cone — `git add --sparse`.
+
+--- (���������� �� STATE.md 29.10, �� ��������� E2E) ---
+
+# STATE — TizenTubeCobalt + Yandex VOT (29.10.2026)
+
+## Цель
+Живые голоса Яндекса (VOT) в TizenTubeCobalt **serverless** (API Яндекса в рантайме + статика GitHub/CDN).
+Ветка `fix-vot-runtime-injection`, PR в `main` не делать. История — `STATE_ARCHIVE.md`.
+Тест: **`YNDX-00091` (magritte, Android 11, armeabi-v7a) `adb 192.168.1.100:5555`**, пакет
+`io.gh.reisxd.tizentube.cobalt` 2.0.3, activity `dev.cobalt.app.MainActivity`.
+**SberBox 192.168.1.198 НЕ ТРОГАТЬ** до отдельной команды.
+
+## ✅ Работает на ТВ (проверено ранее)
+- Standalone: overlay из assets → `/ping` 200 → `/config` (`audioMode:"local"`, `pcFill:false`).
+- Бутстрап `libchrobalt.so` = `v@b003` (перепрошивка не нужна).
+- E2E полного трека через мост: `V4WmgqIC5WI` 20.3 МБ / 4 чанка, `l9kzZXeO_bc` 63 МБ / 12 чанков
+  (49 с) → `status=2` → `status=1`/`5` → `play`; видео не ускорялось и не вставало на паузу.
+
+## 🔴 Активная проблема: InnerTube деградировал
+29.10 ~00:05 все клиенты (`VISIONOS/VR/ANDROID/IOS/WEB`) отвечают `LOGIN_REQUIRED`
+(«confirm you're not a bot») — мост не получает вообще никакого `videoplayback`-URL.
+Ранее (23:47) ANDROID был `OK`, но отдавал 403 на `Range`. Отсюда решение: **URL берём
+у самого плеера страницы** (`window.__votAudioSrc()` из `vot_net.js`, ловит XHR/fetch на
+`videoplayback`, чистит `range`/`rn`), мост пробует его первым (`srcUrl/srcItag/srcClen/srcUa`).
+
+## Сделано в этой итерации (не закоммичено)
+- **Прогресс по скачанным байтам**: `asrcProgress()` + `RangeProgress` в `rangeGet`;
+  `/audiosrc/status` отдаёт `phase/part/chunk/chunks/bytes/total/itag/client/ms`.
+  Страница рисует «ищу аудиопоток…» → «качаю N%» → «отправляю N%» (`SRC_POLL_MS=700`).
+- **Прогрев при старте моста**: тред `vot-warm` → `YandexClient.ensureSession()` +
+  `PoToken.get(ctx,"")`; в логе `warm session ms=`, `warm pot ms=`. Замер холодного старта
+  показал `session+pot = 7660 мс` (из них сам player pot 54 мс) — это и был «0 % на старте».
+- **Порядок клиентов** `VISIONOS, VR, ANDROID, IOS, WEB`, 403 не ретраится.
+- **Обход 403 через страницу** (Vox-подобный путь): если ни один клиент не дал скачиваемый URL,
+  мост публикует `state:"need_page"` + `url/clen/chunks`, страница сама тянет части своим XHR
+  (`Range: bytes=…`, `responseType=arraybuffer`) и постит их в `/audiosrc/raw?part=i`
+  (binарный body), а мост заливает в Яндекс (`uploadChunkAudio`). Лимит body поднят до 12 МБ
+  (было 4 МБ — 5.3 МБ часть молча терялась как «empty part»).
+- `javac` (--release 8) и `node --check` для `vot.js`/`vot_net.js` проходят.
+- **`visitorData` берём у страницы** (`window.__votVisitorData()` → `ytcfg.get('VISITOR_DATA')`),
+  мост минтит poToken под него (`PoToken.getWithVisitor`): гейт `LOGIN_REQUIRED` привязан
+  к visitor id, а у плеера он рабочий. Генератор BotGuard переиспользуется (только новый
+  streaming-токен, ~50 мс), так что прогрев не теряется.
+- **Важно:** плеер на ТВ теперь на **SABR** — его `videoplayback`-URL идёт без `itag`/`clen`
+  (`c=TVHTML5`, `rn=`), как обычный GET не годится. Поэтому ловля URL у страницы — резерв,
+  основной путь снова InnerTube, но с visitor id страницы.
+
+## 🔧 Найдено 29.10: сломанный парсер protobuf
+`Sabr.readVarint` был UMP-форматом (префиксные ведущие единицы), а им читали и
+**protobuf** внутри частей → все дампы/поля (clen, itag из MEDIA_HEADER, `sabr_error`)
+парсились мусором. Разделено: `umpVarint` (только заголовки частей) + `readVarint`
+(base-128, protobuf). Добавлен `Sabr.fieldInfo()` и маршрут `GET /sabrbody`
+(дамп тела плеера vs нашего + сравнение поля 5 ustreamer config).
+
+## 🔴 Найден баг чтения: `readN` не усекал буфер
+`Bridge.readN` возвращал массив целиком, даже если поток кончился раньше → ответ
+`sabr.malformed_config` (31 Б) выглядел как 768 КиБ нулей, и парсер отчитывался
+`parts={0=393201, 44=1}`. Теперь возвращается `Arrays.copyOf(b, off)`.
+Следствия: реальные длины ответов, `parts`, `media`, `err` в `/sabrmix`, `/sabrreplay`.
+Плюс `handleSabrReq` больше не теряет тело: пустой POST не перетирает последний
+непустой захват (было `pageLen=1725` → через секунду `pageLen=0`).
+
+## 🧪 Новый диагностический набор
+- `Sabr.cmp/f/fieldBytes/drop`, `mix` переписан (повторяемые поля: все вхождения
+  целевого поля из `other`, дубликаты в `base` выбрасываются).
+- `GET /sabrbody` → `ucfgVsBody = Sabr.cmp(поле5 тела плеера, ucfg из SABRCFG)`:
+  отвечает, совпадает ли конфиг в запросе плеера с тем, что отдал player-response.
+- `GET /sabrmix` — лестница от **тела плеера** (контроль) к минимуму:
+  `page`, `page+our4`, `page-sel140`, `+pa`, `+ctx`, `+abr`, `page-sel140-min`,
+  `our`, `our+page5`, `our+page5+ctx`; в строке `code/len/media/itag/parts/err/hex`.
+  Ключевые строки: первая, что даёт `itag=140` с медиа; и `our+page5` — если работает,
+  достаточно подставить поле 5 из тела плеера (наш энкодер в порядке).
+
+## ✅ 29.10 ~02:00 — ПРИЧИНА НАЙДЕНА: поле 5 (ustreamer config)
+Лестница `/sabrmix` на живом ролике (10 строк):
+
+| строка | media | itag | результат |
+|---|---|---|---|
+| `page` (тело плеера) | 262144 | 401 | ок |
+| `page+our4` | 262144 | 401 | ок (поле 4 безвредно) |
+| `page-sel140` | 263963 | 251 | ок (сервер дал 251, не 140) |
+| `page-sel140+pa` | 0 | — | `sabr.no_audio_selected action=3` |
+| `page-sel140-min` | 163102 | **140** | ок, segs=1 |
+| `our` | 0 | — | `sabr.malformed_config action=2 status=0 type=12` |
+| **`our+page5`** | **163102** | **140** | **ок, segs=1** |
+| `our+page5+ctx` | 163102 | 140 | ок |
+
+Вывод: наш энкодер тела **корректен**, ломает только **поле 5**. `ucfgVsBody`:
+`a=1247 b=1271 diffAt=709` — `videoPlaybackUstreamerConfig` из player-response
+(1271 Б) ≠ поле 5 из самого запроса плеера (1247 Б), расходятся с байта 709,
+наш вариант на 24 Б длиннее и хвост — ASCII (`iaumtNcbn…`). Поле 19 (ctx) не нужно.
+
+Реализовано: `sSabrUcfg` — байты поля 5 из захваченного тела плеера (`POST /sabrreq`);
+`sabrParamsFromCfg` и `/sabrtest?page=1` берут конфиг оттуда (`sabrUcfgB64()`),
+с фолбэком на `ucfg` из SABRCFG. Проверяется `/sabrtest?page=1`: ждём `ok=1`,
+`bytes≈3449447`, `segs>0`, `eot=1`.
+
+## ✅ 29.10 ~02:10 — SABR качает ЦЕЛИКОМ (поле 5 + wire-URL)
+`/sabrtest?page=1` на живом ролике: `ok:1, bytes=3470846, media=3470846, segs=22, posts=22,
+endMs=213090` (= полная длительность), `ms=3137`, `eot=0` (цикл выходит по
+`bytes>=expectedLength` до EOT-маркера — не ошибка), `err` пуст.
+Рабочая комбинация: **wire-URL из захваченного POST плеера** (`sSabrReq.url`, с
+`alr/cpn/cver/rn/spc`) + **поле 5 из того же тела** (`sSabrUcfg`, 1246 Б).
+`serverAbrStreamingUrl` из `SABRCFG` без pot → `403`.
+Строки лога: `sabr post N rn=N t=<ms> bytes=<n> segs=<n> resp=<n> parts={…}`.
+
+## 🔄 29.10 ~03:00 — page-SABR переведён на двухфазную схему (не проверено E2E)
+Почему: `clen` из конфига страницы **протухает** (одинаков для разных роликов),
+а Яндексу нужен **точный** размер в `fileId.fileSize` и точное число частей в финальной.
+Поэтому: `SabrStage` пишет трек в `getCacheDir()/vot_asrc.bin` (download, `est=16кБ/с×dur`),
+затем `uploadStaged()` льёт части по 5 295 308 Б из файла с реальным размером.
+`sp.expectedLength=0`, `sp.maxPosts=900` (стоп по `endTimeMs`/`eot`).
+`durSec` проброшен: `POST /audiosrc {duration}` → `audioSourceJob(..., durSec)`.
+Добавлен `mp4Head(file)` → в логе `boxes=ftyp/…,moov/…,moof/…` (нет `moov` = Яндекс
+скажет «нет речи», это и было в прогонах с `status 2 → 0`).
+`javac` OK, `node --check` OK; APK ещё не собран.
+
+## ✅/⚠️ 29.10 ~03:05 — E2E двухфазного page-SABR: загрузка прошла, перевод НЕ заиграл
+`9bZkp7q19f0` (status=6): `staged=4108040`, `boxes=ftyp/24,moov/608,sidx/344,moof/1816,mdat/159980,`
+**`ftyp/24,moov/608,sidx/344`** — init-сегмент повторился в середине файла! Загружено 1/1 частью,
+`done bytes=4108040 ms=7079`, Яндекс: `status=2` ×3 → `status=0` «Не удается перевести видео»,
+`lang8=ja` (на корейском треке) — т.е. звук декодировался, но это мусор.
+**Исправлено (не проверено):** `Sabr.Result.inited` — повторный init того же itag больше не
+пишется в sink (`dupInit=` в `summary()`); `initSegs`/`dupInitSegs` в логе. `mp4Head` до 24 боксов.
+Новый маршрут `GET /sabrfile` → `{size,boxes,b64}` — вытянуть стейдженный трек на ПК и проверить
+`ffprobe` (`C:\ffmpeg\bin\ffprobe.exe`), не гадая по статусам Яндекса.
+`javac` OK; APK НЕ собран.
+
+## 🔧 29.10 ~03:30 — цикл SABR не останавливался: перекачал трек 18×
+`YQHsXMglC9A` (dur 367 с): `inits=1 dupInit=899` (фикс init работает), но `posts=900` (= упёрлись
+в `maxPosts`), `bytes=109737678` при реальном треке **5 938 627 Б** — сервер после последнего
+сегмента **начинает стрим заново с нуля**, а `endTimeMs` растёт вместе с `playerTimeMs`,
+поэтому условие `playerTimeMs >= endTimeMs` недостижимо. Файл внутри валиден: `ffprobe` →
+`aac/44100/2ch/127626`, `duration=366.898` ✓, декодирование без ошибок; первые 5 938 627 Б —
+самостоятельный корректный трек. Заливка упала на `chunk 5/21` c `HTTP 504`.
+**Исправлено (не проверено):** `Params.expectedEndMs` + стоп, когда медиа покрывает длительность
+(`endTimeMs >= durSec*1000-500`); байтовый потолок `expectedLength = durSec*20000` (20 кБ/с);
+детектор повтора (новые байты без нового диапазона → стоп после 3 постов, `err=replay at …`).
+`/sabrfile?from=&max=` (по умолчанию 4 МБ, раньше OOM на 109 МБ).
+`javac` OK; APK НЕ собран.
+
+## 🔧 29.10 ~04:00 — page-sabr стартовал на конфиге от другого ролика
+На `iG9CE55wbtY` (1203 с, первый `status=6` на живом ролике с речью) прогон ушёл в
+`sabr.malformed_config action=2 status=0 type=6`, `bytes=0`, `posts=3`, `resp=31` ×3:
+`sSabrUcfg`/`sSabrReq` были от предыдущего ролика (`ustreamer=1912`, а рабочий 1246–1592),
+проверялся только `SABRCFG.vid`. Плюс `playerTimeMs >= endTimeMs` давало ложный стоп после 1 поста.
+**Исправлено (не проверено):**
+- `pageSabrUsable(videoId)` — пара «wire url + поле 5» должна принадлежать текущему ролику
+  (`SABRCFG.vid` и `sSabrUcfgVid`); неизвестный id допустим, чужой — нет.
+- `audioSourceJob` ждёт свежую пару до 12 с (`audiosrc page-sabr wait …` / `wait done ok=`),
+  при отсутствии — `lastErr="page-sabr: no fresh player config"`, без фолбэка на `SABRCFG.ucfg`.
+- `Sabr.run`: медиа поста копится в `Buf` и пишется в файл только если двигает таймлайн вперёд
+  (`postEndMs > prevEnd`), иначе `dropped=`; 2 повтора подряд → `replayStop=1`.
+- `SabrStage` чистит `vot_asrc.bin` в конструкторе (остатки прошлого прогона не считаются `staged`).
+- Страница: при `state=error` до 3 ретраев `POST /audiosrc` с паузой 5 с (`audiosrc ERR … retry N/3`).
+`javac` OK, `node --check` OK; APK НЕ собран.
+
+## 🔴 29.10 ~04:10 — page-SABR скачивал ровно 1 сегмент (163 КБ из 5.7 МБ)
+E2E на `8S0FDjFBj8o` (356 с) и контроль на `5MuIMqhT8DM` (1158 с): оба раза
+`posts=1 endMs=9985 staged=163015` при ожидании 5.7 МБ / 18.5 МБ. Файл формально валиден
+(`ffprobe`: `aac/44100/2ch/128k`, `duration=355.54/1158.28` — длительность берётся из контейнера),
+`ffmpeg -f null -` без ошибок, но медиа в нём ~10 с → Яндекс `status=0`.
+Причина: `P_FORMAT_INIT` (тип 42) несёт длительность **всего** трека (`m.num(3,0)`), и моё
+стоп-условие `endTimeMs >= expectedEndMs-500` срабатывало на первом же посте.
+**Исправлено (не проверено):** стоп считается по `prevEnd` — реально дописанному таймлайну
+(`prevEnd >= expectedEndMs-500`), `P_FORMAT_INIT` больше не влияет на стоп, а только пишется в
+`declMs=` для лога; `P_MEDIA_END` учитывает только не-init заголовки.
+Плюс `__votAudioSrc()` теперь отдаёт url только для текущего ролика (`vid`), страница не
+подсовывает мосту url возрастом 164 с от прошлого видео.
+Проверено, что ретраи страницы работают: `audiosrc ERR … retry 1/3`, `retry 2/3`.
+`javac` OK, `node --check` OK; APK НЕ собран.
+
+## 🔴 29.10 ~04:25 — SABR отказывает на автодуб-дорожке (`xtags=acont=dubbed-auto:lang=ar`)
+Прогон на трёх свежих `status=6` (`hPV-Ql_KGzM` 4199 с, `DLP0OqKhfPk` 1539 с, `rtrdroYs67A` 4014 с):
+`page-sabr start … ustreamer=9032 urlLen=966` → `posts=3 bytes=0 segs=0 resp=170 parts={35=1,46=1,47=1}`
+→ `err=no progress at 0ms` (новый guard отработал: 3 поста без байт, а не 900 постов / 109 МБ).
+Ответ сервера — только `NEXT_REQUEST_POLICY` (35) + 46/47, ни `MEDIA`, ни ошибки. InnerTube
+(ANDROID) на том же ролике отдаёт URL, но `403`, page-relay тоже `403 len=0/5295308`.
+**Причина (гипотеза, от tester):** во всех захваченных URL `xtags=acont%3Ddubbed-auto%3Alang%3Dar` —
+плеер ТВ выбрал автодублированную арабскую дорожку, и SABR её не отдаёт.
+**Изменено (не проверено):**
+- `sabrParamsFromCfg`: если `xtags` содержит `dubbed` → `xtags=""`, `lmt=0` (просим оригинальную
+  дорожку; Яндексу нужен оригинальный голос).
+- `/sabrtest?page=1&xtags=none|<value>` — A/B-переключатель трека (+ `xtags` в ответе).
+- Логи: `sabr req itag= xt= lmt= seq=` (1-й пост) и `hex=` первых 240 Б «пустого» ответа;
+  в `page-sabr start` добавлены `xt=` (что просим) и `cfgXt=` (что выбрал плеер).
+`javac` OK; APK НЕ собран.
+
+## 🔬 29.10 ~04:35 — разобран пустой ответ: сервер требует reload player-response
+Расшифрован `hex=` (170 Б, одинаков на всех роликах): три части в порядке **47 → 46 → 35**.
+- `47 PLAYBACK_START_POLICY` (10 Б): `0a0310b009120310f02e` (1200 / 6128).
+- `46 RELOAD_PLAYER_RESPONSE` (138 Б): `field1.field1.token` = base64-proto из 132 симв.;
+  внутри — `videoId`, постоянный токен `ywVb/oOP23MC8FMB18g92ntL55QdWA==` и 37 Б, меняющихся
+  на каждом посте. По протоколу (комментарий в форке, `SabrStream.java:417-429`) клиент должен
+  перезапросить `/youtubei/v1/player` с `playbackContext.reloadPlaybackContext.reloadPlaybackParams.token`.
+  Форк этого не делает вообще (создаёт `RefreshPlayerResponseSabrPart` и выбрасывает).
+- `35 NEXT_REQUEST_POLICY` (15 Б): `08987510987518e0d40320d00f3a00` — тайминги + **пустой
+  `playback_cookie`**: сессию он нашей не считает.
+Вывод: дело не в xtags/dubbed (A/B `xtags=none` дал тот же ответ) и не в URL. Наше тело не
+похоже на тело плеера: у плеера есть `streamer_context` с `po_token`/`sabr_contexts`/capabilities
+и `buffered_ranges`, у нас — только `client_info`+`po_token`.
+
+**Сделано (не проверено):** `Sabr.replayBody(tpl, playerTimeMs)` + `Params.bodyTpl` — тело плеера
+переигрывается байт-в-байт, правится только `client_abr_state.player_time_ms` (1.28) и поле 4.
+Маршрут `GET /sabrtest?raw=1` берёт тело из последнего `POST /sabrreq` и отдаёт в ответе
+`tplLen/ourLen/tplFields/ourFields/tplSc/ourSc` — прямое сравнение тел.
+`javac` OK; APK НЕ собран.
+
+## ✅ 29.10 ~04:45 — РАБОТАЕТ: replay тела плеера без buffered_ranges даёт медиа
+`GET /sabrtest?page=1&raw=2` на `DLP0OqKhfPk` (1539 с): **`ok=1, bytes=7 488 968, media=20 157 709,
+segs=54, posts=60, endMs=526541, firstMs=433`**, `parts={35,52,20=158,53,21=707,22=158,47}`
+(т.е. реальные `MEDIA_HEADER`/`MEDIA`/`MEDIA_END`). `raw=1` (тело как есть, с полем 3) — **0 байт**,
+`resp=187`, `parts={35,52,53,47}`. Итог: тело плеера + **вырезанные `buffered_ranges`** = рабочий
+запрос; именно поле 3 сообщало серверу «эти диапазоны у меня уже есть».
+`raw=2` воспроизводится (повтор через 30 с дал те же цифры).
+Стоп на 526 с / 7.5 МБ: посты шли каждые ~90 мс, игнорируя `NEXT_REQUEST_POLICY` — сервер начал
+отдавать повторы (`err=replay at 526541ms`, `resp=183` policy-only). Сервер присылает в части 35
+тайминги `d=` (мс) — их надо соблюдать.
+
+**Сделано (не проверено E2E):**
+- `Sabr.replayBody(tpl, time, stripBuffered)` + `Params.bodyTpl/bodyStrip`; в replay-режиме
+  `itag` не фильтруется (берём тот, что даёт сервер), `stuckLimit=20`, `replayLimit=4`.
+- `Sabr.parse`: часть 35 разбирается в `nextDelayMs`/`lastDelayMs`, логи `d=`; `run()` ждёт
+  `min(d, 5 с)` после пустого поста и повторяет (пейсинг по требованию сервера).
+- **Production**: `audioSourceJob` (page-sabr) теперь берёт `capturedSabrBody(videoId)` →
+  `bodyTpl` + `bodyStrip=true`, `itag=0`, `expectedLength=0`; в логе `tpl=/strip=`.
+- `capturedSabrBody()` — тело только для текущего ролика (иначе null).
+`javac` OK; APK НЕ собран.
+
+## 🔧 29.10 ~05:05 — init-сегмент берём у плеера (MSE), флаг `aac`
+`SabrStage` теперь пишется с init-сегментом: страница на **первом `appendBuffer`
+аудио-SourceBuffer** постит эти байты в `POST /mseinit?vid=&mime=` (raw body), мост хранит
+`sMseInit/sMseInitVid/sMseInitMime`, в `audioSourceJob` перед `Sabr.run` вызывается
+`stage.init(mseInitFor(videoId))` (init только для текущего ролика). В логе `mseinit len=… head=…`
+и в `page-sabr start` добавлены `init=`/`mime=`.
+- Причина: SABR отдаёт сессии, которая уже играла, **только media-фрагменты** (`moov`/WebM header
+  ушёл плееру раньше) → файл не контейнер (`inits=0`), Яндекс `status=0` «Видео слишком длинное».
+- A/B-флаг AAC: `POST /config {"aac":true}` → `/config.aac` → страница при `CAP_ON||AAC_ON`
+  включает `patchCodecs` (отказ `audio/webm|opus`). Цель — itag 140 вместо 251.
+`javac` OK, `node --check` OK; APK не собран.
+
+## ✅ 29.10 ~05:20 — AAC-путь даёт валидный mp4: itag 140, 0 ошибок декодирования
+A/B на `hPV-Ql_KGzM` (4199 с) с `POST /config {"aac":true}`: `mseinit len=723
+mime=audio/mp4; codecs="mp4a.40.2" head=0000001866747970` → SABR отдал **itag 140**,
+стейдж **86 040 500 Б** (`boxes=ftyp/24,moov/699,moof/1816,mdat/160068,…`), `ffprobe`:
+`aac/44100/2ch/duration=4198.655`, `ffmpeg -f null -`: **пусто** (ошибок нет).
+Контроль без флага (`DLP0OqKhfPk`): `mseinit len=266 mime=audio/webm; codecs="opus"`, itag 251,
+matroska/webm 29 737 993 Б, 25 000 ошибок `non monotonically increasing dts` → opus-склейка
+не годится (сервер отдаёт перекрывающиеся фрагменты в другом порядке).
+Итог: **init из MSE обязателен** (без него контейнера нет), **AAC обязателен** (opus-склейка битая).
+`aac` теперь по умолчанию `true`; потолок байт поднят до `dur*24кБ` (itag 140 ≈ 20.5 кБ/с).
+`javac` OK.
+
+## Следующий шаг
+1. Собрать APK, на свежем ролике (лучше с речью: TED/лекция) получить `status=6`.
+2. Ждём `audiosrc page-sabr … staged=` ≈ `dur*16кБ` (не ×18), `audiosrc done client=page-sabr`.
+   `ffprobe -v error -show_format -show_streams` + `ffmpeg -v error -i f.m4a -f null -`
+   (ошибки декодирования = склейка SABR неверна). Ждём `aac`, 44.1/48 кГц, duration ≈ длительности ролика.
+3. Если файл валиден и без ошибок декодирования, а Яндекс всё равно `status=0` — сравнить с эталоном:
+   скачать тот же трек itag=140 через `rangeGet` (пока InnerTube отдаёт URL) и сравнить размер/сигнатуру,
+   а также сверить `fileId.fileSize`/`parts` с тем, что отправляет браузерное расширение.
+4. Ревью `reviewer` и коммит в `fix-vot-runtime-injection`.
+
+## Грабли
+- `am force-stop`/`kill` запрещены; install APK убивает процесс.
+- `am start … -f 0x10008000` при живом приложении убивает surface → чёрный экран (только холодный старт).
+- `adb forward tcp:18114 tcp:8013`; старый `18014` принадлежит `.198` — не трогать.
+- Логи только `adb logcat -v time -s VotBridge:V`.
+- `Bridge.java` с BOM (`utf-8-sig`); APK `tt203_bridge.apk`; `assets/vot.js` = `vot_ui.js + vot.js + vot_net.js`.
+
+## Состояние гита
+`5a03c018ba4` (serverless) + текущие правки (прогресс, warmUp, need_page, /audiosrc/raw) — не закоммичено.

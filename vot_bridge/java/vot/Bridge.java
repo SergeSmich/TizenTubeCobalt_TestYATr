@@ -6,10 +6,13 @@ import android.database.sqlite.SQLiteDatabase;
 import android.media.MediaPlayer;
 import android.os.Handler;
 import android.os.HandlerThread;
+import android.util.Base64;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
 
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
@@ -26,6 +29,7 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -111,8 +115,19 @@ public final class Bridge {
     //             "capture" (harvest the player's own MSE audio — default: it is
     //             the only path Google does not gate)
     // pcFill    : may the overlay ask the PC dev server for the source audio
-    private static volatile String sAudioMode = "capture";
+    // "local": the bridge pulls the audio-only track from googlevideo itself and
+    // pushes it to Yandex (full length, background, player untouched). This is
+    // the standalone path; "capture" (MSE tee) stays as a fallback only.
+    private static volatile String sAudioMode = "local";
     private static volatile boolean sPcFill = false;
+    // A/B: make the player pick AAC (itag 140) instead of opus. SABR replay
+    // streams whatever format the player selected — with opus the staged track
+    // is webm/opus and Yandex refuses it. Verified on the TV: default (opus)
+    // → itag 251, matroska/opus, 25 000 "non monotonically increasing dts"
+    // errors; aac → itag 140, mp4/aac 44.1 kHz, zero decode errors. So AAC is
+    // the default: the player can play mp4a in MSE (it asked and appended it),
+    // and the whole local-audio path needs it.
+    private static volatile boolean sAac = true;
 
     // ---- TV-side paths (needed to read Cobalt's cookie store) ----
     private static volatile String sDataDir = "";
@@ -143,7 +158,37 @@ public final class Bridge {
         Thread f = new Thread(Bridge::overlayFetcher, "vot-overlay-fetch");
         f.setDaemon(true);
         f.start();
+        Thread w = new Thread(Bridge::warmUp, "vot-warm");
+        w.setDaemon(true);
+        w.start();
         android.util.Log.i("VotBridge", "bridge starting on 127.0.0.1:8013");
+    }
+
+    // Cold-start warm-up. Both the Yandex handshake and the BotGuard generator
+    // cost seconds on this TV, and both used to be paid on the critical path of
+    // the first audio upload: measured 7.7 s between "audiosrc start" and the
+    // first player request, which the user sees as "download stuck at 0 %".
+    // Doing it at bridge start moves that cost into the app launch, where nobody
+    // is waiting for it. Tokens are cached for hours, so later videos are free.
+    private static void warmUp() {
+        long t0 = System.currentTimeMillis();
+        try {
+            YandexSession se = YandexClient.ensureSession();
+            android.util.Log.i("VotBridge", "warm session ms="
+                    + (System.currentTimeMillis() - t0) + " ok=" + (se != null ? 1 : 0));
+        } catch (Throwable e) {
+            android.util.Log.w("VotBridge", "warm session failed: " + e);
+        }
+        long t1 = System.currentTimeMillis();
+        try {
+            // No videoId: this only spins the generator up and mints the
+            // visitor-bound streaming token, which is the expensive part.
+            PoToken.get(sAppCtx, "");
+            android.util.Log.i("VotBridge", "warm pot ms="
+                    + (System.currentTimeMillis() - t1));
+        } catch (Throwable e) {
+            android.util.Log.w("VotBridge", "warm pot failed: " + e);
+        }
     }
 
     // The overlay compiled into the APK: works offline, on a fresh install, with
@@ -482,6 +527,14 @@ public final class Bridge {
     private static final String ANDROID_VERSION = "20.10.38";
     private static final String ANDROID_UA =
             "com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip";
+    // The TV page plays as TVHTML5 (its googlevideo urls carry "c=TVHTML5") and
+    // it is the one client that is not sent to the "confirm you're not a bot"
+    // gate on this device, so the bridge asks InnerTube as TVHTML5 too.
+    private static final String TV_VERSION = "7.20250312.16.00";
+    private static final String TV_UA =
+            "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version";
+    private static final String TV_EMB_VERSION = "2.0";
+    private static final String EMBED_URL = "https://www.youtube.com/";
 
     private static final class MetaEntry {
         final long at;
@@ -632,9 +685,16 @@ public final class Bridge {
         final String osName;
         final String osVersion;
         final int sdk;
+        final String embedUrl;   // embedded players only: thirdParty.embedUrl
 
         Client(String name, String version, String num, String ua, boolean potInBody,
                String make, String model, String osName, String osVersion, int sdk) {
+            this(name, version, num, ua, potInBody, make, model, osName, osVersion, sdk, null);
+        }
+
+        Client(String name, String version, String num, String ua, boolean potInBody,
+               String make, String model, String osName, String osVersion, int sdk,
+               String embedUrl) {
             this.name = name;
             this.version = version;
             this.num = num;
@@ -645,6 +705,7 @@ public final class Bridge {
             this.osName = osName;
             this.osVersion = osVersion;
             this.sdk = sdk;
+            this.embedUrl = embedUrl;
         }
 
         String uaOrWeb() {
@@ -662,11 +723,20 @@ public final class Bridge {
             false, "Apple", "iPhone16,2", "iPhone", "18.3.2.18.1", 0);
     private static final Client C_ANDROID = new Client("ANDROID", ANDROID_VERSION, "3", ANDROID_UA,
             false, "Google", "Pixel 7", "Android", "11", 30);
+    private static final Client C_TV = new Client("TVHTML5", TV_VERSION, "7", TV_UA,
+            false, "Google", null, null, null, 0, EMBED_URL);
+    // num 85; without thirdParty.embedUrl this client answers UNPLAYABLE.
+    private static final Client C_TV_EMB = new Client("TVHTML5_SIMPLY_EMBEDDED_PLAYER",
+            TV_EMB_VERSION, "85", WEB_UA, false, null, null, null, null, 0, EMBED_URL);
 
-    // Order matters: ANDROID_VR still hands out plain adaptiveFormats urls with a
-    // contentLength and no "n", the visionOS/iOS ones are the fork's favourites.
+    // Order matters and is measured, not guessed. VISIONOS goes first: on the TV
+    // its audio url serves Range 206 for every chunk, while ANDROID_VR and
+    // ANDROID answer 403 on the actual range GET even though the bare probe
+    // (`Range: bytes=0-63`) succeeded — each failing client costs ~12 s of
+    // retries, and VISIONOS never failed. IOS returns SABR-only formats and WEB
+    // answers UNPLAYABLE without login, so they stay last.
     private static final Client[] AUDIO_CLIENTS =
-            new Client[]{C_VR, C_VISIONOS, C_IOS, C_ANDROID, C_WEB};
+            new Client[]{C_TV, C_TV_EMB, C_VISIONOS, C_VR, C_ANDROID, C_IOS, C_WEB};
 
     private static Client clientByName(String s) {
         if (s == null) return null;
@@ -674,6 +744,9 @@ public final class Bridge {
         if (s.equalsIgnoreCase("vr") || s.equalsIgnoreCase("android_vr")) return C_VR;
         if (s.equalsIgnoreCase("visionos") || s.equalsIgnoreCase("vision")) return C_VISIONOS;
         if (s.equalsIgnoreCase("ios")) return C_IOS;
+        if (s.equalsIgnoreCase("tv") || s.equalsIgnoreCase("tvhtml5")) return C_TV;
+        if (s.equalsIgnoreCase("tvemb") || s.equalsIgnoreCase("embedded")
+                || s.equalsIgnoreCase("tvhtml5_simply_embedded_player")) return C_TV_EMB;
         if (s.equalsIgnoreCase("android") || s.equalsIgnoreCase("reel")
                 || s.equalsIgnoreCase("android_reel")) return C_ANDROID;
         return null;
@@ -715,6 +788,14 @@ public final class Bridge {
         client.put("utcOffsetMinutes", 0);
         ctx.put("client", client);
         body.put("context", ctx);
+        if (cl.embedUrl != null) {
+            // Embedded players are only served when the request says where they
+            // are embedded; without it TVHTML5_SIMPLY_EMBEDDED_PLAYER is
+            // UNPLAYABLE and TVHTML5 falls back to SABR-only.
+            JSONObject third = new JSONObject();
+            third.put("embedUrl", cl.embedUrl);
+            body.put("thirdParty", third);
+        }
         body.put("videoId", videoId);
         body.put("contentCheckOk", true);
         body.put("racyCheckOk", true);
@@ -962,14 +1043,1276 @@ public final class Bridge {
             boolean audio = mime.startsWith("audio/") || (itag >= 139 && itag <= 141)
                     || itag == 249 || itag == 250 || itag == 251;
             if (!audio) continue;
-            int score = itag == 251 ? 100 : itag == 140 ? 90 : itag == 250 ? 80
-                    : itag == 249 ? 70 : itag == 139 ? 60 : 10;
+            // 140 (AAC in mp4) first: it is the format Yandex is already proven
+            // to accept (the whole earlier E2E ran on itag 140), Opus is fallback.
+            int score = itag == 140 ? 100 : itag == 139 ? 90 : itag == 251 ? 60
+                    : itag == 250 ? 50 : itag == 249 ? 40 : 10;
             if (score > bestScore) {
                 bestScore = score;
                 best = f;
             }
         }
         return best;
+    }
+
+    // ------------------------------------------------------------ SABR path
+    // TVHTML5 is the only client the "confirm you're not a bot" gate does not
+    // stop, but it never returns a plain url: only serverAbrStreamingUrl. The
+    // format list is still there (itag/lmt/contentLength), which is everything
+    // Sabr needs to pull the same audio the TV player is pulling.
+    private static final class SabrPick {
+        int itag;
+        long lmt;
+        String xtags = "";
+        String trackId = "";
+        long clen;
+        long bitrate;
+        String mime = "";
+    }
+
+    private static SabrPick pickSabrAudio(JSONObject playerJson) {
+        JSONObject sd = playerJson.optJSONObject("streamingData");
+        if (sd == null || sd.optString("serverAbrStreamingUrl", "").isEmpty()) return null;
+        JSONArray fmts = sd.optJSONArray("adaptiveFormats");
+        if (fmts == null) return null;
+        SabrPick best = null;
+        int bestScore = -1;
+        for (int i = 0; i < fmts.length(); i++) {
+            JSONObject f = fmts.optJSONObject(i);
+            if (f == null) continue;
+            int itag = f.optInt("itag", 0);
+            String mime = f.optString("mimeType", "");
+            boolean audio = mime.startsWith("audio/") || (itag >= 139 && itag <= 141)
+                    || itag == 249 || itag == 250 || itag == 251;
+            if (!audio) continue;
+            int score = itag == 140 ? 100 : itag == 251 ? 80 : itag == 250 ? 70
+                    : itag == 249 ? 60 : itag == 139 ? 50 : 10;
+            if (score <= bestScore) continue;
+            SabrPick p = new SabrPick();
+            p.itag = itag;
+            p.lmt = numField(f, "lastModified");
+            p.clen = numField(f, "contentLength");
+            p.bitrate = numField(f, "bitrate");
+            p.mime = mime;
+            p.xtags = f.optString("xtags", "");
+            JSONObject at = f.optJSONObject("audioTrack");
+            if (at != null) p.trackId = at.optString("id", "");
+            best = p;
+            bestScore = score;
+        }
+        return best;
+    }
+
+    // InnerTube writes numbers as strings ("5661002", "1759..."), so parse the
+    // string first and only fall back to optLong.
+    private static long numField(JSONObject o, String k) {
+        String v = o.optString(k, "");
+        if (!v.isEmpty()) {
+            try {
+                return Long.parseLong(v.trim());
+            } catch (Throwable ignore) { }
+        }
+        return o.optLong(k, 0L);
+    }
+
+    private static String ustreamerConfig(JSONObject playerJson) {
+        JSONObject pc = playerJson.optJSONObject("playerConfig");
+        JSONObject mc = pc == null ? null : pc.optJSONObject("mediaCommonConfig");
+        JSONObject ur = mc == null ? null : mc.optJSONObject("mediaUstreamerRequestConfig");
+        return ur == null ? "" : ur.optString("videoPlaybackUstreamerConfig", "");
+    }
+
+    private static Sabr.Params sabrParams(String videoId, JSONObject playerJson,
+                                          PoToken.Tokens t, SabrPick f) {
+        Sabr.Params p = new Sabr.Params();
+        JSONObject sd = playerJson.optJSONObject("streamingData");
+        p.videoId = videoId;
+        p.url = sd == null ? "" : sd.optString("serverAbrStreamingUrl", "");
+        p.ustreamerConfig = ustreamerConfig(playerJson);
+        p.poToken = t == null ? "" : t.playerPot;
+        p.visitorData = t == null ? "" : t.visitorData;
+        p.clientName = 7;                       // TVHTML5
+        p.clientVersion = TV_VERSION;
+        p.ua = TV_UA;
+        p.itag = f == null ? 0 : f.itag;
+        p.lmt = f == null ? 0L : f.lmt;
+        p.xtags = f == null ? "" : f.xtags;
+        p.audioTrackId = f == null ? "" : f.trackId;
+        p.bandwidth = f == null || f.bitrate <= 0 ? 128000L : f.bitrate;
+        p.expectedLength = f == null ? 0L : f.clen;
+        return p;
+    }
+
+    // Sequential SABR bytes go straight into Yandex in 5 295 308-byte parts,
+    // same part semantics as sendTrack: middle parts carry 0, the last carries
+    // the number of parts.
+    private static final class SabrUpload implements Sabr.Sink {
+        private final int gen;
+        private final String videoId;
+        private final String videoUrl;
+        private final String tid;
+        private final String fileId;
+        private final int itag;
+        private final long clen;   // progress-bar hint only, may be 0
+        private final long t0;
+        private final byte[] buf = new byte[AUDIO_CHUNK_SIZE];
+        private int fill;
+        private int part;
+        private long sent;
+
+        SabrUpload(int gen, String videoId, String videoUrl, String tid, String fileId,
+                   int itag, long clen, int totalIgnored, long t0) {
+            this.gen = gen;
+            this.videoId = videoId;
+            this.videoUrl = videoUrl;
+            this.tid = tid;
+            this.fileId = fileId;
+            this.itag = itag;
+            this.clen = clen;
+            this.t0 = t0;
+        }
+
+        public void onBytes(byte[] d, int off, int len) throws Exception {
+            while (len > 0) {
+                // A full buffer is flushed only once more bytes arrive: the very
+                // last chunk of the track is the one that must carry the part
+                // count, and that count is its own index + 1. Flushing eagerly
+                // makes the final part indistinguishable from a middle one.
+                if (fill >= AUDIO_CHUNK_SIZE) flush(false);
+                int n = Math.min(len, AUDIO_CHUNK_SIZE - fill);
+                System.arraycopy(d, off, buf, fill, n);
+                fill += n;
+                off += n;
+                len -= n;
+            }
+            asrcProgress(videoId, "download", part + 1, chunksHint(), sent + fill, clen, itag,
+                    "sabr", System.currentTimeMillis() - t0);
+        }
+
+        // Rough part count for the progress bar only (the real count is known
+        // once the track ends). 0 means "unknown" — the page then shows bytes.
+        private int chunksHint() {
+            if (clen <= 0) return 0;
+            return (int) Math.max(1L, (clen + AUDIO_CHUNK_SIZE - 1) / AUDIO_CHUNK_SIZE);
+        }
+
+        private void flush(boolean last) throws Exception {
+            if (fill <= 0) return;
+            if (gen != sAsrcGen) throw new IOException("cancelled");
+            byte[] data = Arrays.copyOf(buf, fill);
+            boolean single = last && part == 0;
+            int parts = last ? part + 1 : 0;   // middle parts carry 0, the last one the total
+            asrcProgress(videoId, "upload", part + 1, chunksHint(), sent, clen, itag, "sabr",
+                    System.currentTimeMillis() - t0);
+            YandexSession se = YandexClient.ensureSession();
+            if (se == null) throw new IOException("no session");
+            if (single) {
+                YandexClient.uploadSingleAudio(se, videoUrl, tid, fileId, data);
+            } else {
+                YandexClient.uploadChunkAudio(se, videoUrl, tid, fileId, part, parts, data);
+            }
+            part++;
+            sent += data.length;
+            fill = 0;
+            android.util.Log.i("VotBridge", "audiosrc chunk " + part + "/"
+                    + (last ? part : 0) + " bytes=" + data.length + " sent=" + sent
+                    + " parts=" + parts + " at=" + (System.currentTimeMillis() - t0));
+        }
+
+        long finish() throws Exception {
+            flush(true);
+            return sent;
+        }
+
+        int partsUploaded() {
+            return part;
+        }
+    }
+
+    // SABR gives no trustworthy length up front (contentLength in the page
+    // config goes stale between videos), while Yandex wants the exact file size
+    // in fileId and the exact part count on the last part. So the track is
+    // staged to a cache file first — the size is then known for certain — and
+    // uploaded in AUDIO_CHUNK_SIZE parts afterwards. Only one part is in memory
+    // at a time, so a one-hour track costs 5 MB of heap, not 60.
+    private static final class SabrStage implements Sabr.Sink {
+        private final String videoId;
+        private final int itag;
+        private final long est;
+        private final long t0;
+        private final File file = new File(sAppCtx.getCacheDir(), "vot_asrc.bin");
+        private OutputStream os;
+        private long bytes;
+
+        SabrStage(String videoId, int itag, long est, long t0) {
+            this.videoId = videoId;
+            this.itag = itag;
+            this.est = est;
+            this.t0 = t0;
+            // Start from an empty file: a failed run must not leave the previous
+            // track behind for /sabrfile to report as "staged".
+            try { if (file.exists()) file.delete(); } catch (Throwable ignore) { }
+        }
+
+        // A SABR stream of a session that already played the track contains only
+        // media fragments — the init segment (ftyp/moov or the WebM header) went
+        // to the player long ago. Without it the file is not a container at all
+        // (ffprobe: "moov atom not found"; ffmpeg: "Unknown input format") and
+        // Yandex answers "Видео слишком длинное" instead of translating. The
+        // player appends that very init to its audio SourceBuffer, so the page
+        // hands it to us (POST /mseinit) and it is written first.
+        SabrStage init(byte[] b) throws IOException {
+            if (b == null || b.length == 0) return this;
+            // Not swallowed: if the init segment cannot be written the staged
+            // file has no container header at all, and Yandex would answer with
+            // an obscure "video too long" instead of a usable error.
+            try {
+                if (os == null) os = new BufferedOutputStream(new FileOutputStream(file), 65536);
+                os.write(b, 0, b.length);
+                bytes += b.length;
+            } catch (IOException e) {
+                throw new IOException("stage init " + b.length + "B: " + e, e);
+            }
+            return this;
+        }
+
+        File file() { return file; }
+
+        public void onBytes(byte[] d, int off, int len) throws Exception {
+            if (os == null) {
+                os = new BufferedOutputStream(new FileOutputStream(file), 65536);
+            }
+            os.write(d, off, len);
+            bytes += len;
+            asrcProgress(videoId, "download", 0, 0, bytes, est, itag, "sabr",
+                    System.currentTimeMillis() - t0);
+        }
+
+        long close() {
+            long n = bytes;
+            if (os != null) {
+                try { os.close(); } catch (Throwable ignored) { }
+                os = null;
+            }
+            return n;
+        }
+    }
+
+    // Second phase of the staged path: the parts leave the cache file with the
+    // real total size declared, so Yandex sees the same numbers the browser
+    // extension sends.
+    private static long uploadStaged(int gen, String videoId, String videoUrl, String tid,
+                                     int itag, long size, long t0) throws Exception {
+        File f = new File(sAppCtx.getCacheDir(), "vot_asrc.bin");
+        int total = (int) Math.max(1L, (size + AUDIO_CHUNK_SIZE - 1) / AUDIO_CHUNK_SIZE);
+        String fileId = YandexClient.buildFileId(itag, String.valueOf(size));
+        long sent = 0;
+        InputStream in = new BufferedInputStream(new FileInputStream(f), 65536);
+        try {
+            for (int i = 0; i < total; i++) {
+                if (gen != sAsrcGen) throw new IOException("cancelled");
+                int want = (int) Math.min(AUDIO_CHUNK_SIZE, size - sent);
+                byte[] chunk = new byte[want];
+                int off = 0;
+                while (off < want) {
+                    int r = in.read(chunk, off, want - off);
+                    if (r <= 0) break;
+                    off += r;
+                }
+                if (off <= 0) throw new IOException("staged file short at part " + i);
+                if (off < want) chunk = Arrays.copyOf(chunk, off);
+                YandexSession se = YandexClient.ensureSession();
+                if (se == null) throw new IOException("no session");
+                int parts = total <= 1 ? 0 : (i == total - 1 ? total : 0);
+                asrcProgress(videoId, "upload", i + 1, total, sent, size, itag, "sabr",
+                        System.currentTimeMillis() - t0);
+                if (total <= 1) {
+                    YandexClient.uploadSingleAudio(se, videoUrl, tid, fileId, chunk);
+                } else {
+                    YandexClient.uploadChunkAudio(se, videoUrl, tid, fileId, i, parts, chunk);
+                }
+                sent += chunk.length;
+                android.util.Log.i("VotBridge", "audiosrc chunk " + (i + 1) + "/" + total
+                        + " bytes=" + chunk.length + " sent=" + sent + " parts=" + parts
+                        + " at=" + (System.currentTimeMillis() - t0));
+                asrcProgress(videoId, "upload", i + 1, total, sent, size, itag, "sabr",
+                        System.currentTimeMillis() - t0);
+            }
+        } finally {
+            try { in.close(); } catch (Throwable ignored) { }
+        }
+        return sent;
+    }
+
+    // GET /sabrfile -> the track the last page-SABR run staged, base64, so it can
+    // be checked on the PC with ffprobe instead of guessing from Yandex statuses.
+    private static JSONObject handleSabrFile(long from, int max) throws Exception {
+        File f = new File(sAppCtx.getCacheDir(), "vot_asrc.bin");
+        JSONObject o = new JSONObject();
+        long len = f.length();
+        o.put("size", len);
+        o.put("boxes", mp4Head(f));
+        if (from < 0) from = 0;
+        if (from > len) from = len;
+        int n = (int) Math.min(Math.max(1, max), len - from);
+        byte[] all = new byte[n];
+        java.io.RandomAccessFile raf = new java.io.RandomAccessFile(f, "r");
+        try {
+            raf.seek(from);
+            int off = 0;
+            while (off < n) {
+                int r = raf.read(all, off, n - off);
+                if (r <= 0) break;
+                off += r;
+            }
+            if (off < n) all = Arrays.copyOf(all, off);
+        } finally {
+            try { raf.close(); } catch (Throwable ignored) { }
+        }
+        o.put("from", from);
+        o.put("n", all.length);
+        o.put("b64", android.util.Base64.encodeToString(all, android.util.Base64.NO_WRAP));
+        return o;
+    }
+
+    // What the staged track actually is: the seq of top-level MP4 boxes. A valid
+    // fragmented-MP4 audio file starts with ftyp, then moov (init segment), then
+    // moof/mdat pairs. If moov is missing, Yandex decodes nothing and reports
+    // "there is no speech", which is exactly what happened before.
+    private static String mp4Head(File f) {
+        StringBuilder sb = new StringBuilder();
+        java.io.RandomAccessFile raf = null;
+        try {
+            raf = new java.io.RandomAccessFile(f, "r");
+            long pos = 0;
+            long len = raf.length();
+            for (int i = 0; i < 24 && pos + 8 <= len; i++) {
+                raf.seek(pos);
+                long size = raf.readInt() & 0xFFFFFFFFL;
+                byte[] t = new byte[4];
+                raf.readFully(t);
+                String type = new String(t, StandardCharsets.ISO_8859_1).trim();
+                long hdr = 8;
+                if (size == 1) {
+                    size = raf.readLong();
+                    hdr = 16;
+                } else if (size == 0) {
+                    size = len - pos;
+                }
+                if (size < hdr) break;
+                if (sb.length() > 0) sb.append(',');
+                sb.append(type).append('/').append(size);
+                pos += size;
+            }
+        } catch (Throwable e) {
+            sb.append("err=").append(e);
+        } finally {
+            if (raf != null) {
+                try { raf.close(); } catch (Throwable ignored) { }
+            }
+        }
+        return sb.toString();
+    }
+
+    // /sabrtest: pull the whole audio track over SABR and report what arrived,
+    // without touching Yandex. This is the cheapest way to tell whether the
+    // protocol works before wiring it into the upload path.
+    //
+    // /sabrreq: page hands over the exact SABR POST its player made (url,
+    // headers, protobuf body). /sabrreplay repeats it from Java: if that is
+    // 200 while our own request is 403, the difference is in the request, not
+    // in the network. Nothing here touches Yandex.
+    private static volatile JSONObject sSabrReq;
+
+    // Top-level field 5 (video_playback_ustreamer_config) of the player's own
+    // SABR request. The copy in the player response (`videoPlaybackUstreamerConfig`)
+    // is NOT the same bytes: the server answers our request with
+    // `sabr.malformed_config` when we echo it, and streams media when we use the
+    // player's. Diff starts at byte 709, ours is 24 bytes longer.
+    private static volatile byte[] sSabrUcfg;
+
+    // Video the captured body belongs to. The page flips videos faster than the
+    // bridge notices, and a stale config is answered with `sabr.malformed_config`.
+    private static volatile String sSabrUcfgVid = "";
+
+    // Config the page's own player uses right now: serverAbrStreamingUrl +
+    // videoPlaybackUstreamerConfig + the audio format it streams. Our own
+    // InnerTube answers get `sabr.malformed_config`, this one is by definition
+    // the one the server accepts.
+    private static volatile JSONObject sSabrCfg;
+
+    // Init segment of the track the player is streaming, taken from its own
+    // audio SourceBuffer (the first MSE appendBuffer). SABR only serves media
+    // fragments to a session that already played the stream, so without this
+    // the staged file has no ftyp/moov (or WebM header) at all and is not a
+    // container — Yandex rejects it. Keyed by video id: a stale header from
+    // another video would corrupt the file just as badly as no header.
+    private static volatile byte[] sMseInit;
+    private static volatile String sMseInitVid = "";
+    private static volatile String sMseInitMime = "";
+
+    private static JSONObject handleMseInit(byte[] body, String vid, String mime) throws Exception {
+        JSONObject o = new JSONObject();
+        if (body == null || body.length == 0) throw new IOException("empty body");
+        String m = mime == null ? "" : mime;
+        o.put("len", body.length);
+        o.put("mime", m);
+        sMseInit = body;
+        sMseInitMime = m;
+        sMseInitVid = vid == null ? "" : vid;
+        android.util.Log.i("VotBridge", "mseinit len=" + body.length + " mime=" + m
+                + " vid=" + sMseInitVid + " head=" + Sabr.hexHead(body, 16));
+        o.put("ok", 1);
+        return o;
+    }
+
+    // Init bytes for this video (null when absent or from another video).
+    private static byte[] mseInitFor(String videoId) {
+        byte[] b = sMseInit;
+        if (b == null || b.length == 0) return null;
+        String v = sMseInitVid;
+        if (!v.isEmpty() && !videoId.isEmpty() && !v.equals(videoId)) return null;
+        return b;
+    }
+
+    private static JSONObject handleSabrCfg(byte[] body) throws Exception {
+        JSONObject o = new JSONObject();
+        if (body.length == 0) throw new IOException("empty body");
+        JSONObject cfg = new JSONObject(new String(body, StandardCharsets.UTF_8));
+        String url = cfg.optString("url", "");
+        if (url.isEmpty()) throw new IOException("no url");
+        sSabrCfg = cfg;
+        o.put("ok", 1);
+        o.put("urlLen", url.length());
+        o.put("ucfg", cfg.optString("ucfg", "").length());
+        o.put("itag", cfg.optInt("itag", 0));
+        o.put("clen", cfg.optString("clen", ""));
+        android.util.Log.i("VotBridge", "sabrcfg urlLen=" + url.length()
+                + " ucfg=" + cfg.optString("ucfg", "").length()
+                + " itag=" + cfg.optInt("itag", 0) + " clen=" + cfg.optString("clen", "")
+                + " vd=" + cfg.optString("vd", "").length());
+        return o;
+    }
+
+    private static long longOf(String s) {
+        try {
+            return Long.parseLong(String.valueOf(s).trim());
+        } catch (Throwable e) {
+            return 0L;
+        }
+    }
+
+    // /sabrtest?page=1: run the SABR loop entirely on the page's config.
+    // Nothing is uploaded anywhere, only the byte count is reported.
+    private static JSONObject handleSabrTestPage(int itagOverride, String xtagsOverride,
+                                                 int rawMode) throws Exception {
+        JSONObject out = new JSONObject();
+        JSONObject cfg = sSabrCfg;
+        if (cfg == null) {
+            out.put("ok", 0);
+            out.put("why", "no page config yet");
+            return out;
+        }
+        long t0 = System.currentTimeMillis();
+        Sabr.Params p = sabrParamsFromCfg(itagOverride);
+        // A/B on the live video: ?xtags=none asks for the original audio,
+        // ?xtags=<value> forces a specific track. Without it the page's own
+        // xtags is used (with dubs stripped).
+        if (!xtagsOverride.isEmpty()) {
+            p.xtags = "none".equals(xtagsOverride) ? "" : xtagsOverride;
+            p.lmt = 0;
+        }
+        p.expectedLength = longOf(cfg.optString("clen", ""));
+        p.maxPosts = 60;
+        // ?raw=1 replays the player's own request body instead of ours. Our body
+        // is answered with policy frames only (35/46/47, empty playback_cookie),
+        // which by protocol means "reload the player response" — i.e. the server
+        // does not treat our session as the one that owns the stream. The page's
+        // body carries po_token / sabr_contexts / capabilities we do not build.
+        // ?raw=2 does the same but drops field 3 (buffered_ranges): replaying the
+        // player's ranges verbatim tells the server "I already have all of it".
+        if (rawMode > 0) {
+            JSONObject req = sSabrReq;
+            String b64 = req == null ? "" : req.optString("body", "");
+            byte[] tpl = null;
+            try { tpl = Base64.decode(b64, Base64.DEFAULT); } catch (Throwable ignore) { }
+            if (tpl == null || tpl.length == 0) {
+                out.put("ok", 0);
+                out.put("why", "no captured player body");
+                return out;
+            }
+            byte[] ours = Sabr.requestBody(p, 0);
+            out.put("tplVid", req.optString("vid", ""));
+            out.put("tplLen", tpl.length);
+            out.put("ourLen", ours.length);
+            out.put("tplFields", Sabr.topFields(tpl));
+            out.put("ourFields", Sabr.topFields(ours));
+            out.put("tplSc", Sabr.fieldInfo(tpl, 19));
+            out.put("ourSc", Sabr.fieldInfo(ours, 19));
+            out.put("raw", rawMode);
+            out.put("tplBuf", Sabr.fieldInfo(tpl, 3));
+            p.bodyTpl = tpl;
+            p.bodyStrip = rawMode >= 2;
+            // The page's clen belongs to the format the player picked; what the
+            // replayed body selects may be another itag, so do not stop on it.
+            p.expectedLength = 0;
+            p.itag = 0;
+        }
+        out.put("itag", p.itag);
+        out.put("xtags", p.xtags);
+        out.put("lmt", p.lmt);
+        out.put("want", p.expectedLength);
+        out.put("ucfg", p.ustreamerConfig.length());
+        out.put("ucfgFromBody", sSabrUcfg == null ? 0 : sSabrUcfg.length);
+        out.put("urlPot", hasParam(p.url, "pot") ? 1 : 0);
+        out.put("urlKeys", queryKeys(p.url));
+        try {
+            Sabr.Result r = Sabr.run(p, new Sabr.Sink() {
+                public void onBytes(byte[] d, int off, int len) { }
+            });
+            out.put("ok", r.bytes > 0 ? 1 : 0);
+            out.put("bytes", r.bytes);
+            out.put("media", r.mediaBytes);
+            out.put("segs", r.segments);
+            out.put("posts", r.posts);
+            out.put("eot", r.endOfTrack);
+            out.put("clen", r.contentLength);
+            out.put("endMs", r.endMs);
+            out.put("firstMs", r.firstByteMs);
+            out.put("parts", r.parts.toString());
+            if (!r.err.isEmpty()) out.put("err", r.err);
+            android.util.Log.i("VotBridge", "sabrtest page " + r.summary()
+                    + " parts=" + r.parts);
+        } catch (Throwable e) {
+            out.put("ok", 0);
+            out.put("err", String.valueOf(e));
+        }
+        out.put("ms", System.currentTimeMillis() - t0);
+        return out;
+    }
+
+    private static JSONObject handleSabrReq(byte[] body) throws Exception {
+        JSONObject o = new JSONObject();
+        if (body.length == 0) throw new IOException("empty body");
+        JSONObject req = new JSONObject(new String(body, StandardCharsets.UTF_8));
+        String url = req.optString("url", "");
+        if (url.isEmpty()) throw new IOException("no url");
+        // The page fires some SABR posts with an empty body (or we get the POST
+        // before the clone finishes). Keep the last capture that actually had a
+        // body, otherwise the diagnostics see pageLen=0 half of the time.
+        JSONObject prev = sSabrReq;
+        String prevBody = prev == null ? "" : prev.optString("body", "");
+        if (req.optString("body", "").isEmpty() && !prevBody.isEmpty()) {
+            req.put("body", prevBody);
+            o.put("bodyKept", 1);
+        }
+        sSabrReq = req;
+        o.put("ok", 1);
+        o.put("urlLen", url.length());
+        o.put("bodyLen", req.optString("body", "").length());
+        // Keep the ustreamer config the player actually sends: this is the only
+        // copy the SABR server accepts for this stream.
+        String b64 = req.optString("body", "");
+        if (!b64.isEmpty()) {
+            try {
+                byte[] raw = Sabr.fieldBytes(Base64.decode(b64, Base64.DEFAULT), 5);
+                if (raw != null && raw.length > 100) {
+                    sSabrUcfg = raw;
+                    sSabrUcfgVid = req.optString("vid", "");
+                    o.put("ucfg", raw.length);
+                }
+            } catch (Throwable ignore) { }
+        }
+        return o;
+    }
+
+    // videoId the page attached to the config it posted ("" when unknown).
+    private static String pageCfgVid() {
+        JSONObject c = sSabrCfg;
+        return c == null ? "" : c.optString("vid", "");
+    }
+
+    // The player's own VideoPlaybackAbrRequest body for this video, decoded.
+    // Null when nothing was captured yet or the capture belongs to another
+    // video (replaying somebody else's body answers with policies only).
+    private static byte[] capturedSabrBody(String videoId) {
+        JSONObject req = sSabrReq;
+        if (req == null) return null;
+        String rv = req.optString("vid", "");
+        if (!rv.isEmpty() && !videoId.isEmpty() && !rv.equals(videoId)) return null;
+        String b64 = req.optString("body", "");
+        if (b64.isEmpty()) return null;
+        try {
+            byte[] b = Base64.decode(b64, Base64.DEFAULT);
+            return b.length > 200 ? b : null;
+        } catch (Throwable e) {
+            return null;
+        }
+    }
+
+    // True only when both halves of the SABR pair were captured for *this*
+    // video. An unknown id counts as acceptable (older page builds do not send
+    // it); a known different id does not.
+    private static boolean pageSabrUsable(String videoId) {
+        JSONObject c = sSabrCfg;
+        if (c == null || sSabrUcfg == null || sSabrUcfg.length == 0) return false;
+        String cv = c.optString("vid", "");
+        if (!cv.isEmpty() && !cv.equals(videoId)) return false;
+        if (!sSabrUcfgVid.isEmpty() && !sSabrUcfgVid.equals(videoId)) return false;
+        return true;
+    }
+
+    // Base64 of the config the player sends; empty when nothing was captured yet.
+    private static String sabrUcfgB64() {
+        byte[] c = sSabrUcfg;
+        if (c == null || c.length == 0) return "";
+        return Base64.encodeToString(c, Base64.NO_WRAP);
+    }
+
+    // Params for "our" request, taken from the page's own config.
+    private static Sabr.Params sabrParamsFromCfg(int itagOverride) {
+        JSONObject cfg = sSabrCfg;
+        Sabr.Params p = new Sabr.Params();
+        if (cfg == null) return p;
+        p.videoId = videoIdOfPage();
+        // The config's `serverAbrStreamingUrl` answers 403 without a po token;
+        // the url the player actually POSTs to (captured from the wire, with
+        // alr/cpn/cver/rn/spc) is accepted as is.
+        JSONObject req = sSabrReq;
+        String wire = req == null ? "" : req.optString("url", "").trim();
+        p.url = wire.isEmpty() ? cfg.optString("url", "") : wire;
+        // Prefer the config copied out of the player's own request; the copy in
+        // the player response gets `sabr.malformed_config`.
+        String fromBody = sabrUcfgB64();
+        p.ustreamerConfig = fromBody.isEmpty() ? cfg.optString("ucfg", "") : fromBody;
+        p.visitorData = cfg.optString("vd", "");
+        p.itag = itagOverride > 0 ? itagOverride : cfg.optInt("itag", 0);
+        p.lmt = longOf(cfg.optString("lmt", ""));
+        // The TV player picks the auto-dubbed track (`acont=dubbed-auto:lang=xx`)
+        // and the SABR server answers such a request with a policy/seek frame
+        // instead of media (resp≈170 B, no MEDIA part). Yandex needs the
+        // original voice anyway, so drop the dub and ask for the plain track.
+        String xt = cfg.optString("xtags", "");
+        if (xt.toLowerCase().indexOf("dubbed") >= 0) {
+            xt = "";
+            p.lmt = 0;   // lmt belongs to the dubbed track
+        }
+        p.xtags = xt;
+        p.clientName = 7;
+        return p;
+    }
+
+    // /sabrbody: structural dump of the player's own SABR request body next to
+    // the protobuf our encoder builds from the same page config. Field numbers,
+    // lengths and short strings only — enough to see what is missing or extra.
+    private static JSONObject handleSabrBody(int itagOverride) throws Exception {
+        JSONObject out = new JSONObject();
+        JSONObject req = sSabrReq;
+        byte[] page = new byte[0];
+        if (req != null) {
+            String b64 = req.optString("body", "");
+            if (!b64.isEmpty()) {
+                try {
+                    page = Base64.decode(b64, Base64.DEFAULT);
+                } catch (Throwable e) {
+                    out.put("pageErr", String.valueOf(e));
+                }
+            }
+        }
+        byte[] our = Sabr.requestBody(sabrParamsFromCfg(itagOverride), 0);
+        out.put("pageLen", page.length);
+        out.put("ourLen", our.length);
+        out.put("pageTop", Sabr.topFields(page));
+        out.put("ourTop", Sabr.topFields(our));
+        out.put("page", Sabr.dump(page));
+        out.put("our", Sabr.dump(our));
+        out.put("pageUcfg", Sabr.fieldInfo(page, 5));
+        out.put("ourUcfg", Sabr.fieldInfo(our, 5));
+        out.put("pageCtx", Sabr.fieldInfo(page, 19));
+        out.put("ourCtx", Sabr.fieldInfo(our, 19));
+        // Is the ustreamer config in the page's *request* the same bytes we get
+        // from the player response (`ucfg`)? If not, our body carries a config
+        // the server never issued for this stream.
+        out.put("ucfgVsBody", Sabr.cmp(Sabr.fieldBytes(page, 5),
+                Sabr.b64Of(sabrParamsFromCfg(itagOverride).ustreamerConfig)));
+        android.util.Log.i("VotBridge", "sabrbody page=" + page.length + " our=" + our.length);
+        return out;
+    }
+
+    // One POST on the SABR endpoint, reporting only what identifies the answer:
+    // code, size, part types, first media bytes. Response is capped, the media
+    // itself is never stored.
+    private static JSONObject sabrPost(String url, byte[] body) throws Exception {
+        JSONObject o = new JSONObject();
+        HttpURLConnection c = null;
+        try {
+            c = (HttpURLConnection) new URL(url).openConnection();
+            c.setConnectTimeout(10000);
+            c.setReadTimeout(30000);
+            c.setRequestMethod("POST");
+            c.setDoOutput(true);
+            c.setFixedLengthStreamingMode(body.length);
+            c.setRequestProperty("Content-Type", "application/x-protobuf");
+            c.setRequestProperty("Accept", "application/vnd.yt-ump");
+            c.setRequestProperty("Accept-Encoding", "identity");
+            OutputStream os = c.getOutputStream();
+            os.write(body);
+            os.close();
+            int code = c.getResponseCode();
+            o.put("code", code);
+            o.put("ctype", hdr(c, "Content-Type"));
+            InputStream in = code == 200 ? c.getInputStream() : c.getErrorStream();
+            byte[] resp = in == null ? new byte[0] : readN(in, 512 * 1024);
+            o.put("len", resp.length);
+            if (resp.length > 0) {
+                JSONObject p = Sabr.inspect(resp);
+                o.put("itag", p.optInt("itag", 0));
+                o.put("media", p.optLong("media", 0));
+                o.put("segs", p.optInt("segs", 0));
+                o.put("parts", p.optString("parts", ""));
+                if (p.has("err")) o.put("err", p.optString("err", ""));
+                o.put("hex", hexHead(resp, 16));
+            }
+        } catch (Throwable e) {
+            o.put("err", String.valueOf(e));
+        } finally {
+            if (c != null) c.disconnect();
+        }
+        return o;
+    }
+
+    // /sabrmix: the page's own request is the only body the server accepts, so
+    // the probe starts from it and removes/changes one thing at a time. The
+    // first row that still returns media after losing the page's video formats
+    // and gaining itag 140 is the shape we can build ourselves.
+    private static JSONObject handleSabrMix(int itagOverride) throws Exception {
+        JSONObject out = new JSONObject();
+        JSONObject req = sSabrReq;
+        if (req == null || sSabrCfg == null) {
+            out.put("ok", 0);
+            out.put("why", "need both captured request and page config");
+            return out;
+        }
+        String url = req.optString("url", "");
+        if (url.isEmpty()) url = sSabrCfg.optString("url", "");
+        byte[] page = Base64.decode(req.optString("body", ""), Base64.DEFAULT);
+        if (page.length == 0) {
+            out.put("ok", 0);
+            out.put("why", "captured body is empty; wait for the next sabr-body log line");
+            return out;
+        }
+        Sabr.Params p = sabrParamsFromCfg(itagOverride);
+        byte[] our = Sabr.requestBody(p, 0);
+        out.put("urlLen", url.length());
+        out.put("pageLen", page.length);
+        out.put("ourLen", our.length);
+        out.put("pageTop", Sabr.topFields(page));
+        out.put("ourTop", Sabr.topFields(our));
+        JSONArray rows = new JSONArray();
+        String[] names = new String[]{"page", "page+our4", "page-sel140", "page-sel140+pa",
+                "page-sel140+pa+ctx", "page-sel140+pa+ctx+abr", "page-sel140-min",
+                "our", "our+page5", "our+page5+ctx"};
+        for (int i = 0; i < names.length; i++) {
+            byte[] body;
+            try {
+                switch (i) {
+                    case 0:
+                        body = page;
+                        break;
+                    case 1:
+                        body = Sabr.mix(page, our, 4);
+                        break;
+                    case 2:
+                        body = Sabr.mix(page, our, 2);
+                        break;
+                    case 3:
+                        body = Sabr.mix(Sabr.mix(page, our, 2), our, 16);
+                        break;
+                    case 4:
+                        body = Sabr.mix(Sabr.mix(Sabr.mix(page, our, 2), our, 16), our, 19);
+                        break;
+                    case 5:
+                        body = Sabr.mix(Sabr.mix(Sabr.mix(Sabr.mix(page, our, 2), our, 16),
+                                our, 19), our, 1);
+                        break;
+                    case 6: {
+                        byte[] b = Sabr.mix(Sabr.mix(Sabr.mix(Sabr.mix(page, our, 2), our, 16),
+                                our, 19), our, 1);
+                        body = Sabr.drop(b, 17, 22, 23);
+                        break;
+                    }
+                    case 7:
+                        body = our;
+                        break;
+                    case 8:
+                        body = Sabr.mix(our, page, 5);
+                        break;
+                    default:
+                        body = Sabr.mix(Sabr.mix(our, page, 5), page, 19);
+                        break;
+                }
+            } catch (Throwable e) {
+                JSONObject row = new JSONObject();
+                row.put("v", names[i]);
+                row.put("err", String.valueOf(e));
+                rows.put(row);
+                continue;
+            }
+            JSONObject row = sabrPost(url, body);
+            row.put("v", names[i]);
+            row.put("bodyLen", body.length);
+            rows.put(row);
+            android.util.Log.i("VotBridge", "sabrmix " + names[i] + " body=" + body.length
+                    + " code=" + row.optInt("code", 0) + " len=" + row.optInt("len", 0)
+                    + " media=" + row.optLong("media", 0) + " itag=" + row.optInt("itag", 0)
+                    + " parts=" + row.optString("parts", "")
+                    + (row.has("err") ? " err=" + row.optString("err", "") : ""));
+        }
+        out.put("ok", 1);
+        out.put("rows", rows);
+        return out;
+    }
+
+    private static JSONObject handleSabrReplay(String mode, String videoId, int itag,
+                                               String visitorData) throws Exception {
+        JSONObject out = new JSONObject();
+        JSONObject req = sSabrReq;
+        if (req == null) {
+            out.put("ok", 0);
+            out.put("why", "no captured request yet");
+            return out;
+        }
+        String url = req.optString("url", "");
+        String b64 = req.optString("body", "");
+        byte[] data = new byte[0];
+        out.put("mode", mode.isEmpty() ? "page" : mode);
+        if ("nobody".equals(mode)) {
+            // URL + headers only: tells whether the signature itself is refused.
+        } else if ("ourbody".equals(mode)) {
+            // Same URL and headers as the player, but the protobuf body we
+            // build ourselves: tells whether our encoder is the problem.
+            try {
+                PoToken.Tokens t = visitorData.isEmpty()
+                        ? PoToken.get(sAppCtx, videoId)
+                        : PoToken.getWithVisitor(sAppCtx, videoId, visitorData);
+                JSONObject j = itPlayer(videoId, C_TV, t.visitorData, t.playerPot);
+                SabrPick f = pickSabrAudio(j);
+                Sabr.Params p = sabrParams(videoId, j, t, f);
+                if (itag > 0) p.itag = itag;
+                data = Sabr.requestBody(p, 0);
+                out.put("itag", p.itag);
+            } catch (Throwable e) {
+                out.put("bodyErr", String.valueOf(e));
+            }
+        } else if (!b64.isEmpty()) {
+            try {
+                data = Base64.decode(b64, Base64.DEFAULT);
+            } catch (Throwable e) {
+                out.put("bodyErr", String.valueOf(e));
+            }
+        }
+        JSONObject hs = req.optJSONObject("headers");
+        if ("range".equals(mode)) return sabrRangeProbe(url, hs);
+        String reqMethod = req.optString("method", "POST").toUpperCase();
+        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+        try {
+            c.setConnectTimeout(10000);
+            c.setReadTimeout(20000);
+            c.setRequestMethod("GET".equals(reqMethod) ? "GET" : "POST");
+            boolean sendsBody = !"GET".equals(reqMethod);
+            if (sendsBody) {
+                c.setDoOutput(true);
+                c.setFixedLengthStreamingMode(data.length);
+            }
+            out.put("method", reqMethod);
+            if (hs != null) {
+                java.util.Iterator<String> it = hs.keys();
+                while (it.hasNext()) {
+                    String k = it.next();
+                    // Host/Content-Length are set by the stack, everything else
+                    // is replayed verbatim.
+                    if ("host".equals(k) || "content-length".equals(k)) continue;
+                    try {
+                        c.setRequestProperty(k, hs.optString(k, ""));
+                    } catch (Throwable ignored) { }
+                }
+            }
+            if (sendsBody) {
+                OutputStream os = c.getOutputStream();
+                os.write(data);
+                os.close();
+            }
+            int code = c.getResponseCode();
+            out.put("ok", code == 200 ? 1 : 0);
+            out.put("code", code);
+            out.put("bodyLen", data.length);
+            out.put("urlLen", url.length());
+            out.put("ctype", hdr(c, "Content-Type"));
+            out.put("respClen", hdr(c, "Content-Length"));
+            InputStream in = code == 200 ? c.getInputStream() : c.getErrorStream();
+            byte[] resp = in == null ? new byte[0] : readN(in, 4 * 1024 * 1024);
+            out.put("respLen", resp.length);
+            out.put("hex", hexHead(resp, 32));
+            if (code == 200) {
+                JSONObject parsed = Sabr.inspect(resp);
+                out.put("itag", parsed.optInt("itag", 0));
+                out.put("media", parsed.optLong("media", 0L));
+                out.put("segs", parsed.optInt("segs", 0));
+                out.put("parts", parsed.optString("parts", ""));
+            } else {
+                out.put("errBody", new String(resp, 0, Math.min(resp.length, 300),
+                        StandardCharsets.UTF_8));
+            }
+            android.util.Log.i("VotBridge", "sabrreplay code=" + code + " body=" + data.length
+                    + " resp=" + resp.length);
+            return out;
+        } finally {
+            c.disconnect();
+        }
+    }
+
+    // Plain GET with a byte window on the same url the page uses. If this is
+    // 206 with a real Content-Range, the whole SABR detour is unnecessary: the
+    // url can be downloaded like any other audio track.
+    private static JSONObject sabrRangeProbe(String url, JSONObject hs) throws Exception {
+        JSONObject out = new JSONObject();
+        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+        try {
+            c.setConnectTimeout(10000);
+            c.setReadTimeout(20000);
+            c.setRequestProperty("Range", "bytes=0-1023");
+            if (hs != null) {
+                java.util.Iterator<String> it = hs.keys();
+                while (it.hasNext()) {
+                    String k = it.next();
+                    if ("host".equals(k) || "content-length".equals(k)
+                            || "range".equals(k) || "content-type".equals(k)
+                            || "content-encoding".equals(k)) continue;
+                    try {
+                        c.setRequestProperty(k, hs.optString(k, ""));
+                    } catch (Throwable ignored) { }
+                }
+            }
+            int code = c.getResponseCode();
+            out.put("mode", "range");
+            out.put("ok", code == 206 || code == 200 ? 1 : 0);
+            out.put("code", code);
+            out.put("ctype", hdr(c, "Content-Type"));
+            out.put("respClen", hdr(c, "Content-Length"));
+            out.put("contentRange", hdr(c, "Content-Range"));
+            InputStream in = code == 200 || code == 206 ? c.getInputStream() : c.getErrorStream();
+            byte[] resp = in == null ? new byte[0] : readN(in, 4096);
+            out.put("respLen", resp.length);
+            out.put("hex", hexHead(resp, 32));
+            android.util.Log.i("VotBridge", "sabrrangeprobe code=" + code + " len=" + resp.length
+                    + " cr=" + hdr(c, "Content-Range"));
+            return out;
+        } finally {
+            c.disconnect();
+        }
+    }
+
+    private static String hdr(HttpURLConnection c, String name) {
+        try {
+            String v = c.getHeaderField(name);
+            return v == null ? "" : v;
+        } catch (Throwable e) {
+            return "";
+        }
+    }
+
+    private static String hexHead(byte[] b, int n) {
+        if (b == null || b.length == 0) return "";
+        StringBuilder sb = new StringBuilder();
+        int lim = Math.min(n, b.length);
+        for (int i = 0; i < lim; i++) {
+            if (i > 0) sb.append(' ');
+            int v = b[i] & 0xFF;
+            if (v < 16) sb.append('0');
+            sb.append(Integer.toHexString(v));
+        }
+        return sb.toString();
+    }
+
+    // /sabrdiag?page=1: the same url, the same body, several header sets.
+    // Our POST gets 403 while replaying the player's request gets 200, so the
+    // difference is in what we put on the wire. Each row is one combination.
+    private static JSONObject handleSabrDiag(int itagOverride) throws Exception {
+        JSONObject out = new JSONObject();
+        JSONObject cfg = sSabrCfg;
+        if (cfg == null) {
+            out.put("ok", 0);
+            out.put("why", "no page config yet");
+            return out;
+        }
+        String url = cfg.optString("url", "");
+        Sabr.Params p = new Sabr.Params();
+        p.videoId = videoIdOfPage();
+        p.url = url;
+        p.ustreamerConfig = cfg.optString("ucfg", "");
+        p.visitorData = cfg.optString("vd", "");
+        p.itag = itagOverride > 0 ? itagOverride : cfg.optInt("itag", 0);
+        p.lmt = longOf(cfg.optString("lmt", ""));
+        p.xtags = cfg.optString("xtags", "");
+        p.clientName = 7;
+        byte[] body = Sabr.requestBody(p, 0);
+
+        String full = "full";
+        String[] fullKv = new String[]{
+                "Content-Type", "application/x-protobuf",
+                "Accept", "application/vnd.yt-ump",
+                "Accept-Encoding", "identity",
+                "User-Agent", "Cobalt",
+                "X-Goog-Visitor-Id", p.visitorData,
+                "X-Youtube-Client-Name", "7",
+                "Origin", "https://www.youtube.com",
+                "Referer", "https://www.youtube.com/"
+        };
+        String[] minKv = new String[]{"Content-Type", "application/x-protobuf"};
+
+        JSONArray rows = new JSONArray();
+        Object[][] combos = new Object[][]{
+                {"min+norn", minKv, body, 0},
+                {"min+rn", minKv, body, 1},
+                {"full+norn", fullKv, body, 0},
+                {"full+rn", fullKv, body, 1},
+                {"min+empty", minKv, new byte[0], 1},
+                {"nohdr+rn", null, body, 1}
+        };
+        for (int i = 0; i < combos.length; i++) {
+            JSONObject row = new JSONObject();
+            row.put("v", String.valueOf(combos[i][0]));
+            try {
+                Sabr.Raw rr = Sabr.postRaw(url, (byte[]) combos[i][2],
+                        (String[]) combos[i][1], (Integer) combos[i][3]);
+                row.put("code", rr.code);
+                row.put("ctype", rr.ctype);
+                row.put("len", rr.len);
+                row.put("hex", rr.head);
+                if (!rr.err.isEmpty()) row.put("err", rr.err);
+            } catch (Throwable e) {
+                row.put("err", String.valueOf(e));
+            }
+            rows.put(row);
+        }
+        out.put("ok", 1);
+        out.put("bodyLen", body.length);
+        out.put("urlLen", url.length());
+        out.put("itag", p.itag);
+        out.put("rows", rows);
+        android.util.Log.i("VotBridge", "sabrdiag body=" + body.length + " " + rows);
+        return out;
+    }
+
+    // /sabrtest?wire=1: the page's own wire url (the exact string its player
+    // POSTs to) with the page's own ustreamer config. 403 on the plain
+    // `serverAbrStreamingUrl` but 200 on the wire url means the player appends
+    // something (pot/rn/alr) that the server requires.
+    private static JSONObject handleSabrTestWire(int itagOverride) throws Exception {
+        JSONObject out = new JSONObject();
+        JSONObject cfg = sSabrCfg;
+        JSONObject req = sSabrReq;
+        if (cfg == null) {
+            out.put("ok", 0);
+            out.put("why", "no page config yet");
+            return out;
+        }
+        String baseUrl = cfg.optString("url", "");
+        String wireUrl = req == null ? "" : req.optString("url", "");
+        out.put("cfgUrlLen", baseUrl.length());
+        out.put("wireUrlLen", wireUrl.length());
+        out.put("urlDiff", urlDiff(baseUrl, wireUrl));
+        String url = wireUrl.isEmpty() ? baseUrl : wireUrl;
+        long t0 = System.currentTimeMillis();
+        Sabr.Params p = new Sabr.Params();
+        p.videoId = videoIdOfPage();
+        p.url = url;
+        p.ustreamerConfig = cfg.optString("ucfg", "");
+        p.visitorData = cfg.optString("vd", "");
+        p.itag = itagOverride > 0 ? itagOverride : cfg.optInt("itag", 0);
+        p.lmt = longOf(cfg.optString("lmt", ""));
+        p.xtags = cfg.optString("xtags", "");
+        p.expectedLength = longOf(cfg.optString("clen", ""));
+        p.maxPosts = 4;
+        out.put("ucfg", p.ustreamerConfig.length());
+        out.put("src", wireUrl.isEmpty() ? "cfg" : "wire");
+        out.put("itag", p.itag);
+        out.put("want", p.expectedLength);
+
+        // poToken lives inside streamer_context.po_token (19.2), not in the
+        // url — without it SABR answers with an error frame. Probe the three
+        // candidates, then run the winner to the end.
+        String vd = p.visitorData;
+        String[] names = new String[]{"none", "player", "stream"};
+        String[] toks = new String[]{"", "", ""};
+        if (!vd.isEmpty()) {
+            try {
+                PoToken.Tokens t = PoToken.getWithVisitor(sAppCtx, p.videoId, vd);
+                toks[1] = t.playerPot;
+                toks[2] = t.streamingPot;
+            } catch (Throwable e) {
+                out.put("potErr", String.valueOf(e));
+            }
+        }
+        JSONArray probe = new JSONArray();
+        int best = -1;
+        for (int i = 0; i < names.length; i++) {
+            JSONObject row = new JSONObject();
+            row.put("pot", names[i]);
+            row.put("len", toks[i].length());
+            Sabr.Params q = p.copy();
+            q.poToken = toks[i];
+            try {
+                Sabr.Result pr = Sabr.run(q, null);
+                row.put("bytes", pr.bytes);
+                row.put("parts", pr.parts.toString());
+                if (!pr.err.isEmpty()) row.put("err", pr.err);
+                if (pr.bytes > 0 && best < 0) best = i;
+            } catch (Throwable e) {
+                row.put("err", String.valueOf(e));
+            }
+            probe.put(row);
+        }
+        out.put("probe", probe);
+        if (best < 0) {
+            out.put("ok", 0);
+            out.put("why", "no pot variant produced bytes");
+            out.put("ms", System.currentTimeMillis() - t0);
+            return out;
+        }
+        out.put("pot", names[best]);
+        p.poToken = toks[best];
+        p.maxPosts = 60;
+        try {
+            Sabr.Result r = Sabr.run(p, new Sabr.Sink() {
+                public void onBytes(byte[] d, int off, int len) { }
+            });
+            out.put("ok", r.bytes > 0 ? 1 : 0);
+            out.put("bytes", r.bytes);
+            out.put("media", r.mediaBytes);
+            out.put("segs", r.segments);
+            out.put("posts", r.posts);
+            out.put("eot", r.endOfTrack);
+            out.put("clen", r.contentLength);
+            out.put("endMs", r.endMs);
+            out.put("firstMs", r.firstByteMs);
+            out.put("parts", r.parts.toString());
+            if (!r.err.isEmpty()) out.put("err", r.err);
+            android.util.Log.i("VotBridge", "sabrtest wire " + r.summary()
+                    + " parts=" + r.parts);
+        } catch (Throwable e) {
+            out.put("ok", 0);
+            out.put("err", String.valueOf(e));
+        }
+        out.put("ms", System.currentTimeMillis() - t0);
+        return out;
+    }
+
+    // Which query params each url has that the other lacks. Kept tiny on
+    // purpose: it goes straight into an HTTP response.
+    private static String urlDiff(String a, String b) {
+        try {
+            java.util.Set<String> ka = new java.util.HashSet<>(java.util.Arrays.asList(
+                    queryKeys(a).split(",")));
+            java.util.Set<String> kb = new java.util.HashSet<>(java.util.Arrays.asList(
+                    queryKeys(b).split(",")));
+            java.util.Set<String> added = new java.util.TreeSet<>(kb);
+            added.removeAll(ka);
+            java.util.Set<String> dropped = new java.util.TreeSet<>(ka);
+            dropped.removeAll(kb);
+            return "added=" + added + " dropped=" + dropped;
+        } catch (Throwable e) {
+            return "diffErr=" + e;
+        }
+    }
+
+    private static JSONObject handleSabrTest(String videoId, int itag, String visitorData)
+            throws Exception {
+        JSONObject out = new JSONObject();
+        PoToken.Tokens t = visitorData.isEmpty()
+                ? PoToken.get(sAppCtx, videoId)
+                : PoToken.getWithVisitor(sAppCtx, videoId, visitorData);
+        long t0 = System.currentTimeMillis();
+        JSONObject j = itPlayer(videoId, C_TV, t.visitorData, t.playerPot);
+        JSONObject ps = j.optJSONObject("playabilityStatus");
+        JSONObject sd = j.optJSONObject("streamingData");
+        out.put("status", ps == null ? "" : ps.optString("status", ""));
+        String url = sd == null ? "" : sd.optString("serverAbrStreamingUrl", "");
+        out.put("sabr", url.isEmpty() ? 0 : 1);
+        out.put("ustreamer", ustreamerConfig(j).length());
+        if (url.isEmpty()) {
+            out.put("ok", 0);
+            out.put("why", "no serverAbrStreamingUrl");
+            out.put("reason", ps == null ? "" : ps.optString("reason", ""));
+            return out;
+        }
+        SabrPick f = pickSabrAudio(j);
+        out.put("fmtItag", f == null ? 0 : f.itag);
+        out.put("fmtClen", f == null ? 0 : f.clen);
+        out.put("urlKeys", queryKeys(url));
+        out.put("urlPot", hasParam(url, "pot") ? 1 : 0);
+        out.put("streamPotLen", t.streamingPot.length());
+        out.put("playerPotLen", t.playerPot.length());
+        Sabr.Params base = sabrParams(videoId, j, t, f);
+        if (itag > 0) base.itag = itag;
+
+        // One POST per token variant: a bare 403 means "this token is not the
+        // one googlevideo wants for SABR", actual media bytes mean it is.
+        String[] names = new String[]{"stream-ctx", "stream-ctx+url", "player-ctx+url", "none-ctx"};
+        String[] toks = new String[]{t.streamingPot, t.streamingPot, t.playerPot, ""};
+        boolean[] inUrl = new boolean[]{false, true, true, false};
+        JSONArray probe = new JSONArray();
+        int best = -1;
+        for (int i = 0; i < names.length; i++) {
+            Sabr.Params pv = base.copy();
+            pv.poToken = toks[i];
+            pv.urlPot = inUrl[i];
+            pv.maxPosts = 1;
+            JSONObject row = new JSONObject();
+            row.put("v", names[i]);
+            row.put("potLen", toks[i].length());
+            try {
+                Sabr.Result pr = Sabr.run(pv, null);
+                row.put("bytes", pr.bytes);
+                row.put("media", pr.mediaBytes);
+                row.put("parts", pr.parts.toString());
+                if (pr.bytes > 0 && best < 0) best = i;
+            } catch (Throwable e) {
+                row.put("err", String.valueOf(e.getMessage()));
+            }
+            probe.put(row);
+        }
+        out.put("probe", probe);
+        if (best < 0) {
+            out.put("ok", 0);
+            out.put("why", "all probe variants failed");
+            out.put("ms", System.currentTimeMillis() - t0);
+            return out;
+        }
+        out.put("variant", names[best]);
+        Sabr.Params p = base.copy();
+        p.poToken = toks[best];
+        p.urlPot = inUrl[best];
+        p.maxPosts = 60;
+        Sabr.Result r = Sabr.run(p, new Sabr.Sink() {
+            public void onBytes(byte[] d, int off, int len) { }
+        });
+        out.put("ok", r.bytes > 0 ? 1 : 0);
+        out.put("bytes", r.bytes);
+        out.put("mediaBytes", r.mediaBytes);
+        out.put("itag", r.itag);
+        out.put("segs", r.segments);
+        out.put("posts", r.posts);
+        out.put("endMs", r.endMs);
+        out.put("eot", r.endOfTrack);
+        out.put("clen", r.contentLength);
+        out.put("firstMs", r.firstByteMs);
+        out.put("ms", System.currentTimeMillis() - t0);
+        out.put("parts", r.parts.toString());
+        out.put("err", r.err);
+        android.util.Log.i("VotBridge", "sabrtest id=" + videoId + " " + r.summary()
+                + " ms=" + (System.currentTimeMillis() - t0));
+        return out;
     }
 
     // /audiotest: pot -> player (web or vr) -> Range GET probe, all on the TV.
@@ -1149,9 +2492,84 @@ public final class Bridge {
         return null;
     }
 
-    // /audiosrc: no-URL path for status 6. Mint pot, ask the player (VR first:
-    // it still returns plain adaptiveFormats urls, WEB often returns SABR only)
-    // for the audio track, download it from googlevideo and push it to Yandex.
+    // ---- /audiosrc: full audio track, no playback involved -----------------
+    // status=6 means Yandex has no cache entry and cannot pull the track itself,
+    // so it asks us for the source file. We ask InnerTube for the audio-only
+    // adaptive format (measured on the TV: ANDROID_VR / ANDROID / VISIONOS all
+    // return a plain googlevideo url whose Range GET answers 206, with no "n"
+    // parameter and without any poToken), Range-download it in 5 295 308-byte
+    // pieces and push every piece straight to Yandex. Same contract as the Vox
+    // fork's VotYouTubeAudioSource + VotAudioUploader, but the bytes never
+    // accumulate in memory and the page/player is not touched at all: the job
+    // runs in its own thread and the overlay polls /audiosrc/status.
+    private static final Object ASRC_LOCK = new Object();
+    private static volatile JSONObject sAsrcState = new JSONObject();
+    private static volatile int sAsrcGen;
+
+    // Page-relay for urls the bridge itself cannot download (403 with an empty
+    // body). Measured on the TV: in the same minute one video answers 206 to the
+    // bridge and another answers 403 for every client and every poToken variant,
+    // while the page keeps playing that same media. So when the bridge is
+    // blocked, the url is handed to the page, which pulls the parts with its own
+    // XHR (its network stack is the one the player uses) and posts them back.
+    private static volatile String sPageUrl = "";
+    private static volatile String sPageFileId = "";
+    private static volatile String sPageVideoUrl = "";
+    private static volatile String sPageTid = "";
+    private static volatile int sPageItag;
+    private static volatile long sPageClen;
+    private static volatile int sPageTotal;
+    private static volatile long sPageSent;
+    private static volatile int sPageLastPart = -1;
+    private static volatile int sPageGen;
+
+    private static JSONObject audioSourceStatus() {
+        JSONObject o = sAsrcState;
+        try {
+            return new JSONObject(o.toString());
+        } catch (Throwable e) {
+            return new JSONObject();
+        }
+    }
+
+    private static void asrcSet(JSONObject o) {
+        sAsrcState = o;
+    }
+
+    private static JSONObject asrcState(String state, String videoId) {
+        JSONObject o = new JSONObject();
+        try {
+            o.put("state", state);
+            o.put("videoId", videoId);
+        } catch (Throwable e) { }
+        return o;
+    }
+
+    // Live view of the job for the page: which phase we are in, which part is on
+    // the wire and how many bytes of the whole track are already in. Before this
+    // existed the page could only see fully uploaded parts, so the bar stood at
+    // 0 % for the entire first chunk (5.3 MB download + upload on this TV).
+    private static void asrcProgress(String videoId, String phase, int part, int total,
+                                     long bytes, long clen, int itag, String client, long ms) {
+        JSONObject st = asrcState("working", videoId);
+        try {
+            st.put("phase", phase);
+            st.put("part", part);
+            st.put("chunk", Math.max(0, part - 1));
+            st.put("chunks", total);
+            st.put("bytes", bytes);
+            st.put("total", clen);
+            st.put("itag", itag);
+            st.put("client", client);
+            st.put("ms", ms);
+        } catch (Throwable ignored) { }
+        asrcSet(st);
+    }
+
+    // Throttled byte counter for a single range read: 4 updates a second is
+    // enough for a progress bar and cheap enough for a weak TV CPU.
+    private interface RangeProgress { void onBytes(int got); }
+
     private static JSONObject handleAudioSource(JSONObject req) throws Exception {
         String videoId = req.optString("videoId", "");
         String videoUrl = req.optString("videoUrl", "");
@@ -1160,57 +2578,574 @@ public final class Bridge {
         if (translationId.isEmpty()) throw new IOException("missing translationId");
         if (videoUrl.isEmpty()) videoUrl = "https://www.youtube.com/watch?v=" + videoId;
 
+        // Audio url the page captured from its own player. InnerTube from Java
+        // now answers LOGIN_REQUIRED for every client on this TV, while the page
+        // keeps streaming the very same track, so its url is the good one.
+        final String srcUrl = req.optString("srcUrl", "");
+        final int srcItag = req.optInt("srcItag", 0);
+        final long srcClen = req.optLong("srcClen", 0L);
+        final String srcUa = req.optString("srcUa", "");
+        final String pageVd = req.optString("visitorData", "");
+        final double durSec = req.optDouble("duration", 0);
+
+        final int gen;
+        final String fv = videoId;
+        final String fu = videoUrl;
+        final String ft = translationId;
+        synchronized (ASRC_LOCK) {
+            gen = ++sAsrcGen;
+            JSONObject st = asrcState("working", videoId);
+            st.put("chunk", 0);
+            st.put("chunks", 0);
+            st.put("bytes", 0L);
+            st.put("total", 0L);
+            asrcSet(st);
+            Thread th = new Thread(new Runnable() {
+                public void run() { audioSourceJob(gen, fv, fu, ft, srcUrl, srcItag, srcClen, srcUa, pageVd, durSec); }
+            }, "vot-audiosrc");
+            th.setDaemon(true);
+            th.start();
+        }
+        android.util.Log.i("VotBridge", "audiosrc start id=" + videoId + " tid=" + translationId
+                + " pageSrc=" + (srcUrl.isEmpty() ? 0 : 1) + " clen=" + srcClen);
+        JSONObject out = new JSONObject();
+        out.put("started", 1);
+        out.put("videoId", videoId);
+        return out;
+    }
+
+    private static void audioSourceJob(int gen, String videoId, String videoUrl, String translationId,
+                                       String seedUrl, int seedItag, long seedClen, String seedUa,
+                                       String pageVd, double durSec) {
+        long t0 = System.currentTimeMillis();
+        String lastErr = "";
+        // TVHTML5 player response, kept in case every plain url is refused and
+        // the audio has to come over SABR instead.
+        JSONObject sabrJson = null;
+        SabrPick sabrFmt = null;
+        // Last signed url we managed to obtain, kept for the page relay below.
+        String pageUrl = "";
+        int pageItag = 0;
+        long pageClen = 0;
+        int pageTotal = 0;
+        try {
+            // 0) SABR on the page's own config — the only path that yields bytes
+            // right now, and the fastest: the whole track arrives in seconds.
+            // It needs exactly two things from the player: the wire url it POSTs
+            // to (captured request, with alr/cpn/cver/rn/spc) and field 5 of its
+            // own body. serverAbrStreamingUrl from the player response answers
+            // 403, our own ustreamer config — sabr.malformed_config.
+            // The wire url and field 5 belong to one player session: a pair
+            // captured for another video makes the SABR server answer
+            // sabr.malformed_config (31 bytes, nothing at all). The page posts
+            // the fresh pair right after it starts playing, so wait a bit
+            // instead of sending somebody else's config.
+            if (!pageSabrUsable(videoId)) {
+                long waitMs = 12000;
+                long until = System.currentTimeMillis() + waitMs;
+                android.util.Log.i("VotBridge", "audiosrc page-sabr wait cfgVid="
+                        + pageCfgVid() + " ucfgVid=" + sSabrUcfgVid + " want=" + videoId);
+                while (gen == sAsrcGen && System.currentTimeMillis() < until
+                        && !pageSabrUsable(videoId)) {
+                    try { Thread.sleep(250); } catch (InterruptedException ignore) { }
+                }
+                android.util.Log.i("VotBridge", "audiosrc page-sabr wait done ok="
+                        + (pageSabrUsable(videoId) ? 1 : 0) + " cfgVid=" + pageCfgVid()
+                        + " ucfgVid=" + sSabrUcfgVid + " ms="
+                        + (System.currentTimeMillis() - t0));
+            }
+            JSONObject pcfg = sSabrCfg;
+            if (pcfg != null && sSabrUcfg != null) {
+                if (!pageSabrUsable(videoId)) {
+                    lastErr = "page-sabr: no fresh player config (cfg="
+                            + pageCfgVid() + " ucfg=" + sSabrUcfgVid + ")";
+                    android.util.Log.e("VotBridge", "audiosrc " + lastErr);
+                } else {
+                    try {
+                        Sabr.Params sp = sabrParamsFromCfg(0);
+                        if (sp.url.isEmpty()) throw new IOException("no wire url");
+                        final int fgen = gen;
+                        sp.cancel = new Sabr.Cancel() {
+                            public boolean cancelled() { return fgen != sAsrcGen; }
+                        };
+                        // The length in the page config goes stale (it kept the
+                        // size of a track from another video), so it is NOT used
+                        // to stop the loop: the download ends when the media
+                        // covers the whole video, which the page knows as its
+                        // duration, plus a byte ceiling as a hard backstop.
+                        // AAC itag 140 measured ~20.5 kB/s on this TV, so the
+                        // ceiling must sit above that or a full track gets cut.
+                        sp.expectedLength = durSec > 1 ? (long) (durSec * 24000.0) : 0L;
+                        sp.expectedEndMs = durSec > 1 ? (long) (durSec * 1000.0) : 0L;
+                        sp.maxPosts = 900;   // ~10 s of audio per post
+                        // Replay the player's own POST body instead of building
+                        // ours: our body is answered with policy frames only
+                        // (35/46/47) because the server does not consider our
+                        // session the owner of the stream. The player's body
+                        // carries its po_token, sabr_contexts and capabilities;
+                        // dropping field 3 (buffered_ranges) is what turns it
+                        // from "I already have all of it" into "give me the
+                        // stream from here" — verified: 7.5 MB / 526 s of media
+                        // from one run, where every other body shape gave 0.
+                        byte[] tpl = capturedSabrBody(videoId);
+                        if (tpl != null) {
+                            sp.bodyTpl = tpl;
+                            sp.bodyStrip = true;
+                            sp.itag = 0;            // take whatever itag the server streams
+                            sp.expectedLength = 0;  // the page's clen belongs to another itag
+                        }
+                        int it = sp.itag > 0 ? sp.itag : 140;
+                        // Progress hint only: 128 kbps AAC ≈ 16 kB/s.
+                        long est = durSec > 1 ? (long) (durSec * 16000.0) : 0L;
+                        SabrStage stage = new SabrStage(videoId, it, est, t0);
+                        byte[] init = mseInitFor(videoId);
+                        if (init != null) stage.init(init);
+                        android.util.Log.i("VotBridge", "audiosrc page-sabr start itag=" + it
+                                + " est=" + est + " dur=" + Math.round(durSec)
+                                + " ustreamer=" + sp.ustreamerConfig.length()
+                                + " urlLen=" + sp.url.length()
+                                + " tpl=" + (sp.bodyTpl == null ? 0 : sp.bodyTpl.length)
+                                + " strip=" + (sp.bodyStrip ? 1 : 0)
+                                + " init=" + (init == null ? 0 : init.length)
+                                + " mime=" + (sMseInitMime.isEmpty() ? "-" : sMseInitMime)
+                                + " xt=" + (sp.xtags.isEmpty() ? "-" : sp.xtags)
+                                + " cfgXt=" + (pcfg.optString("xtags", "").isEmpty()
+                                        ? "-" : pcfg.optString("xtags", ""))
+                                + " at=" + (System.currentTimeMillis() - t0));
+                        Sabr.Result sr;
+                        long size;
+                        try {
+                            sr = Sabr.run(sp, stage);
+                        } finally {
+                            size = stage.close();
+                        }
+                        int gotItag = sr.itag > 0 ? sr.itag : it;
+                        android.util.Log.i("VotBridge", "audiosrc page-sabr " + sr.summary()
+                                + " staged=" + size + " est=" + est
+                                + " boxes=" + mp4Head(stage.file()));
+                        if (size > 0) {
+                            long sent = uploadStaged(gen, videoId, videoUrl, translationId,
+                                    gotItag, size, t0);
+                            JSONObject ok = asrcState("done", videoId);
+                            ok.put("client", "page-sabr");
+                            ok.put("itag", gotItag);
+                            ok.put("size", sent);
+                            ok.put("total", sent);
+                            ok.put("chunks", (int) Math.max(1L,
+                                    (sent + AUDIO_CHUNK_SIZE - 1) / AUDIO_CHUNK_SIZE));
+                            ok.put("bytes", sent);
+                            ok.put("ms", System.currentTimeMillis() - t0);
+                            asrcSet(ok);
+                            android.util.Log.i("VotBridge", "audiosrc done bytes=" + sent
+                                    + " itag=" + gotItag + " tid=" + translationId
+                                    + " client=page-sabr ms="
+                                    + (System.currentTimeMillis() - t0));
+                            return;
+                        }
+                        lastErr = "page-sabr: " + sr.summary();
+                        android.util.Log.e("VotBridge", "audiosrc page-sabr short: "
+                                + sr.summary());
+                    } catch (Throwable e) {
+                        lastErr = "page-sabr: " + e;
+                        android.util.Log.e("VotBridge", "audiosrc page-sabr failed: " + e);
+                    }
+                }
+            }
+            long ts = System.currentTimeMillis();
+            YandexSession se = YandexClient.ensureSession();
+            if (se == null) throw new IOException("no session");
+            android.util.Log.i("VotBridge", "audiosrc session ms="
+                    + (System.currentTimeMillis() - ts));
+            long tp0 = System.currentTimeMillis();
+            PoToken.Tokens t = PoToken.getWithVisitor(sAppCtx, videoId, pageVd);
+            android.util.Log.i("VotBridge", "audiosrc pot ms="
+                    + (System.currentTimeMillis() - tp0) + " vd=" + t.visitorData.length()
+                    + " pageVd=" + pageVd.length());
+
+            // 1) URL от страницы — первым и без InnerTube. Он уже подписан
+            // клиентом, которым плеер играет прямо сейчас.
+            if (!seedUrl.isEmpty() && seedClen > 0) {
+                int st = (int) Math.max(1L, (seedClen + AUDIO_CHUNK_SIZE - 1) / AUDIO_CHUNK_SIZE);
+                int it = seedItag > 0 ? seedItag : 140;
+                pageUrl = seedUrl;
+                pageItag = it;
+                pageClen = seedClen;
+                pageTotal = st;
+                android.util.Log.i("VotBridge", "audiosrc page-src itag=" + it
+                        + " clen=" + seedClen + " chunks=" + st + " ua=" + seedUa.length()
+                        + " at=" + (System.currentTimeMillis() - t0));
+                try {
+                    sendTrack(gen, videoId, videoUrl, translationId, se,
+                            seedUa.isEmpty() ? C_WEB.uaOrWeb() : seedUa,
+                            seedUrl, it, seedClen, st, "page-src", t0);
+                    return;
+                } catch (Throwable e) {
+                    lastErr = "page-src: " + e;
+                    android.util.Log.e("VotBridge", "audiosrc page-src failed: " + e);
+                }
+            }
+
+            for (int ci = 0; ci < AUDIO_CLIENTS.length; ci++) {
+                if (gen != sAsrcGen) return; // another video took over
+                Client cl = AUDIO_CLIENTS[ci];
+                try {
+                    long tp = System.currentTimeMillis();
+                    JSONObject j = itPlayer(videoId, cl, t.visitorData, t.playerPot);
+                    JSONObject f = pickAudio(j);
+                    if (f == null) {
+                        JSONObject ps = j.optJSONObject("playabilityStatus");
+                        lastErr = cl.name + ": no audio format (status="
+                                + (ps == null ? "?" : ps.optString("status", "?")) + ")";
+                        if (sabrJson == null) {
+                            sabrFmt = pickSabrAudio(j);
+                            if (sabrFmt != null) sabrJson = j;
+                        }
+                        android.util.Log.i("VotBridge", "audiosrc " + lastErr);
+                        continue;
+                    }
+                    int itag = f.optInt("itag", 0);
+                    String url = f.optString("url", "");
+                    long clen = f.optLong("contentLength", 0L);
+                    if (clen <= 0) clen = qclen(url);
+                    if (clen <= 0) {
+                        lastErr = cl.name + ": no content length";
+                        continue;
+                    }
+                    int total = (int) Math.max(1L,
+                            (clen + AUDIO_CHUNK_SIZE - 1) / AUDIO_CHUNK_SIZE);
+                    pageUrl = url;
+                    pageItag = itag;
+                    pageClen = clen;
+                    pageTotal = total;
+                    android.util.Log.i("VotBridge", "audiosrc " + videoId + " " + cl.name
+                            + " itag=" + itag + " clen=" + clen + " chunks=" + total
+                            + " playerMs=" + (System.currentTimeMillis() - tp)
+                            + " at=" + (System.currentTimeMillis() - t0));
+                    sendTrack(gen, videoId, videoUrl, translationId, se, cl.uaOrWeb(),
+                            url, itag, clen, total, cl.name, t0);
+                    return;
+                } catch (Throwable e) {
+                    lastErr = cl.name + ": " + e;
+                    android.util.Log.e("VotBridge", "audiosrc " + cl.name + " failed: " + e);
+                }
+            }
+            // 3) SABR. TVHTML5 is the one client the bot gate does not stop, but
+            // it only serves serverAbrStreamingUrl: the bytes have to be pulled
+            // frame by frame, exactly like the TV player does. Yandex still gets
+            // ordinary 5.3 MB parts, so nothing changes on that side.
+            if (sabrJson != null && sabrFmt != null) {
+                try {
+                    Sabr.Params sp = sabrParams(videoId, sabrJson, t, sabrFmt);
+                    final int fgen = gen;
+                    sp.cancel = new Sabr.Cancel() {
+                        public boolean cancelled() { return fgen != sAsrcGen; }
+                    };
+                    long clen = sabrFmt.clen;
+                    int total = clen <= 0 ? 0 : (int) Math.max(1L,
+                            (clen + AUDIO_CHUNK_SIZE - 1) / AUDIO_CHUNK_SIZE);
+                    if (total <= 0) {
+                        // No contentLength in the player response: fall back to a
+                        // maximum-length guestimate so parts still get numbered.
+                        total = Math.max(1, (int) (60L * 1024 * 1024 / AUDIO_CHUNK_SIZE));
+                        clen = (long) total * AUDIO_CHUNK_SIZE;
+                    }
+                    String fileId = YandexClient.buildFileId(sabrFmt.itag, String.valueOf(clen));
+                    SabrUpload up = new SabrUpload(gen, videoId, videoUrl, translationId, fileId,
+                            sabrFmt.itag, clen, total, t0);
+                    android.util.Log.i("VotBridge", "audiosrc sabr start itag=" + sabrFmt.itag
+                            + " clen=" + clen + " chunks=" + total
+                            + " ustreamer=" + sp.ustreamerConfig.length()
+                            + " pot=" + sp.poToken.length() + " at=" + (System.currentTimeMillis() - t0));
+                    Sabr.Result sr = Sabr.run(sp, up);
+                    long sent = up.finish();
+                    android.util.Log.i("VotBridge", "audiosrc sabr " + sr.summary()
+                            + " sent=" + sent + " parts=" + up.partsUploaded());
+                    if (sent > 0 && up.partsUploaded() >= Math.min(total, 1)) {
+                        JSONObject ok = asrcState("done", videoId);
+                        ok.put("client", "sabr");
+                        ok.put("itag", sr.itag > 0 ? sr.itag : sabrFmt.itag);
+                        ok.put("size", sent);
+                        ok.put("total", clen);
+                        ok.put("chunks", up.partsUploaded());
+                        ok.put("bytes", sent);
+                        ok.put("ms", System.currentTimeMillis() - t0);
+                        asrcSet(ok);
+                        android.util.Log.i("VotBridge", "audiosrc done bytes=" + sent + " itag="
+                                + (sr.itag > 0 ? sr.itag : sabrFmt.itag) + " tid=" + translationId
+                                + " client=sabr ms=" + (System.currentTimeMillis() - t0));
+                        return;
+                    }
+                    lastErr = "sabr: " + sr.summary();
+                    android.util.Log.e("VotBridge", "audiosrc sabr short: " + sr.summary());
+                } catch (Throwable e) {
+                    lastErr = "sabr: " + e;
+                    android.util.Log.e("VotBridge", "audiosrc sabr failed: " + e);
+                }
+            }
+            // Nothing downloadable from the bridge. Hand the url to the page: its
+            // network stack is the same one the player streams with, so it is
+            // accepted where Java is not. The page pulls one part at a time and
+            // posts it back to /audiosrc/raw, which does the Yandex upload here.
+            if (!pageUrl.isEmpty() && pageTotal > 0) {
+                synchronized (ASRC_LOCK) {
+                    sPageUrl = pageUrl;
+                    sPageFileId = YandexClient.buildFileId(pageItag, String.valueOf(pageClen));
+                    sPageVideoUrl = videoUrl;
+                    sPageTid = translationId;
+                    sPageItag = pageItag;
+                    sPageClen = pageClen;
+                    sPageTotal = pageTotal;
+                    sPageSent = 0L;
+                    sPageLastPart = -1;
+                    sPageGen = gen;
+                }
+                JSONObject st = asrcState("need_page", videoId);
+                st.put("phase", "page");
+                st.put("url", pageUrl);
+                st.put("itag", pageItag);
+                st.put("clen", pageClen);
+                st.put("total", pageClen);
+                st.put("chunks", pageTotal);
+                st.put("chunk", 0);
+                st.put("bytes", 0L);
+                st.put("part", 0);
+                st.put("err", lastErr);
+                st.put("ms", System.currentTimeMillis() - t0);
+                asrcSet(st);
+                android.util.Log.i("VotBridge", "audiosrc need_page itag=" + pageItag
+                        + " clen=" + pageClen + " chunks=" + pageTotal + " why=" + lastErr);
+                return;
+            }
+            JSONObject err = asrcState("error", videoId);
+            err.put("err", lastErr);
+            err.put("ms", System.currentTimeMillis() - t0);
+            asrcSet(err);
+            android.util.Log.e("VotBridge", "audiosrc failed: " + lastErr);
+        } catch (Throwable e) {
+            JSONObject err = asrcState("error", videoId);
+            try {
+                err.put("err", String.valueOf(e));
+                err.put("ms", System.currentTimeMillis() - t0);
+            } catch (Throwable ignored) { }
+            asrcSet(err);
+            android.util.Log.e("VotBridge", "audiosrc job failed: " + e);
+        }
+    }
+
+    // Downloads the whole track window-by-window from one signed url and pushes
+    // each window straight into the Yandex cache. Shared by the page-supplied
+    // url and the InnerTube clients, so both paths upload identically.
+    private static void sendTrack(int gen, String videoId, String videoUrl, String translationId,
+                                  YandexSession se, String ua, String url, int itag, long clen,
+                                  int total, String who, long t0) throws Exception {
+        String fileId = YandexClient.buildFileId(itag, String.valueOf(clen));
+        long sent = 0;
+        for (int i = 0; i < total; i++) {
+            if (gen != sAsrcGen) return;
+            long from = (long) i * AUDIO_CHUNK_SIZE;
+            long to = Math.min(clen, from + AUDIO_CHUNK_SIZE) - 1;
+            final long baseSent = sent;
+            final int partNo = i;
+            byte[] chunk = rangeGet(url, ua, from, to, new RangeProgress() {
+                public void onBytes(int got) {
+                    asrcProgress(videoId, "download", partNo + 1, total,
+                            baseSent + got, clen, itag, who, System.currentTimeMillis() - t0);
+                }
+            });
+            // A final part carries the number of parts, the ones in the middle
+            // carry 0 — exactly what the real client sends.
+            int parts = total <= 1 ? 0 : (i == total - 1 ? total : 0);
+            asrcProgress(videoId, "upload", i + 1, total, sent, clen, itag, who,
+                    System.currentTimeMillis() - t0);
+            if (total <= 1) {
+                YandexClient.uploadSingleAudio(se, videoUrl, translationId, fileId, chunk);
+            } else {
+                YandexClient.uploadChunkAudio(se, videoUrl, translationId, fileId, i, parts, chunk);
+            }
+            sent += chunk.length;
+            android.util.Log.i("VotBridge", "audiosrc chunk " + (i + 1) + "/" + total
+                    + " bytes=" + chunk.length + " sent=" + sent
+                    + " at=" + (System.currentTimeMillis() - t0));
+            asrcProgress(videoId, "download", i + 1, total, sent, clen, itag, who,
+                    System.currentTimeMillis() - t0);
+        }
+        JSONObject ok = asrcState("done", videoId);
+        ok.put("client", who);
+        ok.put("itag", itag);
+        ok.put("size", sent);
+        ok.put("total", clen);
+        ok.put("chunks", total);
+        ok.put("bytes", sent);
+        ok.put("ms", System.currentTimeMillis() - t0);
+        asrcSet(ok);
+        android.util.Log.i("VotBridge", "audiosrc done bytes=" + sent + " itag=" + itag
+                + " tid=" + translationId + " client=" + who + " ms="
+                + (System.currentTimeMillis() - t0));
+    }
+
+    // ---- /audiosrc/raw?part=i: page-relayed part --------------------------
+    // The page fetched one part with its own XHR (because googlevideo rejected
+    // the bridge) and posts the bytes here; the Yandex upload stays in Java.
+    private static JSONObject handleAudioRaw(int part, byte[] data) throws Exception {
+        String videoUrl;
+        String tid;
+        String fileId;
+        int itag;
+        long clen;
+        int total;
+        int gen;
+        synchronized (ASRC_LOCK) {
+            if (sPageUrl.isEmpty() || sPageTotal <= 0) throw new IOException("no page relay active");
+            videoUrl = sPageVideoUrl;
+            tid = sPageTid;
+            fileId = sPageFileId;
+            itag = sPageItag;
+            clen = sPageClen;
+            total = sPageTotal;
+            gen = sPageGen;
+        }
+        // The page may still be flushing parts of the previous video while a new
+        // one is already staged: those bytes belong to another translationId and
+        // fileId, so uploading them would silently corrupt the wrong track.
+        if (gen != sAsrcGen) throw new IOException("stale page gen " + gen + "/" + sAsrcGen);
+        if (part < 0 || part >= total) throw new IOException("bad part " + part + "/" + total);
+        if (data == null || data.length == 0) throw new IOException("empty part " + part);
+
         YandexSession se = YandexClient.ensureSession();
         if (se == null) throw new IOException("no session");
+        int parts = total <= 1 ? 0 : (part == total - 1 ? total : 0);
+        if (total <= 1) {
+            YandexClient.uploadSingleAudio(se, videoUrl, tid, fileId, data);
+        } else {
+            YandexClient.uploadChunkAudio(se, videoUrl, tid, fileId, part, parts, data);
+        }
+        long sent;
+        synchronized (ASRC_LOCK) {
+            sent = sPageSent + data.length;
+            sPageSent = sent;
+            sPageLastPart = part;
+        }
+        boolean last = part == total - 1;
+        JSONObject st = asrcState(last ? "done" : "working", videoIdOfPage());
+        if (last) {
+            st.put("client", "page");
+            st.put("itag", itag);
+            st.put("size", sent);
+            st.put("total", clen);
+            st.put("chunks", total);
+            st.put("part", total);
+            st.put("chunk", total);
+            st.put("bytes", sent);
+            asrcSet(st);
+            android.util.Log.i("VotBridge", "audiosrc page done bytes=" + sent + " itag=" + itag
+                    + " tid=" + tid + " gen=" + gen);
+        } else {
+            st.put("phase", "download");
+            st.put("part", part + 1);
+            st.put("chunk", part + 1);
+            st.put("chunks", total);
+            st.put("bytes", sent);
+            st.put("total", clen);
+            st.put("itag", itag);
+            st.put("client", "page");
+            asrcSet(st);
+            android.util.Log.i("VotBridge", "audiosrc page part " + (part + 1) + "/" + total
+                    + " bytes=" + data.length + " sent=" + sent);
+        }
+        JSONObject out = new JSONObject();
+        out.put("ok", 1);
+        out.put("part", part);
+        out.put("sent", sent);
+        out.put("last", last ? 1 : 0);
+        return out;
+    }
 
-        PoToken.Tokens t = PoToken.get(sAppCtx, videoId);
-        String lastErr = "";
-        for (int ci = 0; ci < AUDIO_CLIENTS.length; ci++) {
-            Client cl = AUDIO_CLIENTS[ci];
-            String cv = cl.name;
+    private static String videoIdOfPage() {
+        try {
+            return sAsrcState.optString("videoId", "");
+        } catch (Throwable e) {
+            return "";
+        }
+    }
+
+    // The non-WEB clients need no token at all, so the bare url goes first; the
+    // "&pot=" variant is only a second chance for a client that does want it.
+    private static byte[] rangeGetAny(String url, Client cl, PoToken.Tokens t, long from, long to,
+                                      RangeProgress p) throws IOException {
+        String withPot = withPotParam(url, t == null ? "" : t.playerPot);
+        IOException err = null;
+        String[] cands = withPot.equals(url) ? new String[]{url} : new String[]{url, withPot};
+        for (int i = 0; i < cands.length; i++) {
             try {
-                JSONObject j = itPlayer(videoId, cl, t.visitorData, t.playerPot);
-                JSONObject f = pickAudio(j);
-                if (f == null) {
-                    JSONObject ps = j.optJSONObject("playabilityStatus");
-                    lastErr = cv + ": no audio format (status="
-                            + (ps == null ? "?" : ps.optString("status", "?")) + ")";
-                    android.util.Log.i("VotBridge", "audiosrc " + lastErr);
-                    continue;
-                }
-                int itag = f.optInt("itag", 0);
-                String url = f.optString("url", "");
-                long clen = f.optLong("contentLength", 0L);
-                if (clen <= 0) clen = qclen(url);
-                android.util.Log.i("VotBridge", "audiosrc " + videoId + " " + cv
-                        + " itag=" + itag + " clen=" + clen);
-
-                byte[] data = downloadWithPot(url, cl, t);
-                if (data == null || data.length == 0) {
-                    lastErr = cv + ": download empty";
-                    continue;
-                }
-                android.util.Log.i("VotBridge", "audiosrc downloaded bytes=" + data.length
-                        + " via " + cv);
-
-                String fileId = YandexClient.buildFileId(itag, String.valueOf(data.length));
-                YandexClient.uploadStreamedAudio(se, videoUrl, translationId, fileId, data);
-                android.util.Log.i("VotBridge", "audiosrc uploaded bytes=" + data.length
-                        + " itag=" + itag + " tid=" + translationId);
-
-                JSONObject out = new JSONObject();
-                out.put("ok", 1);
-                out.put("client", cv);
-                out.put("itag", itag);
-                out.put("clen", clen);
-                out.put("size", data.length);
-                return out;
-            } catch (Throwable e) {
-                lastErr = cv + ": " + e;
-                android.util.Log.e("VotBridge", "audiosrc " + cv + " failed: " + e);
+                return rangeGet(cands[i], cl.uaOrWeb(), from, to, p);
+            } catch (IOException e) {
+                err = e;
             }
         }
-        throw new IOException("no downloadable audio for " + videoId + " (" + lastErr + ")");
+        throw err == null ? new IOException("range failed") : err;
+    }
+
+    // Exact byte window from googlevideo, retried: a truncated read means the
+    // connection died mid-chunk, 416 means the window is past the end.
+    private static byte[] rangeGet(String url, String ua, long from, long to, RangeProgress p)
+            throws IOException {
+        int want = (int) (to - from + 1);
+        IOException last = null;
+        for (int attempt = 0; attempt < 3; attempt++) {
+            HttpURLConnection c = null;
+            try {
+                c = (HttpURLConnection) new URL(url).openConnection();
+                c.setConnectTimeout(10000);
+                c.setReadTimeout(30000);
+                c.setRequestProperty("User-Agent", ua);
+                c.setRequestProperty("Accept", "*/*");
+                c.setRequestProperty("Range", "bytes=" + from + "-" + to);
+                int code = c.getResponseCode();
+                if (code == 416) throw new IOException("range 416 at " + from);
+                if (code != 206 && code != 200) {
+                    throw new IOException("http " + code + " " + errBodySnippet(c));
+                }
+                if (code == 200 && from > 0) {
+                    throw new IOException("range ignored (200) at " + from);
+                }
+                byte[] buf = new byte[want];
+                InputStream in = c.getInputStream();
+                int off = 0;
+                int repBytes = -1;
+                long repMs = 0L;
+                while (off < want) {
+                    int r = in.read(buf, off, want - off);
+                    if (r <= 0) break;
+                    off += r;
+                    if (p != null) {
+                        long nowMs = System.currentTimeMillis();
+                        if (repBytes < 0 || off - repBytes >= 262144 || nowMs - repMs >= 250L) {
+                            repBytes = off;
+                            repMs = nowMs;
+                            try { p.onBytes(off); } catch (Throwable ignored) { }
+                        }
+                    }
+                }
+                try { in.close(); } catch (Throwable ignored) { }
+                if (off == want) return buf;
+                throw new IOException("short read " + off + "/" + want);
+            } catch (IOException e) {
+                last = e;
+                android.util.Log.i("VotBridge", "range " + from + "-" + to + " try "
+                        + (attempt + 1) + ": " + e.getMessage());
+                // 403 is not transient: the url is bound to another client/UA, a
+                // retry just burns 12 s of the ladder — let the next client try.
+                if (String.valueOf(e.getMessage()).startsWith("http 403")) break;
+                try {
+                    Thread.sleep(300L * (attempt + 1));
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                }
+            } finally {
+                if (c != null) try { c.disconnect(); } catch (Throwable e) { }
+            }
+        }
+        throw last == null ? new IOException("range failed") : last;
     }
 
 
@@ -1385,7 +3320,10 @@ public final class Bridge {
             }
 
             byte[] body = new byte[0];
-            if (contentLength > 0 && contentLength < (4 * 1024 * 1024)) {
+            // 12 MB: the page relays one 5.3 MB audio part at a time to
+            // /audiosrc/raw, and the old 4 MB cap silently dropped the body,
+            // which surfaced as "empty part 0".
+            if (contentLength > 0 && contentLength < (12 * 1024 * 1024)) {
                 body = readN(in, contentLength);
             }
 
@@ -1419,9 +3357,73 @@ public final class Bridge {
                     } catch (Throwable ignore) { }
                     resp = capUpload(queryParam(path, "videoId"),
                             queryParam(path, "translationId"), itag).toString();
+                } else if (path.startsWith("/audiosrc/status")) {
+                    resp = audioSourceStatus().toString();
+                } else if (path.startsWith("/mseinit")) {
+                    resp = handleMseInit(body, queryParam(path, "vid"),
+                            queryParam(path, "mime")).toString();
+                } else if (path.startsWith("/audiosrc/raw")) {
+                    int part = -1;
+                    try {
+                        part = Integer.parseInt(queryParam(path, "part"));
+                    } catch (Throwable ignore) { }
+                    resp = handleAudioRaw(part, body).toString();
                 } else if (path.startsWith("/audiosrc")) {
                     JSONObject req = body.length > 0 ? new JSONObject(new String(body, StandardCharsets.UTF_8)) : new JSONObject();
                     resp = handleAudioSource(req).toString();
+                } else if (path.startsWith("/sabrreq")) {
+                    resp = handleSabrReq(body).toString();
+                } else if (path.startsWith("/sabrmix")) {
+                    int it = 0;
+                    try {
+                        it = Integer.parseInt(queryParam(path, "itag"));
+                    } catch (Throwable ignore) { }
+                    resp = handleSabrMix(it).toString();
+                } else if (path.startsWith("/sabrbody")) {
+                    int it = 0;
+                    try {
+                        it = Integer.parseInt(queryParam(path, "itag"));
+                    } catch (Throwable ignore) { }
+                    resp = handleSabrBody(it).toString();
+                } else if (path.startsWith("/sabrreplay")) {
+                    int it = 0;
+                    try {
+                        it = Integer.parseInt(queryParam(path, "itag"));
+                    } catch (Throwable ignore) { }
+                    resp = handleSabrReplay(queryParam(path, "mode"), queryParam(path, "videoId"),
+                            it, queryParam(path, "visitorData")).toString();
+                } else if (path.startsWith("/sabrcfg")) {
+                    resp = handleSabrCfg(body).toString();
+                } else if (path.startsWith("/sabrdiag")) {
+                    int it = 0;
+                    try {
+                        it = Integer.parseInt(queryParam(path, "itag"));
+                    } catch (Throwable ignore) { }
+                    resp = handleSabrDiag(it).toString();
+                } else if (path.startsWith("/sabrfile")) {
+                    long from = 0;
+                    int max = 4194304;
+                    try { from = Long.parseLong(queryParam(path, "from")); } catch (Throwable ignore) { }
+                    try {
+                        String mv = queryParam(path, "max");
+                        if (!mv.isEmpty()) max = Integer.parseInt(mv);
+                    } catch (Throwable ignore) { }
+                    resp = handleSabrFile(from, max).toString();
+                } else if (path.startsWith("/sabrtest")) {
+                    String vid = queryParam(path, "videoId");
+                    int it = 0;
+                    try {
+                        it = Integer.parseInt(queryParam(path, "itag"));
+                    } catch (Throwable ignore) { }
+                    if (!queryParam(path, "page").isEmpty()) {
+                        resp = handleSabrTestPage(it, queryParam(path, "xtags"),
+                                (int) longOf(queryParam(path, "raw"))).toString();
+                    } else if (!queryParam(path, "wire").isEmpty()) {
+                        resp = handleSabrTestWire(it).toString();
+                    } else {
+                        if (vid.isEmpty()) throw new IOException("missing videoId");
+                        resp = handleSabrTest(vid, it, queryParam(path, "visitorData")).toString();
+                    }
                 } else if (path.startsWith("/audiotest")) {
                     String vid = queryParam(path, "videoId");
                     if (vid.isEmpty()) throw new IOException("missing videoId");
@@ -1540,6 +3542,7 @@ public final class Bridge {
         o.put("faMode", sFaMode == null ? "audio" : sFaMode);
         o.put("audioMode", sAudioMode == null ? "off" : sAudioMode);
         o.put("pcFill", sPcFill);
+        o.put("aac", sAac);
         return o;
     }
 
@@ -1554,6 +3557,7 @@ public final class Bridge {
             if (req.has("faMode")) sFaMode = req.optString("faMode", "audio");
             if (req.has("audioMode")) sAudioMode = req.optString("audioMode", "off");
             if (req.has("pcFill")) sPcFill = req.optBoolean("pcFill", true);
+            if (req.has("aac")) sAac = req.optBoolean("aac", false);
             android.util.Log.i("VotBridge", "config " + configJson().toString());
         }
         return configJson();
@@ -2118,10 +4122,13 @@ public final class Bridge {
         int off = 0;
         while (off < n) {
             int r = in.read(b, off, n - off);
-            if (r < 0) break;
+            if (r <= 0) break;
             off += r;
         }
-        return b;
+        // Truncate: the caller must see the real length, otherwise a 31-byte
+        // error frame looks like `n` bytes of zeros and the part parser drowns
+        // in fake type-0 parts.
+        return off == n ? b : java.util.Arrays.copyOf(b, off);
     }
 
     private static String safeJson(String s) {
@@ -2408,9 +4415,12 @@ public final class Bridge {
             return b.toByteArray();
         }
 
-        // chunk: {1: translationId, 2: videoUrl, 4: {1:{1:idx,2:data}, 2:total, 3:fileId, 4:1}}
+        // chunk: {1: translationId, 2: videoUrl, 4: {1:{1:idx,2:data}, 2:audioPartsLength, 3:fileId, 4:1}}
+        // audioPartsLength is 0 for every part in the middle and equals the
+        // total part count on the last one — that is what the real client sends
+        // (Vox fork: VotAudioUploader), and the TV run confirmed it is accepted.
         static byte[] encodeChunkAudioRequest(String videoUrl, String translationId, String fileId,
-                                              int chunkIndex, int totalChunks, byte[] data) throws IOException {
+                                              int chunkIndex, int audioPartsLength, byte[] data) throws IOException {
             ByteArrayOutputStream b = new ByteArrayOutputStream();
             writeString(b, 1, translationId);
             writeString(b, 2, videoUrl);
@@ -2419,7 +4429,7 @@ public final class Bridge {
             writeBytes(part, 2, data);
             ByteArrayOutputStream wrap = new ByteArrayOutputStream();
             writeMessage(wrap, 1, part.toByteArray());
-            writeInt(wrap, 2, totalChunks);
+            writeInt(wrap, 2, audioPartsLength);
             writeString(wrap, 3, fileId);
             writeInt(wrap, 4, 1);
             writeMessage(b, 4, wrap.toByteArray());
@@ -2434,8 +4444,8 @@ public final class Bridge {
         }
 
         static void uploadChunkAudio(YandexSession se, String videoUrl, String translationId,
-                                     String fileId, int chunkIndex, int totalChunks, byte[] data) throws Exception {
-            byte[] body = encodeChunkAudioRequest(videoUrl, translationId, fileId, chunkIndex, totalChunks, data);
+                                     String fileId, int chunkIndex, int audioPartsLength, byte[] data) throws Exception {
+            byte[] body = encodeChunkAudioRequest(videoUrl, translationId, fileId, chunkIndex, audioPartsLength, data);
             Map<String, String> h = authHeaders(se, body, "/video-translation/audio");
             httpPut(YANDEX + "/video-translation/audio", body, h);
         }
@@ -2453,7 +4463,8 @@ public final class Bridge {
                 byte[] chunk = new byte[to - from];
                 System.arraycopy(data, from, chunk, 0, chunk.length);
                 android.util.Log.i("VotBridge", "audio chunk " + (i + 1) + "/" + total + " bytes=" + chunk.length);
-                uploadChunkAudio(se, videoUrl, translationId, fileId, i, total, chunk);
+                uploadChunkAudio(se, videoUrl, translationId, fileId, i,
+                        i == total - 1 ? total : 0, chunk);
             }
         }
 

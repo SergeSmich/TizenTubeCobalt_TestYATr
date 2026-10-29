@@ -68,6 +68,7 @@
     audioUploaded: false,
     audioIdx: 0,
     uploading: false,
+    pageRelay: false,   // мост отдал url странице: части качаем своим XHR
     retried: false,
     cfg: null,
     livelyVoice: false,
@@ -668,39 +669,261 @@
     else innertubeAudio(id, onSrc, onErr);
   }
 
-  // Serverless-путь для status=6: мост сам минтит poToken, берёт аудио-URL у
-  // InnerTube (ANDROID_VR → WEB), скачивает дорожку и грузит её в Яндекс
-  // (/audiosrc). Ни ПК, ни скачивания в странице не участвуют. Возвращает true,
-  // если запрос ушёл (дальше ждём поллингом).
+  // Serverless-путь для status=6: мост сам достаёт аудио-URL у InnerTube
+  // (ANDROID_VR / ANDROID / VISIONOS отдают прямой googlevideo-URL, которому не
+  // нужны ни poToken, ни "n"), качает дорожку ЦЕЛИКОМ по Range и отдаёт её
+  // Яндексу кусками по 5 295 308 Б. Это фоновый поток моста: видео не
+  // ускоряется, не встаёт на паузу и вообще не трогается — страница лишь
+  // опрашивает /audiosrc/status и рисует проценты.
   function bridgeAudioSrc(id, dur, tid) {
     if (!tid) { state.busy = false; setStatus('Перевод: нет translationId для аудио', '#e53935'); return false; }
     if (state.uploading) return true;
     if (state.audioUploaded) return false;
     state.uploading = true;
+    state.pageRelay = false;
+    state.srcTries = 0;
     state.translationId = String(tid);
     log('audiosrc id=' + id + ' tid=' + tid);
-    setStatus('Перевод: готовлю звук ролика…\nэто займёт до минуты', '#f5a623', 'wait');
-    http('POST', '/audiosrc',
-      { videoId: id, translationId: String(tid), videoUrl: watchUrl(id) },
-      function (r) {
-        state.uploading = false;
-        state.audioUploaded = true;
-        state.busy = false;
-        log('audiosrc ok client=' + (r && r.client || '?') + ' itag=' + (r && r.itag) +
-            ' size=' + (r && r.size));
-        setStatus('Перевод: звук загружен, жду перевод…', '#f5a623', 'wait');
-        poll(id, dur, 5);
-      },
+    setStatus('Перевод: качаю звук ролика в фоне…', '#f5a623', 'wait');
+    // Мост спросит InnerTube сам, но на этом ТВ клиенты всё чаще отдают
+    // LOGIN_REQUIRED. Свой подписанный URL у нас уже есть — его плеер
+    // использует прямо сейчас, поэтому отдаём его мосту вместе с нашим UA.
+    postAudioSrc(id, dur, tid, 12);
+    return true;
+  }
+
+  // Ждём до ~6 с появления аудио-URL в плеере (на старте ролика он появляется
+  // через 1–3 с), потом всё равно стартуем: пусть мост попробует сам.
+  function postAudioSrc(id, dur, tid, tries) {
+    if (state.curId !== id) { state.uploading = false; return; }
+    var ps = null;
+    try { ps = (window.__votAudioSrc && window.__votAudioSrc()) || null; } catch (e) { }
+    if (!ps && tries > 0) { setTimeout(function () { postAudioSrc(id, dur, tid, tries - 1); }, 500); return; }
+    var body = { videoId: id, translationId: String(tid), videoUrl: watchUrl(id) };
+    if (dur > 0) body.duration = Number(dur);
+    var vd = '';
+    try { vd = (window.__votVisitorData && window.__votVisitorData()) || ''; } catch (e) { }
+    if (vd) { body.visitorData = vd; log('audiosrc visitor len=' + vd.length); }
+    if (ps && ps.url && ps.clen > 0) {
+      body.srcUrl = ps.url;
+      body.srcItag = ps.itag;
+      body.srcClen = ps.clen;
+      body.srcUa = String((window.navigator && navigator.userAgent) || '');
+      log('audiosrc page url itag=' + ps.itag + ' clen=' + ps.clen + ' age=' + ps.age);
+    } else {
+      log('audiosrc no page url, trying innertube');
+    }
+    http('POST', '/audiosrc', body,
+      function () { pollSrc(id, dur, Date.now()); },
       function (e) {
         state.uploading = false;
         state.busy = false;
-        log('audiosrc ERR ' + e);
+        log('audiosrc start ERR ' + e);
         if (state.curId !== id) return;
-        // Звук не ушёл — не сдаёмся, держим живой tid как раньше.
         setStatus('Перевод: звук не отправился, жду сервер…', '#f5a623', 'wait');
         holdSix(id, dur, {}, 'audiosrc-failed');
       });
-    return true;
+  }
+
+  var SRC_POLL_MS = 700;       // шаг опроса статуса: 4 обновления в секунду хватает
+  var SRC_MAX_MS = 900000;     // 15 мин: дольше ждать бессмысленно
+
+  function pollSrc(id, dur, t0) {
+    if (state.curId !== id) { state.uploading = false; return; }
+    if (Date.now() - t0 > SRC_MAX_MS) {
+      state.uploading = false;
+      state.busy = false;
+      log('audiosrc timeout');
+      holdSix(id, dur, {}, 'audiosrc-timeout');
+      return;
+    }
+    http('GET', '/audiosrc/status', null, function (s) {
+      if (state.curId !== id) { state.uploading = false; return; }
+      var st = String((s && s.state) || '');
+      if (st === 'done') {
+        state.uploading = false;
+        state.audioUploaded = true;
+        state.busy = false;
+        log('audiosrc ok client=' + (s.client || '?') + ' itag=' + (s.itag || '?')
+          + ' size=' + (s.size || 0) + ' chunks=' + (s.chunks || 0) + ' ms=' + (s.ms || 0));
+        setStatus('Перевод: звук загружен ('
+          + Math.round(Number(s.size || 0) / 1024) + ' КБ), жду перевод…', '#f5a623', 'wait');
+        poll(id, dur, 5);
+        return;
+      }
+      if (st === 'error') {
+        // Мост мог стартовать на конфиге плеера от прошлого ролика и получить
+        // sabr.malformed_config. Пара «wire url + поле 5» появляется через
+        // пару секунд после старта воспроизведения — пробуем ещё раз.
+        state.srcTries = Number(state.srcTries || 0) + 1;
+        if (state.srcTries <= 3) {
+          log('audiosrc ERR ' + (s && s.err) + ' retry ' + state.srcTries + '/3');
+          setStatus('Перевод: звук не загрузился, пробую снова…', '#f5a623', 'wait');
+          var tid = Number(state.translationId || 0);
+          setTimeout(function () {
+            if (state.curId === id && state.uploading) postAudioSrc(id, dur, tid, 0);
+          }, 5000);
+          return;
+        }
+        state.uploading = false;
+        state.busy = false;
+        state.pageRelay = false;
+        log('audiosrc ERR ' + (s && s.err) + ' (no retries left)');
+        if (state.curId !== id) return;
+        setStatus('Перевод: звук не загрузился\n' + (s && s.err || ''), '#f5a623', 'wait');
+        holdSix(id, dur, {}, 'audiosrc-failed');
+        return;
+      }
+      // Мост не смог скачать дорожку сам (403 с пустым телом на этом ролике) и
+      // отдал подписанный url нам: страница качает те же байты своим сетевым
+      // стеком — тем самым, которым играет плеер.
+      if (st === 'need_page') {
+        if (!state.pageRelay) {
+          state.pageRelay = true;
+          log('audiosrc need_page why=' + (s && s.err));
+          pageRelay(id, dur, s, t0);
+        }
+        return;
+      }
+      var got = Number(s && s.bytes || 0);
+      var tot = Number(s && s.total || 0);
+      var ph = String((s && s.phase) || '');
+      var part = Number(s && s.part || 0);
+      var nparts = Number(s && s.chunks || 0);
+      var pct = tot > 0 ? Math.min(99, Math.round(got / tot * 100)) : 0;
+      var head;
+      if (ph === 'upload') head = 'отправляю звук в фоне ' + pct + '%';
+      else if (ph === 'download' || got > 0) head = 'качаю звук в фоне ' + pct + '%';
+      else head = 'ищу аудиопоток ролика…';
+      // Номер части показываем только когда их правда несколько: на коротком
+      // ролике «часть 1/1» в статусе выглядит как сбой.
+      var sub = nparts > 1 && part > 0 ? ' (часть ' + Math.min(part, nparts) + '/' + nparts + ')' : '';
+      setStatus('Перевод: ' + head + sub + '\n'
+        + (tot > 0 ? Math.round(got / 1024) + ' / ' + Math.round(tot / 1024) + ' КБ' : '…'),
+        '#f5a623', 'wait');
+      setTimeout(function () { pollSrc(id, dur, t0); }, SRC_POLL_MS);
+    }, function (e) {
+      log('audiosrc status ERR ' + e);
+      setTimeout(function () { pollSrc(id, dur, t0); }, SRC_POLL_MS * 2);
+    });
+  }
+
+  // ---- page relay: parts fetched by the page, uploaded by the bridge -------
+  // Мост получил 403 на googlevideo (Java-стек ТВ заблокирован на конкретном
+  // ролике), но страница тот же файл тянет плеером. Качаем части своим XHR,
+  // постим байты в /audiosrc/raw — загрузка в Яндекс остаётся в мосту.
+  var PAGE_PART = 5295308;     // ровно AUDIO_CHUNK_SIZE моста
+  var PAGE_TRIES = 2;
+
+  function pageRelay(id, dur, s, t0) {
+    var url = String((s && s.url) || '');
+    var clen = Number((s && s.clen) || 0);
+    var total = Number((s && s.chunks) || 0);
+    // У плеера может быть свой, более свежий подписанный URL того же трека.
+    // Берём его, только если длина файла совпадает: иначе поедут границы
+    // частей, а мост ждёт ровно `total` частей по 5 295 308 Б.
+    try {
+      var ps = (window.__votAudioSrc && window.__votAudioSrc()) || null;
+      if (ps && ps.url && clen > 0 && Number(ps.clen) === clen) {
+        url = ps.url;
+        log('audiosrc page relay uses player url itag=' + ps.itag + ' age=' + ps.age);
+      }
+    } catch (e) { }
+    if (!url || clen <= 0 || total <= 0) {
+      state.uploading = false;
+      state.pageRelay = false;
+      state.busy = false;
+      log('audiosrc page relay bad args clen=' + clen + ' parts=' + total);
+      holdSix(id, dur, {}, 'page-relay-bad');
+      return;
+    }
+    log('audiosrc page relay clen=' + clen + ' parts=' + total);
+    var idx = 0;
+    var bytes = 0;
+
+    function fail(e) {
+      state.pageRelay = false;
+      state.uploading = false;
+      state.busy = false;
+      log('audiosrc page ERR ' + e);
+      if (state.curId !== id) return;
+      setStatus('Перевод: звук не скачался страницей\n' + e, '#e53935', 'wait');
+      holdSix(id, dur, {}, 'page-fetch-failed');
+    }
+
+    function draw() {
+      var pct = clen > 0 ? Math.min(99, Math.round(bytes / clen * 100)) : 0;
+      setStatus('Перевод: качаю звук в фоне ' + pct + '% (часть '
+        + Math.min(idx + 1, total) + '/' + total + ')\n'
+        + Math.round(bytes / 1024) + ' / ' + Math.round(clen / 1024) + ' КБ',
+        '#f5a623', 'wait');
+    }
+
+    // Один диапазон файла. 206 — норма, а вот 200 значит, что Range проигнорирован
+    // и пришёл весь файл: вырезаем нужное окно сами, иначе части поедут.
+    function grab(from, to, tries, ok) {
+      var want = to - from + 1;
+      var x = new XMLHttpRequest();
+      x.open('GET', url, true);
+      x.responseType = 'arraybuffer';
+      x.timeout = 180000;
+      try { x.setRequestHeader('Range', 'bytes=' + from + '-' + to); } catch (e0) { }
+      x.onload = function () {
+        var buf = x.response;
+        var len = buf ? buf.byteLength : 0;
+        if (len === want) { ok(buf); return; }
+        if (len > want) { try { ok(buf.slice(0, want)); return; } catch (e1) { } }
+        if (tries > 1) { grab(from, to, tries - 1, ok); return; }
+        fail(new Error('googlevideo http ' + x.status + ' len=' + len + '/' + want));
+      };
+      x.onerror = function () {
+        if (tries > 1) { grab(from, to, tries - 1, ok); return; }
+        fail(new Error('googlevideo network'));
+      };
+      x.ontimeout = function () { fail(new Error('googlevideo timeout')); };
+      x.send();
+    }
+
+    function post(i, buf, ok) {
+      var x = new XMLHttpRequest();
+      x.open('POST', BRIDGE + '/audiosrc/raw?part=' + i, true);
+      x.setRequestHeader('Content-Type', 'application/octet-stream');
+      x.timeout = 180000;
+      x.onload = function () {
+        if (x.status === 200) { ok(); return; }
+        var t = '';
+        try { t = String(x.responseText || '').slice(0, 160); } catch (e2) { }
+        fail(new Error('bridge http ' + x.status + (t ? ' ' + t : '')));
+      };
+      x.onerror = function () { fail(new Error('bridge network')); };
+      x.ontimeout = function () { fail(new Error('bridge timeout')); };
+      x.send(buf);
+    }
+
+    function next() {
+      if (state.curId !== id) { state.pageRelay = false; state.uploading = false; return; }
+      if (idx >= total) {
+        state.pageRelay = false;
+        setStatus('Перевод: звук отправлен, жду перевод…', '#f5a623', 'wait');
+        pollSrc(id, dur, t0);
+        return;
+      }
+      var from = idx * PAGE_PART;
+      var to = Math.min(clen, from + PAGE_PART) - 1;
+      draw();
+      grab(from, to, PAGE_TRIES, function (buf) {
+        if (state.curId !== id) { state.pageRelay = false; state.uploading = false; return; }
+        post(idx, buf, function () {
+          bytes += buf.byteLength;
+          idx += 1;
+          log('audiosrc page part ' + idx + '/' + total + ' bytes=' + bytes);
+          draw();
+          setTimeout(next, 0);
+        });
+      });
+    }
+
+    next();
   }
 
   // Ask the PC dev server to download the track and push it into the Yandex
@@ -834,7 +1057,8 @@
     return true;
   }
 
-  // status=6 (AUDIO_REQUESTED) — НЕ терминальный и НЕ повод бросать задачу.
+
+
   // Замеры 26.10: (а) тот же tid `X23-S8hAa3c` отдал 6, а через ~3.5 мин — 1,
   // (б) на «мёртвых» `l08V8bNg53I`/`1GZ5pFwdU2M` 6 → 2 → терминальный 0.
   // Отличить (а) от (б) по ответу нельзя, поэтому держим tid и опрашиваем:
@@ -1745,6 +1969,7 @@
     state.audioUploaded = false;
     state.audioIdx = 0;
     state.uploading = false;
+    state.pageRelay = false;
     state.retried = false;
     state.pcTried = false;
     state.pcDeadline = 0;
@@ -1772,8 +1997,15 @@
     try { schedulePaint(); } catch (ep) { }
     fetchMeta(id);
     var tries = 0;
+    var cfgWait = 0;
     (function wait() {
       var v = findVideo();
+      // Без конфига моста неизвестно, включён ли захват (audioMode): даём ему
+      // до 10 с, но не блокируем запуск навсегда.
+      if (v && v.duration > 0 && !state.cfg && cfgWait++ < 20) {
+        setTimeout(wait, 500);
+        return;
+      }
       if (v && v.duration > 0) {
         log('video ready id=' + id + ' dur=' + v.duration.toFixed(1) + ' src=' + String(v.currentSrc || v.src || '').slice(0, 180));
         gvProbes();

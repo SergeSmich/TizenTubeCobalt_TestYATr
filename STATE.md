@@ -1,53 +1,64 @@
-# STATE — TizenTubeCobalt + Yandex VOT (29.10.2026, ночь)
+# STATE — TizenTubeCobalt + Yandex VOT (29.10.2026)
 
 ## Цель
-Живые голоса Яндекса (VOT) в TizenTubeCobalt **serverless** (в рантайме API Яндекса + статика GitHub/CDN).
-Ветка `fix-vot-runtime-injection`, PR в `main` не делать. История — `STATE_ARCHIVE.md`.
-Тест: **`YNDX-00091` (magritte, Android 11, armeabi-v7a) `adb 192.168.1.100:5555`**, пакет
-`io.gh.reisxd.tizentube.cobalt` 2.0.3, activity `dev.cobalt.app.MainActivity`.
-**SberBox 192.168.1.198 НЕ ТРОГАТЬ** до отдельной команды.
+Живой перевод Яндекса (VOT) в TizenTubeCobalt **serverless**: API Яндекса в рантайме + статика
+GitHub/CDN, без форка и без ПК-сервера. Ветка `fix-vot-runtime-injection`, PR в `main` не делать.
+Тест: **`YNDX-00091` (magritte, Android 11, armeabi-v7a) `adb 192.168.1.100:5555`**,
+пакет `io.gh.reisxd.tizentube.cobalt` 2.0.3, activity `dev.cobalt.app.MainActivity`.
+**SberBox 192.168.1.198 НЕ ТРОГАТЬ.** История до 29.10 — `STATE_ARCHIVE.md`.
 
-## ✅ Работает на ТВ (проверено, ПК-сервер ВЫКЛЮЧЕН)
-- Standalone: `overlay from assets 192692 bytes` → `/ping` 200 → `/config`
-  `{"lively":false,"hasToken":false,"audioMode":"capture","pcFill":false}`.
-- Бутстрап в `libchrobalt.so` = реф **`v@b003`**: лёгкий загрузчик, грузит оригинальный
-  `userScript.js` с CDN и fetch-ит `/vot.js` с моста (127.0.0.1:8013) → eval. Перепрошивать не нужно.
-- Авто-перевод без клика (`vot.js:1784` → `startTranslation` на каждом ролике).
-- **E2E доказан на НЕкэшированном ролике `Oj8Sz0LQAos`**: `cap begin` → `status=6` →
-  `cap uploaded bytes=1230146 itag=140 in 266ms` → `status=2` (rem→0) → `status=1` →
-  `play https://vtrans.s3-private.mds.yandex.net/tts/prod/...` → `playback started`.
-- **Определение языка без ПК**: `fetchMeta` теперь при `pcFill:false` идёт в `/meta_local`
-  (мост, player-ответ, `defaultAudioTrackIndex`) → `meta_local id=… lang=en 836ms`, задержка 17 с ушла.
+## ✅ 29.10 ~05:56 — E2E РАБОТАЕТ ПОЛНОСТЬЮ АВТОМАТИЧЕСКИ
+`rtrdroYs67A` (4014 с), без ручных запросов: `translate start` (страница сама) → `status=6` +
+tid → `POST /audiosrc` (сама) → `page-sabr` скачал **81 922 133 Б** itag 140 → 16 частей залито
+→ Яндекс `status=5` → `status=1` + `audioUrl`, страница **включила перевод** (`play offset=…`,
+`vol tr=100 orig=10`). Время: 74.8 с на аудио, ~3 мин до готового перевода.
+Контроль на `hPV-Ql_KGzM` (4199 с): mp3 у Яндекса **4198.654785 с**, 67 179 877 Б — полная длина.
 
-## 🔴 Грабли: чёрный экран (вылечено)
-`am start … -f 0x10008000` при уже работающем приложении убивает surface:
-`onVideoSurfaceDestroyed` → `Prepare to suspend` **без resume** → Cobalt навсегда suspend →
-`[ERROR:player_create.cc(201)] Video surface is not available now` → SbPlayer не создаётся = чёрный экран,
-при этом страница жива (MSE качает), а TTS играет отдельным MediaPlayer моста.
-**Правило: не перезапускать activity через `-f 0x10008000`, когда приложение на экране.**
-Холодный старт (после install) с `-f 0x10008000` — безопасен.
+## Как это работает (три обязательных ингредиента)
+1. **AAC вместо opus**: `/config.aac=true` (теперь дефолт) → страница в `patchCodecs` отвечает
+   «нет» на `audio/webm|opus` в `MS.isTypeSupported` → плеер берёт `audio/mp4; codecs="mp4a.40.2"`,
+   SABR отдаёт **itag 140**. С opus (251) файл — matroska/webm с 25 000 ошибок
+   `non monotonically increasing dts` (сервер отдаёт перекрывающиеся фрагменты не по порядку).
+2. **Init-сегмент из MSE**: SABR отдаёт сессии, которая уже играла, только media-фрагменты.
+   Страница на первом `appendBuffer` аудио-SourceBuffer постит байты в `POST /mseinit?vid=&mime=`
+   (723 Б, `ftyp/dash`), мост пишет их первыми в стейдж. Без init файл вообще не контейнер.
+3. **Тело POST самого плеера без поля 3** (`buffered_ranges`): только эта форма даёт медиа
+   (`raw=2`); наше тело → policy-only (`35/46/47`), `raw=1` (с полем 3) → 0 байт.
+   Плюс пейсинг по таймингам части 35 (`d=`).
 
-## ⚠️ Осталось
-- **Покрытие**: захват = только проигранное из MSE, обрезка `CAP_MIN 12s / CAP_MAX 45s / 4 МБ`
-  (`vot.js:736-741`), `CAP_LIMIT 24 МБ` (`vot_net.js:181`). Полный трек не решён.
-- Косметика: при холодном старте `overlay fetch failed` / `config fetch failed` 3×8 с на мёртвый
-  `192.168.1.186:8013`, затем backoff 300 с. Не влияет на работу (берутся `assets`), но шумит в логе.
-- Без токена Яндекса `lively=false` → обычный голос (токен приходил только с ПК).
-- VIEW-интент на холодном старте открывает home, ролик выбирается автоплеем — для тестов
-  открывать ссылку после HOME, без clear-task.
+## Состояние кода
+- `Sabr.java`: `Params.bodyTpl/bodyStrip`, `replayBody(tpl,time,strip)`, `parse()` частей
+  35/52/53 (`nextDelayMs`), `stuckLimit/replayLimit`, `Result.initSegs/dupInit/declMs/pol`,
+  `umpVarint` (заголовки) отдельно от `readVarint` (protobuf).
+- `Bridge.java`: `/mseinit`, `mseInitFor(vid)`, `SabrStage.init(byte[])`, `capturedSabrBody(vid)`,
+  `sAac` (дефолт true) + `/config.aac`, стейджинг в `vot_asrc.bin` → `uploadStaged` (5 295 308 Б),
+  `mp4Head`, `/sabrfile?from=&max=` (4 МБ), `/sabrtest?page=1&raw=N&xtags=`.
+- `vot_net.js`: `hookMse` → `mseInitSend`, `pullConfig` каждые 12 с (in-flight guard),
+  `patchCodecs` (флаг `aac`).
+- Ревью `reviewer` пройдено, обязательные фиксы внесены: `handleAudioRaw` отбивает части
+  стале-поколения (`gen != sAsrcGen`), `SabrStage.init` пробрасывает `IOException`.
+- `javac` OK, `node --check` OK (`vot_net.js` и `assets/vot.js`), закоммичено в ветку.
 
-## Следующие шаги
-1. Ревью (`reviewer`) и коммит рабочего serverless-состояния в `fix-vot-runtime-injection` (не пушить).
-2. Полный трек: seek-обход таймлайна (докачка сегментов + склейка) либо явное ограничение обещания.
-3. По желанию: тишина в логе при `pcFill:false` (не ходить за config/overlay на ПК при наличии assets).
+## 🔎 Известная проблема качества (следующее)
+Плеер ТВ сам выбирает **автодуб**: в захваченном body/wire-url `xtags=acont=dubbed-auto:lang=ar`.
+Значит и init, и SABR-медиа принадлежат арабской дорожке, и Яндекс переводит дубль, а не
+оригинал. Нужно заставить плеер брать оригинальный трек (ytcfg/эксперимент авто-дубля) либо
+просить SABR оригинал и брать init того же формата — проверить на ролике без дублей (xt тег пуст)
+как контроль.
+
+## Следующий шаг
+1. ✅ Закоммичено: `a71c7962e49` (`vot: serverless полный аудиотрек через SABR replay`).
+   APK на ТВ — сборка 05:39, т.е. **без** двух защитных фиксов ревью; пересобрать при следующем прогоне.
+2. Разобраться с `dubbed-auto`: как отключить автодуб в плеере Cobalt (или запросить оригинал).
+3. Прогнать 2–3 ролика подряд (в т.ч. короткий) — проверить, что смена ролика не ломает
+   `mseInit`/`xtags` и что ретраи `/translate` не мешают авто-пути.
 
 ## Грабли
 - `am force-stop`/`kill` запрещены; install APK убивает процесс.
-- `adb forward tcp:18114 tcp:8013` для `.100`; старый `18014` принадлежит `.198` — не трогать.
-- Логи только `adb logcat -v time -s VotBridge:V` (+`starboard:V cobalt:V` для медиа).
-- `Bridge.java` с BOM (`utf-8-sig`); `build_bridge.ps1 -NoInstall` — сборка без установки;
-  APK `tt203_bridge.apk` в корне; `assets/vot.js` = `vot_ui.js + vot.js + vot_net.js` (`\n;\n`).
-- `curl`/`wget` на ТВ нет: `toybox nc` из `/data/local/tmp` или `adb forward` + Invoke-WebRequest.
-
-## Артефакты
-`…\opencode\`: `sa_meta.log` (E2E + meta_local), `sa_install.log`, `sa_e2e.log`, `cap_e2e.log`, `fork_vot_pid.log`.
+- `am start … -f 0x10008000` при живом приложении убивает surface → чёрный экран (только холодный старт).
+- Deep-link intent `VIEW watch?v=…` перезагружает страницу на выбор профиля (не всегда ведёт в ролик).
+- `adb forward tcp:18114 tcp:8013`; старый `18014` принадлежит `.198` — не трогать.
+- Логи только `adb logcat -v time -s VotBridge:V`.
+- `Bridge.java` с BOM (`utf-8-sig`); APK `tt203_bridge.apk`; `assets/vot.js` = vot_ui.js + vot.js + vot_net.js.
+- `/translate` без tid: вердикт читается тем же `firstRequest:false` + тот же `videoUrl`+`duration`.
+- `/sabrfile` целиком = OOM; тянуть по 4 МБ (`from`/`max`).

@@ -146,6 +146,61 @@ public final class PoToken {
         return sGen.isExpired();
     }
 
+    /**
+     * Same as get(), but the visitor id comes from the page. The bot gate that
+     * answers LOGIN_REQUIRED ("confirm you're not a bot") is bound to the
+     * visitor id, and our own freshly minted one gets flagged after a while,
+     * while the page keeps streaming the same video with its own. Minting the
+     * poToken for the page's id keeps both sides consistent.
+     */
+    public static Tokens getWithVisitor(Context ctx, String videoId, String vd) throws Exception {
+        if (vd == null || vd.isEmpty()) return get(ctx, videoId);
+        if (ctx == null) throw new IOException("no context");
+        synchronized (LOCK) {
+            Throwable last = null;
+            for (int attempt = 0; attempt < 2; attempt++) {
+                try {
+                    boolean expired = (sGen == null) || sGen.isExpired();
+                    if (expired) {
+                        closeGenLocked();
+                        long t0 = System.currentTimeMillis();
+                        sGen = Gen.create(ctx);
+                        android.util.Log.i(TAG, "pot: generator (page vd) ready in "
+                                + (System.currentTimeMillis() - t0) + "ms");
+                    }
+                    if (!vd.equals(sVisitorData) || sStreamingPot == null) {
+                        // Cheap: the generator is reused, only a fresh streaming
+                        // token for this visitor id is minted (~50 ms).
+                        long t0 = System.currentTimeMillis();
+                        sStreamingPot = sGen.generate(vd);
+                        sVisitorData = vd;
+                        POT_CACHE.clear();
+                        android.util.Log.i(TAG, "pot: page visitor in "
+                                + (System.currentTimeMillis() - t0) + "ms vd=" + cut(vd, 24));
+                    }
+                    String pot = "";
+                    if (videoId != null && !videoId.isEmpty()) {
+                        pot = POT_CACHE.get(videoId);
+                        if (pot == null) {
+                            long t0 = System.currentTimeMillis();
+                            pot = sGen.generate(videoId);
+                            POT_CACHE.put(videoId, pot);
+                            if (POT_CACHE.size() > 8) POT_CACHE.clear();
+                            android.util.Log.i(TAG, "pot: page playerPot " + videoId + " in "
+                                    + (System.currentTimeMillis() - t0) + "ms " + cut(pot, 16));
+                        }
+                    }
+                    return new Tokens(sVisitorData, pot, sStreamingPot);
+                } catch (Throwable e) {
+                    last = e;
+                    android.util.Log.e(TAG, "pot: page attempt " + (attempt + 1) + " failed: " + e);
+                    closeGenLocked();
+                }
+            }
+            throw new IOException("poToken(page) failed: " + last);
+        }
+    }
+
     private static void closeGenLocked() {
         Gen g = sGen;
         sGen = null;
