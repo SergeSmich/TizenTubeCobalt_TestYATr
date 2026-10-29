@@ -287,6 +287,30 @@
       var ur = mc.mediaUstreamerRequestConfig || {};
       var ucfg = String(ur.videoPlaybackUstreamerConfig || '');
       var fmts = sd.adaptiveFormats || [];
+      // Диагностика выбора дорожки: TV-плеер уходит в автодуб
+      // (`acont=dubbed-auto:lang=xx`), и мы получаем медиа дубля, а не
+      // оригинала. Список аудиоформатов с xtags/audioTrack показывает, есть ли
+      // в ответе оригинальная дорожка и как она называется.
+      try {
+        var vdId = capVideoId() || '?';
+        var desc = [];
+        for (var k = 0; k < fmts.length && desc.length < 8; k++) {
+          var q = fmts[k] || {};
+          var qi = Number(q.itag) || 0;
+          if (qi < 139 || qi > 251) continue;
+          var qx = String(q.xtags || '');
+          var qt = q.audioTrack || {};
+          desc.push(qi + (qx ? '[' + qx + ']' : '[-]')
+            + (qt.id ? '{' + String(qt.id).slice(0, 24) + (qt.audioIsDefault ? '*D' : '') + '}' : ''));
+        }
+        var dt = -1;
+        try {
+          var atr = j.captions.playerCaptionsTracklistRenderer || {};
+          dt = atr.defaultAudioTrackIndex;
+        } catch (e2) { }
+        once('audfmt-' + vdId, 'audfmt vid=' + vdId + ' def=' + dt
+          + ' ' + desc.join(' '));
+      } catch (e3) { }
       var best = null;
       for (var i = 0; i < fmts.length; i++) {
         var f = fmts[i] || {};
