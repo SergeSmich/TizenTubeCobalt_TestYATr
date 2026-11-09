@@ -1,0 +1,12 @@
+{
+  "task": "Сервисы перевода названий и план фич (маркер, регион, поиск, нейро-поиск)",
+  "kind": "task",
+  "path": "collab/opencode/L-0002-servisy-perevoda-nazvaniy-i-plan-fich.md",
+  "ping": "[L-0002] Задача: Сервисы перевода названий и план фич (маркер, регион, поиск, нейро-поиск). git fetch origin refs/heads/local/opencode:refs/remotes/origin/local/opencode; прочитай collab/opencode/L-0002-*.md из origin/local/opencode @ 2dd72502e02; ответь коммитом A-0002 в origin/arena/01a1c0d3.",
+  "state": "pending_send",
+  "base": "2dd72502e02",
+  "arena_ref": "origin/arena/01a1c0d3",
+  "id": "L-0002",
+  "updated": "2026-11-09T16:02:23+00:00",
+  "created": "2026-11-09T16:02:23+00:00"
+}
