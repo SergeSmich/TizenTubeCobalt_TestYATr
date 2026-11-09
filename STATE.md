@@ -295,3 +295,53 @@
   кнопку `ytlr-player-actions-container`.
 - Временный `bar dump` в `vot.js` (~4079–4120) пока оставлен для диагностики:
   печатает список кнопок с rect/aria/dis.
+
+## 09.11: громкость оригинала при переводе (enforceVolume)
+- Симптом: при включённом переводе оригинал «часто» звучал на 100%, хотя
+  задано 10%; ручная коррекция ползунком в меню помогала.
+- Причина: `applyVolume()` вызывался только на старте `/play`, при смене
+  префа и на стопе. Cobalt пересоздаёт `<video>`/сбрасывает `volume` при
+  смене ролика, дорожки, после рекламы и на переходах — сброс не ловился.
+- Фикс: `enforceVolume(why)` — сверяет `v.volume`/`v.muted` с
+  `volPct('vol.original')` каждые 250 мс (отдельный таймер) и в `syncLoop`
+  (1 с), плюс события `playing|loadeddata|volumechange|seeked`. При
+  расхождении возвращает значение и пишет `vol enforce why=… want=… got=…`
+  (лог ограничен 20 строками). Раз в 30 с — `vol watch want=… got=…`.
+- Проверено на `.100` (09.11): `hj3qDOx9g8g` — 5 снимков `vol watch`:
+  `want=10% got=0.1`; переключение на `C45RuVktN_Y` — два `vol enforce
+  why=event/tick want=10% got=1` сразу после смены ролика, затем снова
+  `got=0.1`. То есть сброс плеера теперь отлавливается в пределах тика.
+
+## 09.11: патчи A-0001 (язык/HOLD/OK) применены
+- `http()`: `timeout=20000` + `ontimeout` → зависший мост больше не оставляет
+  `busy`/`metaPending` навсегда (D1).
+- `fetchMeta`: выход при `curId !== id` до установки `metaPending`; ретраи
+  `META_GAPS` запускаются только для текущего ролика (D2).
+- Поздние ретраи (25 с и серия 45 с) при уже известном `origLang` снимают
+  `metaPending`, а не просто выходят (D3).
+- `metaAlive(id)` — сторож 70 с: если опрос сорвался, окно ожидания
+  гарантированно превращается в HOLD с рабочим OK; снимается при сбросе
+  ролика (D4).
+- `startTranslation`: входная проверка `curId` (с допуском `getVideoId()===id`
+  для ручного нажатия); `wait()` не запускает перевод прошлого ролика (D4').
+- `writeSourceInfo` (мост): запись без языка не перекрывает запись с языком
+  того же ранга/выше — `track lang=en` больше не теряется под `job {}` (D5).
+  `publishSource`: язык из `phase=page` не повышается до факта (D6).
+- `FOCUS_CTRL` расширен: slider/tab/link/option/switch/listbox/dialog,
+  progress-bar, scrubber, tabs, chip, playlist-panel (D3 аудита).
+- Прогон на `.100`: `hj3qDOx9g8g` — `meta_local en` → `translate start
+  lang=en` → `play offset=0.0`; `P541-Kmv-6Q` — `meta_local ru (ASR)` →
+  `translate skip (late meta)`; `timeout` и вечных `translate wait` нет.
+- Повторный чистый прогон после ревью-правок (`xhr done`-guard, `langRescue`/
+  `dropsKnownLang` в мосте): `hj3qDOx9g8g` — `watch detected` → `source …
+  lang=en phase=default` → `meta_local en from=xtags-original 1322ms` →
+  `translate waiting for source lang try=1` → `translate start lang=en` →
+  `translate resp status=1` → `play offset=0.0`; `vol watch want=10%
+  got=0.1` на 18:40:55 и 18:41:25. Патчи A-0001 закрыты.
+- Замечание по методике: если deep-link приходит, пока приложение ещё
+  поднимает домашнюю сетку (`ytlr-playback-preview` автоплей), watch-страница
+  не открывается и `translate start` не будет — это не регрессия. Надёжно:
+  дать приложению дойти до сетки, затем повторить `am start` (intent уйдёт
+  top-instance и откроет watch).
+
+

@@ -4,7 +4,7 @@ title: Аудит определения языка оригинала и око
 from: opencode
 to: arena
 kind: task
-status: open
+status: closed
 branch: local/opencode
 needs: none
 ---

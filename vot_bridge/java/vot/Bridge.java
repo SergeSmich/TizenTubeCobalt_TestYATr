@@ -2692,7 +2692,8 @@ public final class Bridge {
             String prevVid = prev == null ? "" : prev.optString("videoId", "");
             String prevLang = prev == null ? "" : prev.optString("lang", "");
             if (prev != null && videoId != null && videoId.equals(prevVid)
-                    && !prevLang.isEmpty()) {
+                    && !prevLang.isEmpty()
+                    && !"page".equals(prev.optString("phase", ""))) {
                 m.lang = prevLang;
                 m.acont = prev.optString("acont", "");
                 m.role = roleOfName(prev.optString("role", ""));
@@ -2837,9 +2838,22 @@ public final class Bridge {
                                                      int stripped, JSONObject extra) {
         try {
             JSONObject prev = sSrcInfo;
+            // unknown beats wrong, в обе стороны:
+            //  - запись без языка не блокирует корректный `track lang=en`
+            //    (langRescue: язык важнее ранга);
+            //  - безъязыкая запись не затирает уже известный язык, кроме
+            //    подсказки `phase=page` (её job с вырезанным дублем и должен
+            //    заменять на честный `dubStripped=1`).
+            String prevPhase = prev == null ? "" : prev.optString("phase", "page");
+            boolean newHasLang = m != null && m.lang != null && !m.lang.isEmpty();
+            boolean prevHasLang = prev != null && !prev.optString("lang", "").isEmpty();
+            boolean prevTrustedLang = prevHasLang && !"page".equals(prevPhase);
+            boolean lowerRank = prev != null && rank < srcRank(prevPhase);
+            boolean langRescue = !prevHasLang && newHasLang;
+            boolean dropsKnownLang = prevTrustedLang && !newHasLang;
             if (prev != null && videoId != null && !videoId.isEmpty()
                     && videoId.equals(prev.optString("videoId", ""))
-                    && rank < srcRank(prev.optString("phase", "page"))) {
+                    && ((lowerRank && !langRescue) || dropsKnownLang)) {
                 return;   // keep the better record we already have
             }
             String phase = srcPhase(rank);

@@ -114,6 +114,8 @@
     // Пока он есть, «язык не определён» показывать рано: поздний ретрай через
     // 25 с проходит бот-гейт, и перевод стартует сам.
     metaPending: null,
+    // Сторож окна ожидания: снимает metaPending, если опрос сорвался.
+    metaWd: null,
     // id ролика, для которого пользователь вручную включил перевод кнопкой:
     // ручное включение обходит правило skipLang.
     forceTranslate: null,
@@ -433,18 +435,32 @@
   function http(method, path, body, cb, err) {
     var x = new XMLHttpRequest();
     x.open(method, BRIDGE + path, true);
+    // Без таймаута зависший мост оставлял busy/metaPending навсегда: XHR ждал
+    // ответ вечно, а окно «определяю язык…» уже никем не снималось.
+    x.timeout = 20000;
+    // Таймаут поднимает и `ontimeout`, и `onreadystatechange` (status 0):
+    // без флага err сработал бы дважды и запустил две цепочки ретраев.
+    var done = false;
+    function finish(fn, arg) {
+      if (done) return;
+      done = true;
+      (fn || function () {})(arg);
+    }
+    x.ontimeout = function () { finish(err, new Error('timeout')); };
     x.setRequestHeader('Content-Type', 'application/json');
     x.onreadystatechange = function () {
-      if (x.readyState !== 4) return;
+      if (x.readyState !== 4 || done) return;
+      done = true;
       if (x.status === 200) {
-        try { cb(JSON.parse(x.responseText)); } catch (e) { (err || function () {})(e); }
+        try { if (cb) cb(JSON.parse(x.responseText)); }
+        catch (e) { (err || function () {})(e); }
       } else {
         var t = '';
         try { t = String(x.responseText || '').slice(0, 220); } catch (e2) { }
         (err || function () {})(new Error('http ' + x.status + (t ? ' ' + t : '')));
       }
     };
-    x.onerror = function () { (err || function () {})(new Error('network')); };
+    x.onerror = function () { finish(err, new Error('network')); };
     x.send(body ? JSON.stringify(body) : null);
   }
 
@@ -494,6 +510,13 @@
         }
         schedulePaint();
       });
+      // Ролик стартовал/переключил дорожку/вернулся после рекламы — плеер
+      // мог выставить 100%. Возвращаем громкость оригинала сразу.
+      function volNow() { enforceVolume('event'); }
+      v.addEventListener('playing', volNow);
+      v.addEventListener('loadeddata', volNow);
+      v.addEventListener('volumechange', volNow);
+      v.addEventListener('seeked', volNow);
     } catch (e) { log('video events ERR ' + (e && e.message)); }
   }
 
@@ -1617,6 +1640,10 @@
   }
 
   function startTranslation(id, dur, lang, metaTries) {
+    // Старый wait()/ретрай не должен занять busy и отправить /translate за
+    // прошлый ролик. curId=null (переход ещё не оформлен) не блокируем, и
+    // ручное нажатие на уже открытом новом ролике тоже проходит.
+    if (state.curId && state.curId !== id && getVideoId() !== id) return;
     if (state.busy) return;
     if (state.skipLangBlock === id) { state.busy = false; return; }
     // Новая операция перевода (кнопка, смена языка, другой шард) — свой бюджет
@@ -2049,6 +2076,10 @@
       http('POST', '/resume', { }, function () { }, function () { });
     }
 
+    // Страховка: если плеер сбросил громкость между событиями (Cobalt это
+    // делает молча), тик вернёт заданный процент.
+    enforceVolume('loop');
+
     http('GET', '/position', null, function (p) {
       if (!state.active) return;
       var vv = currentVideoTime();
@@ -2154,6 +2185,7 @@
     state.metaLate = null;
     state.metaLateN = 0;
     state.metaPending = null;
+    metaAlive(null);
     state.livelyVoice = false;
     state.playedOnce = false;
     state.restarting = false;
@@ -2190,7 +2222,7 @@
         probeYtcfg();
         probeAudio();
         probeLang();
-        startTranslation(id, v.duration);
+        if (state.curId === id) startTranslation(id, v.duration);
       } else if (tries++ < 60) {
         setTimeout(wait, 1000);
       } else {
@@ -2250,6 +2282,44 @@
     log('vol tr=' + tr + ' orig=' + pct + ' active=' + (state.active ? 1 : 0)
       + ' muted=' + (v.muted ? 1 : 0) + ' got=' + got);
   }
+
+  // Плеер Cobalt пересоздаёт <video> и сам возвращает ему 100% при старте
+  // ролика, смене аудиодорожки, после рекламы и при переходах по главам.
+  // Один вызов applyVolume() на старте перевода этот сброс не переживает,
+  // поэтому раз в тик сверяем фактическое значение и возвращаем нужное.
+  var volEnforceLog = 0;
+  var volEnforceN = 0;
+  var volWatchAt = 0;
+  function enforceVolume(why) {
+    if (!state.active) return;
+    var v = findVideo();
+    if (!v) return;
+    var pct = volPct('vol.original', 0);
+    var want = Math.max(0, Math.min(1, pct / 100));
+    var wantMuted = (pct <= 0);
+    var got = -1, gotMuted = false;
+    try { got = Number(v.volume); gotMuted = !!v.muted; } catch (e) { return; }
+    // Раз в 30 с — снимок «чего ждём и что видим»: по нему видно, сбрасывает
+    // ли плеер громкость сам, даже если enforce ни разу не сработал.
+    var now = Date.now();
+    if (now - volWatchAt > 30000) {
+      volWatchAt = now;
+      log('vol watch want=' + pct + '% got=' + got + ' muted=' + (gotMuted ? 1 : 0));
+    }
+    if (Math.abs(got - want) < 0.005 && gotMuted === wantMuted) return;
+    try { v.muted = wantMuted; } catch (e1) { }
+    try { v.volume = want; } catch (e2) { }
+    if (now - volEnforceLog > 1000 && volEnforceN < 20) {
+      volEnforceLog = now;
+      volEnforceN++;
+      log('vol enforce why=' + (why || 'loop') + ' want=' + pct + '% got=' + got
+        + ' muted=' + (gotMuted ? 1 : 0));
+    }
+  }
+
+  // Отдельный быстрый тик: сетевой syncLoop раз в секунду, а сброс громкости
+  // слышен сразу, поэтому проверяем чаще. Вне перевода функция выходит сразу.
+  setInterval(function () { enforceVolume('tick'); }, 250);
 
   // Подпись пункта «Громкость» в корне нативной панели.
   function votVolText() {
@@ -2619,6 +2689,22 @@
     schedulePaint();
   }
 
+  // Гарантированный финиш окна ожидания: если сеть или таймер сорвались,
+  // «определяю язык звука…» не может висеть вечно. 70 с > самого долгого
+  // законного ожидания (серия ретраев по 45 с), поэтому легальные ветки
+  // успевают переставить сторож на каждом шаге.
+  var META_DEADMAN_MS = 70000;
+  function metaAlive(id) {
+    if (state.metaWd) { clearTimeout(state.metaWd); state.metaWd = null; }
+    if (!id) return;
+    state.metaWd = setTimeout(function () {
+      state.metaWd = null;
+      if (state.curId !== id || state.metaPending !== id) return;
+      state.metaPending = null;
+      showLangHold(id);
+    }, META_DEADMAN_MS);
+  }
+
   // Язык оригинала. Оба источника живут на самой приставке, ПК не нужен:
   //  1) GET /source — что мост фактически отдал звуком (role/acont/lang и флаг
   //     dubStripped). Это описание тех байтов, которые ушли в Яндекс, поэтому
@@ -2629,9 +2715,13 @@
   // первым /translate, так что /source поначалу пуст.
   function fetchMeta(id, tries) {
     var n = tries || 0;
+    // Ретрай прошлого ролика не должен затирать флаг нового: иначе новый
+    // видит metaPending !== id и уходит в ложный HOLD, а флаг старого висит.
+    if (state.curId !== id) return;
     // Опрос начат: до первого ответа язык «не определён» ещё не факт —
     // startTranslation должен показать ожидание, а не HOLD.
     state.metaPending = id;
+    metaAlive(id);
     http('GET', '/source?videoId=' + encodeURIComponent(id), null, function (j) {
       if (state.curId !== id) return;
       if (!j || !j.ok) { fetchMetaLocal(id, n); return; }
@@ -2690,13 +2780,20 @@
             && (state.metaLateN || 0) < 8) {
           state.metaLateN = (state.metaLateN || 0) + 1;
           state.metaPending = id;
+          metaAlive(id);
           // Ретраи идут серией по 45 с, и нередко именно один из них проходит
           // бот-гейт (на `P541-Kmv-6Q` язык нашёлся на третьем заходе, через
           // ~90 с). Пока серия жива, «не определён» — всё ещё неправда:
           // держим ожидание, OK по-прежнему форсирует перевод (sticky).
           langWaitStatus(id);
           setTimeout(function () {
-            if (state.curId !== id || state.origLang) return;
+            if (state.curId !== id) return;
+            // Язык уже пришёл другим путём — снять флаг, иначе окно ожидания
+            // останется навсегда (колбэк меты выйдет по origLang).
+            if (state.origLang) {
+              if (state.metaPending === id) state.metaPending = null;
+              return;
+            }
             log('meta_local late retry id=' + id + ' n=' + state.metaLateN);
             fetchMetaLocal(id, 0, true);
           }, 45000);
@@ -2718,8 +2815,13 @@
           if (state.metaLate !== id) {
             state.metaLate = id;
             state.metaPending = id;
+            metaAlive(id);
             setTimeout(function () {
-              if (state.curId !== id || state.origLang) return;
+              if (state.curId !== id) return;
+              if (state.origLang) {
+                if (state.metaPending === id) state.metaPending = null;
+                return;
+              }
               log('meta_local late retry id=' + id);
               fetchMetaLocal(id, 0, true);
             }, 25000);
@@ -2727,7 +2829,8 @@
           return;
         }
         state.metaPending = id;
-        setTimeout(function () { fetchMeta(id, n + 1); }, META_GAPS[n]);
+        metaAlive(id);
+        setTimeout(function () { if (state.curId === id) fetchMeta(id, n + 1); }, META_GAPS[n]);
       } else {
         state.metaPending = null;
         log('meta_local id=' + id + ' lang unknown (source+meta timeout)');
@@ -2737,7 +2840,8 @@
       if (state.curId !== id) return;
       if (n < META_GAPS.length) {
         state.metaPending = id;
-        setTimeout(function () { fetchMeta(id, n + 1); }, META_GAPS[n]);
+        metaAlive(id);
+        setTimeout(function () { if (state.curId === id) fetchMeta(id, n + 1); }, META_GAPS[n]);
       } else {
         state.metaPending = null;
         log('meta_local ERR ' + (e && e.message));
@@ -3217,7 +3321,14 @@
     '[role="menuitem"]', '[role="checkbox"]', '[role="radio"]', 'a[href]',
     'input', 'select', 'textarea',
     'ytlr-player-actions-container', 'ytlr-menu-item', 'ytlr-playlist-item',
-    'ytlr-toggle-button', 'ytlr-icon-button', 'ytlr-compact-link'
+    'ytlr-toggle-button', 'ytlr-icon-button', 'ytlr-compact-link',
+    // Дыры, из-за которых OK в HOLD-окне уводил фокус с реального контрола
+    // (слайдер перемотки, табы, чипы, плейлист, диалоги).
+    '[role="slider"]', '[role="tab"]', '[role="link"]', '[role="option"]',
+    '[role="switch"]', '[role="listbox"]', '[role="dialog"]',
+    'ytlr-progress-bar', 'ytlr-scrubber', 'ytlr-tabs', 'ytlr-tab',
+    'ytlr-chip', 'ytlr-chip-cloud-chip-renderer',
+    'ytlr-playlist-panel-video-renderer', 'ytlr-playlist-panel-video-wrapper'
   ].join(',');
 
   function focusOwnsKey() {
