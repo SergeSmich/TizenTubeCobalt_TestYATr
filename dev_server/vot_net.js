@@ -957,6 +957,8 @@
         id = typeof n.contentId === 'string' && /^[A-Za-z0-9_-]{6,}$/.test(n.contentId)
           ? n.contentId : '';
       }
+      // Канал (contentId совпадает с channelId) — не ролик.
+      if (id && typeof n.channelId === 'string' && n.channelId === id) id = '';
       if (id && !seen[id]) {
         var t = ttTitleOf(n) || ttDeepTitle(n, 0);
         if (t && t.length <= 120) { seen[id] = 1; out.push({ id: id, t: t }); }

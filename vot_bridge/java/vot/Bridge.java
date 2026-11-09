@@ -277,9 +277,10 @@ public final class Bridge {
     // Бюджет ответа: сетку нельзя держать дольше, чем она рисуется. Всё, что не
     // успело, уходит в fail:budget и переводится следующим тиком.
     private static final long TT_BUDGET_MS = 6000;
-    // Пауза между GET и один повтор на 429/сеть: без них 12 запросов подряд
-    // получают 429, и половина пачки уходит в fail без причины в логе.
-    private static final int TT_GAP_MS = 160;
+    // Параллельные GET: один запрос к бесплатному endpoint ~300 мс, и
+    // последовательная пачка держала карточки без перевода секундами.
+    // 4 потока — компромисс: быстрее и пока без 429.
+    private static final int TT_THREADS = 4;
     private static final int TT_RETRY_MS = 600;
     private static final int TT_RETRIES = 1;
     private static final long TT_COOL_MS = 60000;
@@ -722,51 +723,84 @@ public final class Bridge {
                 // По умолчанию «пачка оборвана по 429»; каждый осмотренный
                 // элемент перезапишет причину своей собственной.
                 for (int i = 0; i < keys.size(); i++) whyByIdx.put(i + 1, "cool");
-                // Free web endpoint: one GET per title, best effort. A failed item
-                // keeps the original title and gets no marker.
-                for (int i = 0; i < keys.size(); i++) {
-                    String src = missSrc.get(keys.get(i));
-                    String why = "budget";
-                    long i0 = System.currentTimeMillis();
-                    if (i0 < deadline && i0 >= sTtCoolUntil) {
-                        for (int att = 0; att <= TT_RETRIES; att++) {
-                            if (att > 0) {
-                                long wait = Math.min(TT_RETRY_MS * att,
-                                        deadline - System.currentTimeMillis() - 400);
-                                if (wait <= 0) break;
-                                try { Thread.sleep(wait); } catch (InterruptedException ie) { }
+                // Free web endpoint: one GET per title. Запросы идут в несколько
+                // потоков: один GET ~300 мс, и последовательная пачка из 12
+                // названий держала карточки без перевода 3-4 с.
+                final java.util.concurrent.ConcurrentHashMap<Integer, String> got =
+                        new java.util.concurrent.ConcurrentHashMap<>();
+                final java.util.concurrent.ConcurrentHashMap<Integer, String> whys =
+                        new java.util.concurrent.ConcurrentHashMap<>();
+                final java.util.concurrent.atomic.AtomicInteger cursor =
+                        new java.util.concurrent.atomic.AtomicInteger();
+                final java.util.concurrent.atomic.AtomicBoolean cooling =
+                        new java.util.concurrent.atomic.AtomicBoolean();
+                final long dl = deadline;
+                final int nItems = keys.size();
+                int nw = Math.min(TT_THREADS, nItems);
+                Thread[] pool = new Thread[nw];
+                for (int w = 0; w < nw; w++) {
+                    pool[w] = new Thread(new Runnable() {
+                        public void run() {
+                            for (;;) {
+                                int i = cursor.getAndIncrement();
+                                if (i >= nItems) return;
+                                if (cooling.get()) { whys.put(i + 1, "cool"); continue; }
+                                String src = missSrc.get(keys.get(i));
+                                String why = "budget";
+                                long i0 = System.currentTimeMillis();
+                                if (i0 < dl && i0 >= sTtCoolUntil) {
+                                    for (int att = 0; att <= TT_RETRIES; att++) {
+                                        if (att > 0) {
+                                            long wait = Math.min(TT_RETRY_MS * att,
+                                                    dl - System.currentTimeMillis() - 400);
+                                            if (wait <= 0) break;
+                                            try { Thread.sleep(wait); } catch (InterruptedException ie) { }
+                                        }
+                                        try {
+                                            got.put(i + 1, ttGoogle(src, lang));
+                                            why = "ok";
+                                            break;
+                                        } catch (IOException e) {
+                                            why = e.getMessage() == null ? "err" : e.getMessage();
+                                        }
+                                        if (!ttRetryable(why)) break;
+                                    }
+                                } else if (i0 < sTtCoolUntil) {
+                                    why = "cool";
+                                }
+                                whys.put(i + 1, why);
+                                // ≤120 символов на строку; ok — только для первых 8,
+                                // чтобы по логу было видно, что пачка идёт, а не только
+                                // итоговый счёт.
+                                if (!why.equals("ok") || i < 8) {
+                                    android.util.Log.i("VotBridge", "title_tr item n=" + (i + 1) + "/"
+                                            + nItems + " h=" + keys.get(i).substring(0, 8)
+                                            + " len=" + src.length() + " why=" + why
+                                            + " ms=" + (System.currentTimeMillis() - i0));
+                                }
+                                // 429 — не сбой одного элемента: остальные получат то же,
+                                // поэтому пачку обрываем, а следующие 60 с отвечаем из
+                                // кэша (why=cool).
+                                if (why.equals("http429")) {
+                                    cooling.set(true);
+                                    sTtCoolUntil = System.currentTimeMillis() + TT_COOL_MS;
+                                }
                             }
-                            try {
-                                byIdx.put(i + 1, ttGoogle(src, lang));
-                                why = "ok";
-                                break;
-                            } catch (IOException e) {
-                                why = e.getMessage() == null ? "err" : e.getMessage();
-                            }
-                            if (!ttRetryable(why)) break;
                         }
-                    } else if (i0 < sTtCoolUntil) {
-                        why = "cool";
-                    }
-                    whyByIdx.put(i + 1, why);
-                    // ≤120 символов на строку; ok — только для первых 8, чтобы по
-                    // логу было видно, что пачка идёт, а не только итоговый счёт.
-                    if (!why.equals("ok") || i < 8) {
-                        android.util.Log.i("VotBridge", "title_tr item n=" + (i + 1) + "/"
-                                + keys.size() + " h=" + keys.get(i).substring(0, 8)
-                                + " len=" + src.length() + " why=" + why
-                                + " ms=" + (System.currentTimeMillis() - i0));
-                    }
-                    // 429 — не сбой одного элемента: остальные получат то же, поэто­му
-                    // пачку обрываем, а следующие 60 с отвечаем из кэша (why=cool).
-                    if (why.equals("http429")) {
-                        sTtCoolUntil = System.currentTimeMillis() + TT_COOL_MS;
-                        break;
-                    }
-                    if (i + 1 < keys.size()) {
-                        try { Thread.sleep(TT_GAP_MS); } catch (InterruptedException ie) { }
-                    }
+                    });
+                    pool[w].setDaemon(true);
+                    pool[w].start();
                 }
+                for (int w = 0; w < nw; w++) {
+                    // Ждём не дольше остатка бюджета: один GET ограничен
+                    // 4+4 с таймаутами и с ретраями может выйти за 6 с.
+                    // Потоки демоны, их поздний результат просто не попадёт
+                    // в ответ (получит why=budget), ответ не зависнет.
+                    long left = dl - System.currentTimeMillis();
+                    try { if (left > 0) pool[w].join(left); } catch (InterruptedException ie) { }
+                }
+                byIdx.putAll(got);
+                whyByIdx.putAll(whys);
             } else {
                 StringBuilder user = new StringBuilder();
                 user.append("Переведи названия (").append(missSrc.size()).append(" шт.):\n");

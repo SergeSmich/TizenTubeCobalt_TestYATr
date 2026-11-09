@@ -5929,6 +5929,10 @@
     + 'ytlr-playback-preview,ytlr-playlist-panel-video-renderer';
   var ttCache = {}, ttNoop = {}, ttPending = {}, ttQueue = [], ttBusy = 0;
   var ttApplyTimer = 0, ttCooldown = 0, ttOkCount = 0, ttLastLog = 0, ttDomLog = 0;
+  var ttDomScan = 0;    // последний проход «название из разметки» (не чаще 2/с)
+  // Сколько раз название уже просили перевести. Две попытки на сессию: иначе
+  // безнадёжное название (мост вернул fail) опрашивался бы каждым проходом.
+  var ttTries = {};
 
   function ttNormText(s) {
     return String(s == null ? '' : s).replace(/\s+/g, ' ').trim();
@@ -6006,6 +6010,12 @@
     // 12 — это один экран поиска; больше не влезает в бюджет провайдера
     // (один GET на название), остальное уходит следующим тиком.
     var batch = ttQueue.splice(0, 12), items = [], i;
+    // Попытки считаем в момент фактической отправки (id 'dom' — название из
+    // разметки): очередь может быть выброшена по кулдауну, и тогда сгоревшие
+    // попытки навсегда лишили бы плитку перевода.
+    for (i = 0; i < batch.length; i++) {
+      if (batch[i].id === 'dom') ttTries[batch[i].t] = (ttTries[batch[i].t] || 0) + 1;
+    }
     for (i = 0; i < batch.length; i++) items.push({ id: batch[i].id, t: batch[i].t });
     ttBusy++;
     var t0 = Date.now(), lang = ttLang();
@@ -6182,18 +6192,21 @@
   function ttApply() {
     ttApplyTimer = 0;
     if (!ttEnabled()) return;
-    var has = false;
-    for (var k in ttCache) if (Object.prototype.hasOwnProperty.call(ttCache, k)) { has = true; break; }
-    if (!has) return;
-    var i, j, hits = 0, seen = 0, sample = '';
+    var i, j, hits = 0, seen = 0, sample = '', domQ = [];
     var cards = null;
     try { cards = document.querySelectorAll(TT_CARDS); } catch (e0) { cards = null; }
     // Плиток нет — страницу не трогаем вообще. Никакого «сканировать всё»:
     // именно такой проход раньше правил подписи меню и служебные строки.
     if (!cards || !cards.length) return;
+    var hasCache = false;
+    for (var k in ttCache) if (Object.prototype.hasOwnProperty.call(ttCache, k)) { hasCache = true; break; }
+    var domOk = Date.now() - ttDomScan > 500;
+    // Кэша нет и ещё не время искать название в разметке — страницу не трогаем
+    // (иначе на русской ленте полный обход плиток шёл бы на каждую мутацию).
+    if (!hasCache && !domOk) return;
     // Маркеры приводим в соответствие с содержимым плиток до подстановки:
     // клиент мог перерисовать карточку и потерять/унаследовать точку.
-    ttSyncDots(cards);
+    if (hasCache) ttSyncDots(cards);
     for (i = 0; i < cards.length && hits < 60; i++) {
       var card = cards[i];
       // Плитка внутри плитки: точку ставим на внешнюю карточку.
@@ -6205,6 +6218,16 @@
       // список из span/div пропускал заголовки целиком.
       try { nodes = card.querySelectorAll('*'); }
       catch (e1) { continue; }
+      var bestEl = null, bestTx = '', bestTop = 1e9, bestW = 0, cardDone = false, vid = false;
+      // Плитка ролика всегда с кадром-превью (i.ytimg.com/vi/...). У аккаунтов и
+      // каналов вместо него аватар (yt3.ggpht.com/yti/...), у служебных плиток
+      // превью нет вовсе. Это второй признак «не ролик»: по одному счётчику
+      // просмотров полка Shorts не опознавалась (там нет ни длительности, ни
+      // просмотров), и её названия оставались английскими.
+      try {
+        var th = card.querySelector('ytlr-thumbnail-details');
+        if (th && /\/vi\//.test(th.getAttribute('style') || '')) vid = true;
+      } catch (ev) { }
       for (j = 0; j < nodes.length; j++) {
         var el = nodes[j];
         if (el.closest && el.closest('#vot-ui-root')) continue;
@@ -6216,33 +6239,64 @@
         if (mark) {
           var osrc = el.getAttribute('data-vot-orig') || '';
           var cur = ttNormText(el.textContent);
-          if (leaf && osrc && ttCache[osrc] === cur) continue;    // перевод на месте
+          if (leaf && osrc && ttCache[osrc] === cur) { cardDone = true; continue; } // перевод на месте
           if (leaf && osrc && cur === osrc && ttCache[osrc]) {    // клиент вернул оригинал
-            if (ttApplyOne(el, osrc, ttCache[osrc], card)) { hits++; }
+            if (ttApplyOne(el, osrc, ttCache[osrc], card)) { hits++; cardDone = true; }
             continue;
           }
           el.removeAttribute('data-vot-tt');
           el.removeAttribute('data-vot-orig');
         }
         // Только чистый лист: у элемента с детьми textContent трогать нельзя.
-        if (!leaf) continue;
+        if (!leaf || cardDone) continue;
         var tx = ttNormText(el.textContent);
         if (!tx || tx.length > 120) continue;
-        // Точное совпадение с названием из ответа YouTube: под перевод не
-        // попадают ни счётчики просмотров, ни названия каналов.
-        if (!ttCache[tx]) {
-          if (seen < 4 && tx.length > 1) { seen++; sample += tx.slice(0, 30) + ' | '; }
-          continue;
+        if (/^\d{1,2}:\d{2}(:\d{2})?$/.test(tx)) { vid = true; continue; }   // длительность
+        if (/[•·]/.test(tx)) { vid = true; continue; }                        // «просмотры • дата»
+        if (/(просмотр|подписчик|views|subscribers)/i.test(tx)) { vid = true; continue; }
+        var rr = null;
+        try { rr = el.getBoundingClientRect(); } catch (e2) { continue; }
+        // 150 px: бейджи («Новое», «4K», длительность) и имена профилей уже,
+        // а заголовок и byline канала — нет.
+        if (!rr || rr.width < 150 || rr.height < 12) continue;
+        // Название — верхний широкий лист плитки. Выбирать «самый широкий»
+        // нельзя: у короткого заголовка byline канала бывает шире, и тогда
+        // переводилось имя канала.
+        if (rr.top < bestTop - 1 || Math.abs(rr.top - bestTop) <= 1 && rr.width > bestW) {
+          bestTop = rr.top; bestW = rr.width; bestEl = el; bestTx = tx;
         }
-        if (ttApplyOne(el, tx, ttCache[tx], card)) hits++;
+      }
+      // Не ролик (аватар/профиль/служебная плитка): ни перевода, ни точки.
+      // Экран «Выберите аккаунт» тоже состоит из плиток, и без этой проверки
+      // имена профилей («Serge» → «Серж») переводились и получали маркер.
+      if (!vid) continue;
+      // Переводим только название плитки — верхний её широкий лист. Имя канала,
+      // счётчики и длительность не трогаем, даже если их текст случайно попал
+      // в кэш из ответа YouTube (ttDeepTitle мог зацепить byline).
+      if (!cardDone && bestEl) {
+        if (ttCache[bestTx]) {
+          if (ttApplyOne(bestEl, bestTx, ttCache[bestTx], card)) hits++;
+        } else {
+          if (seen < 4 && bestTx.length > 1) { seen++; sample += bestTx.slice(0, 30) + ' | '; }
+          if (domOk && domQ.length < 12 && ttWanted(bestTx)
+              && !ttNoop[bestTx] && !ttPending[bestTx]
+              && (ttTries[bestTx] || 0) < 2) domQ.push({ id: 'dom', t: bestTx });
+        }
       }
     }
+    if (domQ.length) {
+      var nq = ttBatch(domQ);
+      if (nq) log('title_domq n=' + nq + ' q=' + domQ.length);
+    }
+    // Проход «название из разметки» израсходован: даже если очередь пуста
+    // (всё уже русское), следующий полный обход — не раньше чем через 500 мс.
+    if (domOk) ttDomScan = Date.now();
     if (hits) {
       // Наши записи не должны будить observer: снимаем накопленные записи,
       // иначе каждая подстановка планирует ещё один полный проход.
       try { if (ttMo) ttMo.takeRecords(); } catch (e4) { }
       log('title_apply n=' + hits);
-    } else if (seen && Date.now() - ttDomLog > 30000) {
+    } else if (seen && !domQ.length && Date.now() - ttDomLog > 30000) {
       ttDomLog = Date.now();
       log('title_dom cards=' + cards.length + ' miss=' + sample.slice(0, 120));
     }
@@ -6270,7 +6324,7 @@
     // CSS-псевдоэлемент здесь больше не нужен: он дублировал точку и обрезался
     // вместе с заголовком при line-clamp.
     try {
-      ttMo = new MutationObserver(function () { ttApplySoon(700); });
+      ttMo = new MutationObserver(function () { ttApplySoon(150); });
       // childList+subtree: YTLR пересобирает плитки при скролле и смене ленты.
       // characterData не слушаем: наши записи в text-node иначе будили бы цикл,
       // а после пачки мы ещё и снимаем накопленные записи (takeRecords).
@@ -6292,7 +6346,7 @@
         } else if (k === 'titleTr.lang') {
           // Язык перевода сменился — старые подстановки невалидны.
           log('title_restore lang n=' + ttRestoreAll());
-          ttCache = {}; ttNoop = {};
+          ttCache = {}; ttNoop = {}; ttTries = {};
           ttApplySoon(100);
         }
       });
@@ -7271,6 +7325,8 @@
         id = typeof n.contentId === 'string' && /^[A-Za-z0-9_-]{6,}$/.test(n.contentId)
           ? n.contentId : '';
       }
+      // Канал (contentId совпадает с channelId) — не ролик.
+      if (id && typeof n.channelId === 'string' && n.channelId === id) id = '';
       if (id && !seen[id]) {
         var t = ttTitleOf(n) || ttDeepTitle(n, 0);
         if (t && t.length <= 120) { seen[id] = 1; out.push({ id: id, t: t }); }
