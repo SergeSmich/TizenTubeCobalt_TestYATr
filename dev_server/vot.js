@@ -494,6 +494,13 @@
         }
         schedulePaint();
       });
+      // Ролик стартовал/переключил дорожку/вернулся после рекламы — плеер
+      // мог выставить 100%. Возвращаем громкость оригинала сразу.
+      function volNow() { enforceVolume('event'); }
+      v.addEventListener('playing', volNow);
+      v.addEventListener('loadeddata', volNow);
+      v.addEventListener('volumechange', volNow);
+      v.addEventListener('seeked', volNow);
     } catch (e) { log('video events ERR ' + (e && e.message)); }
   }
 
@@ -2049,6 +2056,10 @@
       http('POST', '/resume', { }, function () { }, function () { });
     }
 
+    // Страховка: если плеер сбросил громкость между событиями (Cobalt это
+    // делает молча), тик вернёт заданный процент.
+    enforceVolume('loop');
+
     http('GET', '/position', null, function (p) {
       if (!state.active) return;
       var vv = currentVideoTime();
@@ -2250,6 +2261,44 @@
     log('vol tr=' + tr + ' orig=' + pct + ' active=' + (state.active ? 1 : 0)
       + ' muted=' + (v.muted ? 1 : 0) + ' got=' + got);
   }
+
+  // Плеер Cobalt пересоздаёт <video> и сам возвращает ему 100% при старте
+  // ролика, смене аудиодорожки, после рекламы и при переходах по главам.
+  // Один вызов applyVolume() на старте перевода этот сброс не переживает,
+  // поэтому раз в тик сверяем фактическое значение и возвращаем нужное.
+  var volEnforceLog = 0;
+  var volEnforceN = 0;
+  var volWatchAt = 0;
+  function enforceVolume(why) {
+    if (!state.active) return;
+    var v = findVideo();
+    if (!v) return;
+    var pct = volPct('vol.original', 0);
+    var want = Math.max(0, Math.min(1, pct / 100));
+    var wantMuted = (pct <= 0);
+    var got = -1, gotMuted = false;
+    try { got = Number(v.volume); gotMuted = !!v.muted; } catch (e) { return; }
+    // Раз в 30 с — снимок «чего ждём и что видим»: по нему видно, сбрасывает
+    // ли плеер громкость сам, даже если enforce ни разу не сработал.
+    var now = Date.now();
+    if (now - volWatchAt > 30000) {
+      volWatchAt = now;
+      log('vol watch want=' + pct + '% got=' + got + ' muted=' + (gotMuted ? 1 : 0));
+    }
+    if (Math.abs(got - want) < 0.005 && gotMuted === wantMuted) return;
+    try { v.muted = wantMuted; } catch (e1) { }
+    try { v.volume = want; } catch (e2) { }
+    if (now - volEnforceLog > 1000 && volEnforceN < 20) {
+      volEnforceLog = now;
+      volEnforceN++;
+      log('vol enforce why=' + (why || 'loop') + ' want=' + pct + '% got=' + got
+        + ' muted=' + (gotMuted ? 1 : 0));
+    }
+  }
+
+  // Отдельный быстрый тик: сетевой syncLoop раз в секунду, а сброс громкости
+  // слышен сразу, поэтому проверяем чаще. Вне перевода функция выходит сразу.
+  setInterval(function () { enforceVolume('tick'); }, 250);
 
   // Подпись пункта «Громкость» в корне нативной панели.
   function votVolText() {
