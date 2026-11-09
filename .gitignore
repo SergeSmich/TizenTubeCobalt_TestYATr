@@ -386,3 +386,4 @@ vot_bridge/*.dex
 /cfg.json
 /_tmp_cookies.db
 
+/.arena/
