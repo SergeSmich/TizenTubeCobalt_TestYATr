@@ -3062,6 +3062,8 @@
     out.push(votNavItem('Громкость', votVolText(), 'vot-vol'));
     out.push(votNavItem('Мой язык', langLabel(prefLangCode()), 'vot-skip'));
     out.push(votNavItem('Если язык не определён', unknownPolicyLabel(), 'vot-unknown'));
+    out.push(votSwitch('Перевод названий', 'точка = название переведено',
+      'titleTr.enabled', uiPref('titleTr.enabled', true) !== false));
     out.push(votItem({ title: 'Статус', sub: votStatusText() }));
     return out;
   }
@@ -3096,6 +3098,7 @@
     var k = s.slice(0, p), v = s.slice(p + 1);
     if (k === 'shard') { uiSet('shard', v); state.lang = v; }
     else if (k === 'otherShard.enabled') uiSet(k, v === '1');
+    else if (k === 'titleTr.enabled') uiSet(k, v === '1');
     else if (k === 'vol.translate' || k === 'vol.original') { uiSet(k, Number(v) || 0); applyVolume(); }
     else if (k === 'skipLang' || k === 'prefLang') setPrefLang(v);
     else if (k === 'unknownPolicy') {
@@ -5363,10 +5366,218 @@
     }
   } catch (e2) { log('MO ERR ' + (e2 && e2.message)); }
 
+  // ---- Перевод названий карточек -------------------------------------------
+  // Сетевой слой собирает пары videoId→название из ответов search/browse и
+  // отдаёт их сюда (__votTitleBatch). Дальше: батчи ≤20, L1-кэш на сессию,
+  // POST /title_tr через мост (ключ провайдера живёт только там), подстановка
+  // в карточки и маркер-точка. При любой ошибке остаётся оригинал и маркер не
+  // ставится — правило «unknown beats wrong».
+  var TT_CARDS = 'ytlr-tile-renderer,ytlr-compact-tile-renderer,'
+    + 'ytlr-video-with-context-renderer,ytlr-compact-video-renderer,'
+    + 'ytlr-playlist-renderer,ytlr-channel-renderer,[role="gridcell"]';
+  var ttCache = {}, ttPending = {}, ttQueue = [], ttBusy = 0;
+  var ttApplyTimer = 0, ttCooldown = 0, ttOkCount = 0, ttLastLog = 0;
+
+  function ttNormText(s) {
+    return String(s == null ? '' : s).replace(/\s+/g, ' ').trim();
+  }
+  function ttCyrShare(s) {
+    var letters = 0, cyr = 0;
+    for (var i = 0; i < s.length; i++) {
+      var c = s.charCodeAt(i);
+      var lat = (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+      if (lat || (c >= 0x0400 && c <= 0x04FF)) {
+        letters++;
+        if (c >= 0x0400 && c <= 0x04FF) cyr++;
+      }
+    }
+    return letters ? cyr / letters : 0;
+  }
+  function ttHash(s) {
+    var h = 2166136261;
+    for (var i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = (h * 16777619) >>> 0; }
+    return h.toString(36);
+  }
+  function ttEnabled() {
+    try { return uiPref('titleTr.enabled', true) !== false && uiPref('titleTr.enabled', true) !== '0'; }
+    catch (e) { return true; }
+  }
+  // Переводим только смешанный/иностранный текст: кириллицы < 60%, есть буквы
+  // (включая CJK: заголовки на японском тоже нужно переводить).
+  function ttWanted(s) {
+    if (!s || s.length < 2 || s.length > 120) return false;
+    var hasLetter = false;
+    for (var i = 0; i < s.length; i++) {
+      var c = s.charCodeAt(i);
+      if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+          || (c >= 0xC0 && c < 0x2000)
+          || (c >= 0x3040 && c <= 0x30FF)
+          || (c >= 0x3400 && c <= 0xA4CF)
+          || (c >= 0xAC00 && c <= 0xD7AF)) { hasLetter = true; break; }
+    }
+    if (!hasLetter) return false;
+    return ttCyrShare(s) < 0.6;
+  }
+
+  function ttBatch(list) {
+    if (!ttEnabled() || !list || !list.length) return 0;
+    if (Date.now() < ttCooldown) return 0;
+    var added = 0;
+    for (var i = 0; i < list.length; i++) {
+      var it = list[i] || {};
+      var t = ttNormText(it.t);
+      if (!ttWanted(t) || ttCache[t] || ttPending[t]) continue;
+      ttPending[t] = 1;
+      ttQueue.push({ id: String(it.id || ''), t: t });
+      added++;
+      if (ttQueue.length >= 60) break;
+    }
+    ttPump();
+    return added;
+  }
+
+  function ttPump() {
+    if (ttBusy > 0 || !ttQueue.length || !ttEnabled()) return;
+    if (Date.now() < ttCooldown) { ttQueue.length = 0; return; }
+    var batch = ttQueue.splice(0, 20), items = [], i;
+    for (i = 0; i < batch.length; i++) items.push({ id: batch[i].id, t: batch[i].t });
+    ttBusy++;
+    var t0 = Date.now();
+    http('POST', '/title_tr', { v: 1, lang: 'ru', items: items }, function (r) {
+      ttBusy--;
+      var ok = 0, k;
+      if (!r || r.ok === 0) {
+        // Нет ключа/провайдер недоступен: не долбим мост каждым ответом сетки.
+        ttCooldown = Date.now() + 300000;
+        log('title_tr off ' + ((r && r.why) || 'bad'));
+      } else if (r.tr) {
+        for (k = 0; k < r.tr.length; k++) {
+          var e = r.tr[k] || {};
+          var src = ttNormText(e.src), tr = ttNormText(e.t);
+          if (!src || !tr || !ttWanted(src) || tr === src || tr.length > 160) continue;
+          ttCache[src] = tr;
+          ok++;
+        }
+      }
+      for (k = 0; k < batch.length; k++) delete ttPending[batch[k].t];
+      ttOkCount += ok;
+      if (Date.now() - ttLastLog > 3000 || ok === 0) {
+        ttLastLog = Date.now();
+        log('title_tr n=' + batch.length + ' ok=' + ok + ' ms='
+          + ((r && r.ms) || (Date.now() - t0)) + ' total=' + ttOkCount);
+      }
+      if (ok) ttApplySoon(0);
+      ttPump();
+    }, function (e) {
+      ttBusy--;
+      for (var k = 0; k < batch.length; k++) delete ttPending[batch[k].t];
+      log('title_tr err ' + ((e && e.message) || 'x'));
+      ttPump();
+    });
+  }
+
+  function ttMarkDot() {
+    var d = document.createElement('span');
+    d.className = 'vot-tt-dot';
+    d.style.display = 'inline-block';
+    d.style.width = '9px';
+    d.style.height = '9px';
+    d.style.borderRadius = '50%';
+    d.style.background = '#3ea6ff';
+    d.style.marginLeft = '8px';
+    d.style.verticalAlign = 'middle';
+    d.style.flex = '0 0 auto';
+    d.setAttribute('aria-hidden', 'true');
+    return d;
+  }
+
+  // Подменяем только листовой узел, чей текст в точности равен названию из
+  // ответа сетки. data-vot-tt хранит хеш источника: при recycle плитки текст
+  // меняется, хеш не совпадает — и карточка переводится заново.
+  function ttApplyOne(el, src, tr) {
+    if (el.getAttribute('data-vot-tt') === ttHash(src)) return false;
+    try { el.textContent = tr; } catch (e) { return false; }
+    el.appendChild(ttMarkDot());
+    el.setAttribute('data-vot-tt', ttHash(src));
+    return true;
+  }
+
+  function ttApply() {
+    ttApplyTimer = 0;
+    if (!ttEnabled()) return;
+    var has = false;
+    for (var k in ttCache) if (Object.prototype.hasOwnProperty.call(ttCache, k)) { has = true; break; }
+    if (!has) return;
+    var cards = null, i, j, hits = 0;
+    try { cards = document.querySelectorAll(TT_CARDS); } catch (e) { cards = null; }
+    var scanCards = !!(cards && cards.length);
+    var list = [];
+    if (scanCards) {
+      for (i = 0; i < cards.length && list.length < 90; i++) list.push(cards[i]);
+    } else {
+      try {
+        var all = document.querySelectorAll('span,div,h2,h3,yt-formatted-string,p');
+        for (i = 0; i < all.length && list.length < 600; i++) list.push(all[i]);
+      } catch (e2) { return; }
+    }
+    for (i = 0; i < list.length && hits < 40; i++) {
+      var nodes;
+      if (scanCards) {
+        try { nodes = list[i].querySelectorAll('span,div,h2,h3,yt-formatted-string,p'); }
+        catch (e3) { continue; }
+      } else {
+        nodes = [list[i]];
+      }
+      for (j = 0; j < nodes.length; j++) {
+        var el = nodes[j];
+        if (el.children && el.children.length > 1) continue;
+        var tx = ttNormText(el.textContent);
+        if (!tx || tx.length > 120) continue;
+        var tr = ttCache[tx];
+        if (!tr) continue;
+        if (el.closest && el.closest('#vot-ui-root')) continue;
+        if (ttApplyOne(el, tx, tr)) { hits++; if (hits >= 40) break; }
+      }
+    }
+    if (hits) log('title_apply n=' + hits);
+  }
+
+  function ttApplySoon(delay) {
+    if (ttApplyTimer) return;
+    ttApplyTimer = setTimeout(function () {
+      try { ttApply(); } catch (e) { ttApplyTimer = 0; log('title_apply err ' + (e && e.message)); }
+    }, delay == null ? 400 : delay);
+  }
+
+  function setupTitleTr() {
+    if (window.__votTitleBatch) return;
+    window.__votTitleBatch = ttBatch;
+    try {
+      var mo = new MutationObserver(function () { ttApplySoon(700); });
+      // childList+subtree: YTLR пересобирает плитки при скролле и смене ленты.
+      mo.observe(document.documentElement || document.body, { childList: true, subtree: true });
+    } catch (e0) { }
+    // Страховка для recycle без childList: раз в 4 с, только при живом кэше.
+    setInterval(function () {
+      try {
+        if (ttEnabled() && document.visibilityState !== 'hidden') ttApplySoon(50);
+      } catch (e1) { }
+    }, 4000);
+    try {
+      window.addEventListener('vot-pref', function (e) {
+        if (e && e.detail && e.detail.key === 'titleTr.enabled') ttApplySoon(100);
+      });
+    } catch (e2) { }
+    log('title_tr hook ready');
+  }
+
   setupUI();
   // Даты в поиске — собственные кнопки справа от штатной клавиатуры.
   setupSearchSortProbe();
   setupSearchFilters();
+  // Перевод названий карточек: сетевой слой отдаёт названия, здесь — батчи,
+  // подстановка и маркер-точка.
+  setupTitleTr();
   btnRetry();
 
 })();

@@ -870,6 +870,137 @@
     if (/(?:^|\/)search(?:[?#]|$)/.test(s) || /(?:^|\/)results(?:[?#]|$)/.test(s)) return 'other';
     return '';
   }
+  // ---- Названия карточек ---------------------------------------------------
+  // Из ответов search/browse вытаскиваем пары videoId→название и отдаём
+  // оверлею (window.__votTitleBatch). Сами тела не логируем: в /log уходят
+  // только счётчики. Названия нужны и для карточек сайдбара/главной.
+  var ttHooks = 0;
+  function ttIsList(u) {
+    var s = String(u || '');
+    return /(?:^|\/)youtubei\/v1\/(search|browse|next|guide)(?:[?#]|$)/.test(s);
+  }
+  function ttText(v) {
+    if (!v) return '';
+    if (typeof v === 'string') return v.replace(/\s+/g, ' ').trim();
+    if (typeof v !== 'object') return '';
+    if (typeof v.simpleText === 'string' && v.simpleText) return ttText(v.simpleText);
+    if (typeof v.content === 'string' && v.content) return ttText(v.content);
+    if (typeof v.text === 'string' && v.text) return ttText(v.text);
+    if (v.runs && v.runs.length) {
+      var s = '';
+      for (var i = 0; i < v.runs.length; i++) {
+        var r = v.runs[i];
+        if (r && typeof r.text === 'string') s += r.text;
+      }
+      if (s) return ttText(s);
+    }
+    return '';
+  }
+  function ttTitleOf(o) {
+    var t = ttText(o.title);
+    if (t) return t;
+    t = ttText(o.headline);
+    if (t) return t;
+    t = ttText(o.primaryText);
+    if (t) return t;
+    var md = o.metadata;
+    if (md && md.lockupMetadataViewModel) {
+      t = ttText(md.lockupMetadataViewModel.title);
+      if (t) return t;
+    }
+    var ov = o.overlayMetadata;
+    if (ov) {
+      t = ttText(ov.primaryText);
+      if (t) return t;
+    }
+    return '';
+  }
+  // Заголовок может лежать не в самом объекте с id, а на 1–3 уровня глубже
+  // (TV: tileRenderer → header.tileHeaderRenderer.title).
+  function ttDeepTitle(o, depth) {
+    if (!o || typeof o !== 'object' || depth > 3) return '';
+    if (Object.prototype.toString.call(o) === '[object Array]') {
+      for (var i = 0; i < o.length; i++) {
+        var ra = ttDeepTitle(o[i], depth + 1);
+        if (ra) return ra;
+      }
+      return '';
+    }
+    var t = ttTitleOf(o);
+    if (t) return t;
+    for (var k in o) {
+      if (!Object.prototype.hasOwnProperty.call(o, k)) continue;
+      var v = o[k];
+      if (v && typeof v === 'object') {
+        var r = ttDeepTitle(v, depth + 1);
+        if (r) return r;
+      }
+    }
+    return '';
+  }
+  function ttWalk(root) {
+    var out = [], seen = {}, stack = [root], nodes = 0, i;
+    while (stack.length && nodes < 20000 && out.length < 60) {
+      var n = stack.pop();
+      nodes++;
+      if (!n || typeof n !== 'object') continue;
+      if (Object.prototype.toString.call(n) === '[object Array]') {
+        for (i = 0; i < n.length; i++) stack.push(n[i]);
+        continue;
+      }
+      var id = n.videoId;
+      if (typeof id !== 'string' || !/^[A-Za-z0-9_-]{6,}$/.test(id)) {
+        id = typeof n.contentId === 'string' && /^[A-Za-z0-9_-]{6,}$/.test(n.contentId)
+          ? n.contentId : '';
+      }
+      if (id && !seen[id]) {
+        var t = ttTitleOf(n) || ttDeepTitle(n, 0);
+        if (t && t.length <= 120) { seen[id] = 1; out.push({ id: id, t: t }); }
+      }
+      for (var k in n) {
+        if (!Object.prototype.hasOwnProperty.call(n, k)) continue;
+        var v = n[k];
+        if (v && typeof v === 'object') stack.push(v);
+      }
+    }
+    return out;
+  }
+  var ttDiagN = 0;
+  function ttDiag(tag, len, n) {
+    if (ttDiagN++ < 10) post('title_scan ' + tag + ' len=' + len + ' items=' + n);
+  }
+  function ttHand(list) {
+    if (!list.length) return;
+    var added = 0;
+    if (window.__votTitleBatch) {
+      try { added = window.__votTitleBatch(list) || 0; } catch (e) { }
+    }
+    if (ttHooks++ < 8) post('title_hook got=' + list.length + ' new=' + added
+      + ' hook=' + (window.__votTitleBatch ? 1 : 0));
+  }
+  function ttScanText(text) {
+    if (typeof text !== 'string' || !text || text.length > 4000000) return;
+    if (text.charCodeAt(0) !== 123) return; // '{'
+    var j;
+    try { j = JSON.parse(text); } catch (e) { ttDiag('parsefail', text.length, 0); return; }
+    var out = ttWalk(j);
+    ttDiag('json', text.length, out.length);
+    ttHand(out);
+  }
+  function ttScanObj(j) {
+    if (!j || typeof j !== 'object') return;
+    var out = ttWalk(j);
+    ttDiag('obj', 0, out.length);
+    ttHand(out);
+  }
+  function ttFromXhr(x) {
+    try {
+      var r = x.response;
+      if (r && typeof r === 'object') { ttScanObj(r); return; }
+    } catch (e) { }
+    try { ttScanText(x.responseText); } catch (e) { }
+  }
+
   // Одно целое из префа в диапазоне 0..max; всё остальное — 0 (без фильтра).
   function searchPick(key, max) {
     var n = 0;
@@ -1057,6 +1188,10 @@
       } else if (isPlayer(u)) {
         var self = this;
         try { this.addEventListener('loadend', function () { onPlayer(self); }); } catch (e) { }
+      } else if (ttIsList(u)) {
+        var tx = this;
+        try { once('ttsrc|' + netKey(u), 'title_src xhr ' + netKey(u)); } catch (e) { }
+        try { tx.addEventListener('loadend', function () { ttFromXhr(tx); }); } catch (e) { }
       } else if (String(u).indexOf('googlevideo.com') >= 0) {
         try { rememberAudio(u); } catch (e) { }
         var host = short(u).split('/')[0];
@@ -1159,6 +1294,13 @@
                   + String(((j && j.videoDetails) || {}).defaultAudioLanguage || '-'));
                 rememberPlayerJson(j);
               });
+            } catch (e) { }
+          });
+        } else if (ttIsList(u)) {
+          try { once('ttsrc|' + netKey(u), 'title_src fetch ' + netKey(u)); } catch (e0) { }
+          p.then(function (r) {
+            try {
+              r.clone().text().then(ttScanText, function () { });
             } catch (e) { }
           });
         } else if (String(u).indexOf('googlevideo.com') >= 0) {

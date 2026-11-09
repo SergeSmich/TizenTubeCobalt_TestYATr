@@ -265,6 +265,522 @@ public final class Bridge {
         }
     }
 
+    // ---- title translation for cards ---------------------------------------
+    // The overlay sends batched card titles here; the bridge keeps the provider
+    // key (never in the page) and a 30-day cache keyed by the source text, so
+    // repeated grids cost zero requests. Any failure returns the original
+    // title and the overlay shows no marker (unknown beats wrong).
+    private static final int TT_MAX_ITEMS = 24;
+    private static final int TT_MAX_CHARS = 120;
+    private static final long TT_TTL_MS = 30L * 24 * 3600 * 1000;
+    private static final int TT_CACHE_MAX = 5000;
+    private static final String TT_SYS =
+            "Ты переводишь названия видео YouTube на русский. Верни СТРОГО JSON "
+            + "{\"tr\":[{\"i\":<номер>,\"t\":\"<перевод>\"}]} без markdown и пояснений. "
+            + "Правила: одна строка; имена собственные, бренды и латиницу-бренды "
+            + "(iPhone, Dota 2, NVIDIA) не переводить и не транслитерировать; эмодзи "
+            + "сохранять на том же месте; КАПС сохранять; числа, годы, номера серий не "
+            + "менять; если фрагмент уже по-русски — оставить как есть; длина не больше "
+            + "исходной +30% и не больше 100 символов; никаких кавычек вокруг всего "
+            + "названия, никаких \"перевод:\".";
+
+    private static String titleCfgPath() {
+        return (sDataDir == null || sDataDir.isEmpty() ? "" : sDataDir + "/") + "title_tr.json";
+    }
+
+    private static String titleCachePath() {
+        return (sDataDir == null || sDataDir.isEmpty() ? "" : sDataDir + "/") + "title_tr_cache.json";
+    }
+
+    private static volatile JSONObject sTitleCfg;
+    private static volatile JSONObject sTitleCache;
+
+    private static String readSmallFile(String path) {
+        try {
+            File f = new File(path);
+            if (!f.isFile() || f.length() == 0) return "";
+            byte[] b = new byte[(int) Math.min(f.length(), 2L * 1024 * 1024)];
+            FileInputStream in = new FileInputStream(f);
+            try {
+                int off = 0, n;
+                while (off < b.length && (n = in.read(b, off, b.length - off)) > 0) off += n;
+                return new String(b, 0, off, StandardCharsets.UTF_8);
+            } finally {
+                try { in.close(); } catch (Throwable e) { }
+            }
+        } catch (Throwable e) {
+            return "";
+        }
+    }
+
+    private static void writeSmallFile(String path, String s) {
+        FileOutputStream fo = null;
+        try {
+            fo = new FileOutputStream(path);
+            fo.write(s.getBytes(StandardCharsets.UTF_8));
+        } catch (Throwable e) {
+            android.util.Log.w("VotBridge", "title_tr write failed: " + e);
+        } finally {
+            try { if (fo != null) fo.close(); } catch (Throwable e) { }
+        }
+    }
+
+    private static JSONObject titleCfg() {
+        JSONObject c = sTitleCfg;
+        if (c != null) return c;
+        synchronized (Bridge.class) {
+            if (sTitleCfg != null) return sTitleCfg;
+            JSONObject o = new JSONObject();
+            try {
+                String s = readSmallFile(titleCfgPath());
+                if (!s.trim().isEmpty()) o = new JSONObject(s);
+            } catch (Throwable e) {
+                android.util.Log.w("VotBridge", "title_tr cfg parse failed: " + e);
+            }
+            if (o.optString("provider", "").isEmpty() || o.optString("model", "").isEmpty()) {
+                try {
+                    if (o.optString("provider", "").isEmpty()) o.put("provider", "gemini");
+                    if (o.optString("model", "").isEmpty()) o.put("model", "gemini-2.5-flash-lite");
+                } catch (Throwable e) { }
+            }
+            sTitleCfg = o;
+            return o;
+        }
+    }
+
+    private static synchronized JSONObject titleCache() {
+        JSONObject c = sTitleCache;
+        if (c != null) return c;
+        JSONObject o = new JSONObject();
+        try {
+            String s = readSmallFile(titleCachePath());
+            if (!s.trim().isEmpty()) o = new JSONObject(s);
+        } catch (Throwable e) {
+            android.util.Log.w("VotBridge", "title_tr cache parse failed: " + e);
+        }
+        sTitleCache = o;
+        return o;
+    }
+
+    // Prune expired entries; when still too big, drop the least recently used.
+    private static synchronized void titleCacheSave(JSONObject c) {
+        try {
+            long now = System.currentTimeMillis();
+            java.util.Iterator<String> it = c.keys();
+            java.util.ArrayList<String> keys = new java.util.ArrayList<>();
+            while (it.hasNext()) keys.add(it.next());
+            for (String k : keys) {
+                JSONObject e = c.optJSONObject(k);
+                if (e == null || now - e.optLong("at", 0) > TT_TTL_MS) c.remove(k);
+            }
+            if (c.length() > TT_CACHE_MAX) {
+                java.util.ArrayList<String> all = new java.util.ArrayList<>();
+                it = c.keys();
+                while (it.hasNext()) all.add(it.next());
+                java.util.Collections.sort(all, new java.util.Comparator<String>() {
+                    public int compare(String a, String b) {
+                        JSONObject x = c.optJSONObject(a), y = c.optJSONObject(b);
+                        long xa = x == null ? 0 : x.optLong("at", 0);
+                        long ya = y == null ? 0 : y.optLong("at", 0);
+                        return xa < ya ? -1 : (xa > ya ? 1 : 0);
+                    }
+                });
+                int drop = all.size() - TT_CACHE_MAX;
+                for (int i = 0; i < drop; i++) c.remove(all.get(i));
+            }
+            writeSmallFile(titleCachePath(), c.toString());
+        } catch (Throwable e) {
+            android.util.Log.w("VotBridge", "title_tr cache save failed: " + e);
+        }
+    }
+
+    private static String sha1hex(String s) {
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-1");
+            byte[] d = md.digest(s.getBytes(StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder();
+            for (byte b : d) sb.append(String.format("%02x", b & 0xff));
+            return sb.toString();
+        } catch (Throwable e) {
+            return Integer.toHexString(s.hashCode());
+        }
+    }
+
+    private static double cyrShare(String s) {
+        int letters = 0, cyr = 0;
+        for (int i = 0; i < s.length(); i++) {
+            char ch = s.charAt(i);
+            if (Character.isLetter(ch)) {
+                letters++;
+                if (ch >= 0x0400 && ch <= 0x04FF) cyr++;
+            }
+        }
+        return letters == 0 ? 0 : (double) cyr / letters;
+    }
+
+    private static String ttNorm(String s) {
+        return String.valueOf(s == null ? "" : s).replaceAll("\\s+", " ").trim();
+    }
+
+    // Call the provider: Gemini native API by default, or any OpenAI-compatible
+    // endpoint when cfg.endpoint is set (one place to swap the free provider).
+    private static String ttProvider(String user, JSONObject cfg) throws IOException {
+        String key = cfg.optString("key", "");
+        String model = cfg.optString("model", "gemini-2.5-flash-lite");
+        String ep = cfg.optString("endpoint", "");
+        String url;
+        String payload;
+        boolean gemini = ep.isEmpty();
+        if (gemini) {
+            url = "https://generativelanguage.googleapis.com/v1beta/models/"
+                    + model + ":generateContent?key=" + key;
+            JSONObject b = new JSONObject();
+            try {
+                JSONObject sys = new JSONObject().put("parts", new JSONArray()
+                        .put(new JSONObject().put("text", TT_SYS)));
+                JSONObject part = new JSONObject().put("text", user);
+                JSONObject content = new JSONObject().put("role", "user")
+                        .put("parts", new JSONArray().put(part));
+                b.put("systemInstruction", sys);
+                b.put("contents", new JSONArray().put(content));
+                b.put("generationConfig", new JSONObject()
+                        .put("temperature", 0)
+                        .put("maxOutputTokens", 2048)
+                        .put("responseMimeType", "application/json"));
+            } catch (Throwable e) {
+                throw new IOException("payload");
+            }
+            payload = b.toString();
+        } else {
+            url = ep;
+            JSONObject b = new JSONObject();
+            try {
+                b.put("model", model);
+                b.put("temperature", 0);
+                b.put("messages", new JSONArray()
+                        .put(new JSONObject().put("role", "system").put("content", TT_SYS))
+                        .put(new JSONObject().put("role", "user").put("content", user)));
+            } catch (Throwable e) {
+                throw new IOException("payload");
+            }
+            payload = b.toString();
+        }
+        HttpURLConnection c = null;
+        try {
+            c = (HttpURLConnection) new URL(url).openConnection();
+            c.setConnectTimeout(4000);
+            c.setReadTimeout(9000);
+            c.setRequestMethod("POST");
+            c.setDoOutput(true);
+            c.setRequestProperty("Content-Type", "application/json");
+            if (!gemini) c.setRequestProperty("Authorization", "Bearer " + key);
+            byte[] raw = payload.getBytes(StandardCharsets.UTF_8);
+            c.setFixedLengthStreamingMode(raw.length);
+            OutputStream os = c.getOutputStream();
+            try { os.write(raw); } finally { try { os.close(); } catch (Throwable e) { } }
+            int code = c.getResponseCode();
+            InputStream in = code >= 400 ? c.getErrorStream() : c.getInputStream();
+            String text = "";
+            if (in != null) {
+                ByteArrayOutputStream bo = new ByteArrayOutputStream();
+                byte[] buf = new byte[4096];
+                int n;
+                while ((n = in.read(buf)) > 0) bo.write(buf, 0, n);
+                in.close();
+                text = new String(bo.toByteArray(), StandardCharsets.UTF_8);
+            }
+            if (code < 200 || code >= 300) {
+                android.util.Log.w("VotBridge", "title_tr provider http " + code
+                        + " " + text.substring(0, Math.min(160, text.length())));
+                throw new IOException("http " + code);
+            }
+            JSONObject j;
+            try {
+                j = new JSONObject(text);
+            } catch (Throwable e) {
+                throw new IOException("bad json");
+            }
+            String out = "";
+            if (gemini) {
+                JSONArray cand = j.optJSONArray("candidates");
+                JSONObject c0 = cand == null || cand.length() == 0 ? null : cand.optJSONObject(0);
+                JSONObject content = c0 == null ? null : c0.optJSONObject("content");
+                JSONArray parts = content == null ? null : content.optJSONArray("parts");
+                StringBuilder sb = new StringBuilder();
+                if (parts != null) {
+                    for (int i = 0; i < parts.length(); i++) {
+                        JSONObject p = parts.optJSONObject(i);
+                        if (p != null) sb.append(p.optString("text", ""));
+                    }
+                }
+                out = sb.toString();
+            } else {
+                JSONArray ch = j.optJSONArray("choices");
+                JSONObject c0 = ch == null || ch.length() == 0 ? null : ch.optJSONObject(0);
+                JSONObject msg = c0 == null ? null : c0.optJSONObject("message");
+                out = msg == null ? "" : msg.optString("content", "");
+            }
+            return out;
+        } finally {
+            try { if (c != null) c.disconnect(); } catch (Throwable e) { }
+        }
+    }
+
+    // Google Translate web endpoint (provider=google): no key, one title per GET.
+    // The bridge cache (30 days) keeps repeated grids free of requests.
+    private static String ttGoogle(String text, String lang) throws IOException {
+        String q = java.net.URLEncoder.encode(text, "UTF-8");
+        String url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl="
+                + java.net.URLEncoder.encode(lang, "UTF-8") + "&dt=t&q=" + q;
+        HttpURLConnection c = null;
+        try {
+            c = (HttpURLConnection) new URL(url).openConnection();
+            c.setConnectTimeout(4000);
+            c.setReadTimeout(9000);
+            c.setRequestProperty("User-Agent",
+                    "Mozilla/5.0 (Linux; Android 9; TV) AppleWebKit/537.36 "
+                    + "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
+            int code = c.getResponseCode();
+            InputStream in = code >= 400 ? c.getErrorStream() : c.getInputStream();
+            String text2 = "";
+            if (in != null) {
+                ByteArrayOutputStream bo = new ByteArrayOutputStream();
+                byte[] buf = new byte[4096];
+                int n;
+                while ((n = in.read(buf)) > 0) bo.write(buf, 0, n);
+                in.close();
+                text2 = new String(bo.toByteArray(), StandardCharsets.UTF_8);
+            }
+            if (code < 200 || code >= 300) throw new IOException("http " + code);
+            // [[["перевод","оригинал",null,null,10],[" ..."],...],null,"en",...]
+            JSONArray outer;
+            try {
+                outer = new JSONArray(text2);
+            } catch (Throwable e) {
+                throw new IOException("bad json");
+            }
+            JSONArray segs = outer.optJSONArray(0);
+            StringBuilder sb = new StringBuilder();
+            if (segs != null) {
+                for (int i = 0; i < segs.length(); i++) {
+                    JSONArray s = segs.optJSONArray(i);
+                    if (s != null && s.length() > 0) sb.append(s.optString(0, ""));
+                }
+            }
+            return sb.toString();
+        } finally {
+            try { if (c != null) c.disconnect(); } catch (Throwable e) { }
+        }
+    }
+
+    // Keep only sane translations: one line, bounded length, not the original,
+    // no "перевод:" prefix. Everything else is a fail (original stays visible).
+    private static boolean ttValid(String src, String tr) {
+        String t = ttNorm(tr);
+        if (t.isEmpty() || t.length() > 160) return false;
+        if (t.indexOf('\n') >= 0) return false;
+        if (t.equals(ttNorm(src))) return false;
+        String low = t.toLowerCase();
+        if (low.startsWith("перевод") || low.startsWith("translation")) return false;
+        if (t.length() > ttNorm(src).length() * 2 + 20) return false;
+        return true;
+    }
+
+    private static String handleTitleTr(JSONObject req) {
+        long t0 = System.currentTimeMillis();
+        JSONObject out = new JSONObject();
+        JSONArray trs = new JSONArray(), skips = new JSONArray(), fails = new JSONArray();
+        JSONObject cache = titleCache();
+        String lang = req.optString("lang", "ru");
+        JSONArray items = req.optJSONArray("items");
+        try {
+            JSONObject cfg = titleCfg();
+            boolean google = "google".equals(cfg.optString("provider", ""));
+            boolean hasKey = google || !cfg.optString("key", "").isEmpty();
+            // key -> {src, ids} in request order (dedupe identical titles)
+            LinkedHashMap<String, String> missSrc = new LinkedHashMap<>();
+            LinkedHashMap<String, JSONArray> missIds = new LinkedHashMap<>();
+            LinkedHashMap<String, String> missItemId = new LinkedHashMap<>();
+            if (items != null) {
+                for (int i = 0; i < items.length() && i < TT_MAX_ITEMS; i++) {
+                    JSONObject it = items.optJSONObject(i);
+                    if (it == null) continue;
+                    String id = it.optString("id", "");
+                    String src = ttNorm(it.optString("t", ""));
+                    if (src.isEmpty() || src.length() > TT_MAX_CHARS) {
+                        fails.put(new JSONObject().put("id", id).put("why", "bad"));
+                        continue;
+                    }
+                    if (cyrShare(src) >= 0.6) {
+                        skips.put(new JSONObject().put("id", id).put("why", "has_cyrillic"));
+                        continue;
+                    }
+                    String key = sha1hex("1:" + lang + ":" + src);
+                    JSONObject e = cache.optJSONObject(key);
+                    if (e != null && System.currentTimeMillis() - e.optLong("at", 0) <= TT_TTL_MS) {
+                        trs.put(new JSONObject().put("id", id).put("t", e.optString("t", ""))
+                                .put("src", src).put("s", "cache"));
+                        continue;
+                    }
+                    if (!missSrc.containsKey(key)) {
+                        missSrc.put(key, src);
+                        missIds.put(key, new JSONArray());
+                    }
+                    missIds.get(key).put(id);
+                    missItemId.put(key, id);
+                }
+            }
+            if (missSrc.isEmpty()) {
+                out.put("ok", 1).put("lang", lang).put("tr", trs).put("skip", skips)
+                        .put("fail", fails).put("ms", System.currentTimeMillis() - t0);
+                return out.toString();
+            }
+            if (!hasKey) {
+                out.put("ok", 0).put("why", "no_key").put("lang", lang).put("tr", trs)
+                        .put("skip", skips).put("fail", fails)
+                        .put("ms", System.currentTimeMillis() - t0);
+                return out.toString();
+            }
+            java.util.ArrayList<String> keys = new java.util.ArrayList<>(missSrc.keySet());
+            HashMap<Integer, String> byIdx = new HashMap<>();
+            if (google) {
+                // Free web endpoint: one GET per title, best effort. A failed item
+                // keeps the original title and gets no marker.
+                for (int i = 0; i < keys.size(); i++) {
+                    try {
+                        String one = ttGoogle(missSrc.get(keys.get(i)), lang);
+                        if (one != null && !one.trim().isEmpty()) byIdx.put(i + 1, one);
+                    } catch (Throwable e) {
+                        android.util.Log.w("VotBridge", "title_tr google item: " + e);
+                    }
+                }
+            } else {
+                StringBuilder user = new StringBuilder();
+                user.append("Переведи названия (").append(missSrc.size()).append(" шт.):\n");
+                int n = 0;
+                for (String k : keys) {
+                    n++;
+                    user.append(n).append(". ").append(missSrc.get(k)).append('\n');
+                }
+                String answer;
+                try {
+                    answer = ttProvider(user.toString(), cfg);
+                } catch (Throwable e) {
+                    android.util.Log.w("VotBridge", "title_tr provider fail: " + e);
+                    out.put("ok", 0).put("why", "upstream").put("lang", lang).put("tr", trs)
+                            .put("skip", skips).put("fail", fails)
+                            .put("ms", System.currentTimeMillis() - t0);
+                    return out.toString();
+                }
+                String json = answer;
+                int b0 = json.indexOf('{'), b1 = json.lastIndexOf('}');
+                if (b0 >= 0 && b1 > b0) json = json.substring(b0, b1 + 1);
+                JSONArray got = null;
+                try { got = new JSONObject(json).optJSONArray("tr"); } catch (Throwable e) { }
+                if (got != null) {
+                    for (int i = 0; i < got.length(); i++) {
+                        JSONObject g = got.optJSONObject(i);
+                        if (g == null) continue;
+                        int idx = g.optInt("i", i + 1);
+                        byIdx.put(idx, g.optString("t", ""));
+                    }
+                }
+            }
+            long now = System.currentTimeMillis();
+            int okN = 0, failN = 0;
+            for (int i = 0; i < keys.size(); i++) {
+                String key = keys.get(i);
+                String src = missSrc.get(key);
+                // Providers number from 1; accept 0-based when 1-based is absent.
+                String cand = byIdx.containsKey(i + 1) ? byIdx.get(i + 1) : byIdx.get(i);
+                if (cand != null && ttValid(src, cand)) {
+                    String t = ttNorm(cand);
+                    JSONObject e = new JSONObject();
+                    e.put("t", t).put("src", src).put("at", now);
+                    cache.put(key, e);
+                    JSONArray ids = missIds.get(key);
+                    if (ids != null) {
+                        for (int q = 0; q < ids.length(); q++) {
+                            trs.put(new JSONObject().put("id", ids.optString(q)).put("t", t)
+                                    .put("src", src).put("s", "llm"));
+                        }
+                    }
+                    okN++;
+                } else {
+                    JSONArray ids = missIds.get(key);
+                    if (ids != null) {
+                        for (int q = 0; q < ids.length(); q++) {
+                            fails.put(new JSONObject().put("id", ids.optString(q)).put("why", "invalid"));
+                        }
+                    }
+                    failN++;
+                }
+            }
+            if (okN > 0) titleCacheSave(cache);
+            long ms = System.currentTimeMillis() - t0;
+            android.util.Log.i("VotBridge", "title_tr n=" + missSrc.size() + " ok=" + okN
+                    + " fail=" + failN + " cache=" + cache.length() + " ms=" + ms);
+            out.put("ok", 1).put("lang", lang).put("tr", trs).put("skip", skips)
+                    .put("fail", fails).put("ms", ms);
+            return out.toString();
+        } catch (Throwable e) {
+            android.util.Log.w("VotBridge", "title_tr err: " + e);
+            try {
+                return out.put("ok", 0).put("why", "err").put("tr", trs).put("skip", skips)
+                        .put("fail", fails).toString();
+            } catch (Throwable e2) {
+                return "{\"ok\":0,\"why\":\"err\"}";
+            }
+        }
+    }
+
+    private static String titleTrStatus() {
+        JSONObject cfg = titleCfg();
+        JSONObject o = new JSONObject();
+        try {
+            o.put("ok", 1);
+            o.put("provider", cfg.optString("provider", "gemini"));
+            o.put("model", cfg.optString("model", ""));
+            o.put("hasKey", !cfg.optString("key", "").isEmpty());
+            o.put("cache", titleCache().length());
+        } catch (Throwable e) {
+            return "{\"ok\":0}";
+        }
+        return o.toString();
+    }
+
+    private static String titleTrReset() {
+        synchronized (Bridge.class) {
+            sTitleCache = new JSONObject();
+            writeSmallFile(titleCachePath(), "{}");
+        }
+        return "{\"ok\":1,\"cache\":0}";
+    }
+
+    private static String titleTrConfig(JSONObject req) {
+        synchronized (Bridge.class) {
+            try {
+                JSONObject cfg = new JSONObject();
+                cfg.put("provider", req.optString("provider", "gemini"));
+                cfg.put("model", req.optString("model", "gemini-2.5-flash-lite"));
+                cfg.put("endpoint", req.optString("endpoint", ""));
+                if (req.has("key")) cfg.put("key", req.optString("key", ""));
+                else if (sTitleCfg != null) cfg.put("key", sTitleCfg.optString("key", ""));
+                writeSmallFile(titleCfgPath(), cfg.toString());
+                sTitleCfg = cfg;
+                android.util.Log.i("VotBridge", "title_tr cfg provider="
+                        + cfg.optString("provider") + " model=" + cfg.optString("model")
+                        + " key=" + (!cfg.optString("key", "").isEmpty() ? 1 : 0));
+                return new JSONObject().put("ok", 1)
+                        .put("provider", cfg.optString("provider"))
+                        .put("model", cfg.optString("model"))
+                        .put("hasKey", !cfg.optString("key", "").isEmpty()).toString();
+            } catch (Throwable e) {
+                return "{\"ok\":0,\"why\":\"cfg\"}";
+            }
+        }
+    }
+
     // ---- PC filler: removed ------------------------------------------------
     // The bridge used to proxy /fill and /fill_status to a dev server on the LAN
     // (yt-dlp with browser cookies downloaded the track and uploaded it). The app
@@ -4105,6 +4621,16 @@ public final class Bridge {
                     resp = handleConfig(req).toString();
                 } else if (path.startsWith("/yt_session")) {
                     resp = handleYtSession();
+                } else if (path.startsWith("/title_tr/status")) {
+                    resp = titleTrStatus();
+                } else if (path.startsWith("/title_tr/reset")) {
+                    resp = titleTrReset();
+                } else if (path.startsWith("/title_tr/config")) {
+                    JSONObject req = body.length > 0 ? new JSONObject(new String(body, StandardCharsets.UTF_8)) : new JSONObject();
+                    resp = titleTrConfig(req);
+                } else if (path.startsWith("/title_tr")) {
+                    JSONObject req = body.length > 0 ? new JSONObject(new String(body, StandardCharsets.UTF_8)) : new JSONObject();
+                    resp = handleTitleTr(req);
                 } else if (path.startsWith("/yt_url")) {
                     String vid = queryParam(path, "videoId");
                     if (vid.isEmpty()) throw new IOException("missing videoId");
