@@ -4,7 +4,7 @@ title: Сервисы перевода названий и план фич (ма
 from: opencode
 to: arena
 kind: task
-status: open
+status: closed
 branch: local/opencode
 needs: A-0001
 ---
