@@ -5919,11 +5919,16 @@
   // POST /title_tr через мост (ключ провайдера живёт только там), подстановка
   // в карточки и маркер-точка. При любой ошибке остаётся оригинал и маркер не
   // ставится — правило «unknown beats wrong».
+  // Переводим только ролики: источник текста — плитки TT_CARDS, поэтому
+  // подписи меню, заголовки полок и строки настроек под замену не попадают.
+  // Плитки роликов — единственное, что переводим. Меню (гайд), заголовки
+  // полок, полосы действий и служебные строки в этот список не входят, поэтому
+  // их подписи не подменяются и не пропадают.
   var TT_CARDS = 'ytlr-tile-renderer,ytlr-compact-tile-renderer,'
     + 'ytlr-video-with-context-renderer,ytlr-compact-video-renderer,'
-    + 'ytlr-playlist-renderer,ytlr-channel-renderer,[role="gridcell"]';
-  var ttCache = {}, ttPending = {}, ttQueue = [], ttBusy = 0;
-  var ttApplyTimer = 0, ttCooldown = 0, ttOkCount = 0, ttLastLog = 0;
+    + 'ytlr-playback-preview,ytlr-playlist-panel-video-renderer';
+  var ttCache = {}, ttNoop = {}, ttPending = {}, ttQueue = [], ttBusy = 0;
+  var ttApplyTimer = 0, ttCooldown = 0, ttOkCount = 0, ttLastLog = 0, ttDomLog = 0;
 
   function ttNormText(s) {
     return String(s == null ? '' : s).replace(/\s+/g, ' ').trim();
@@ -5949,6 +5954,12 @@
     try { return uiPref('titleTr.enabled', true) !== false && uiPref('titleTr.enabled', true) !== '0'; }
     catch (e) { return true; }
   }
+  // Язык перевода названий: преф, но только валидный код (иначе ru).
+  function ttLang() {
+    var v = 'ru';
+    try { v = String(uiPref('titleTr.lang', 'ru') || 'ru'); } catch (e) { v = 'ru'; }
+    return /^[a-z]{2}([-_][A-Za-z]{2,4})?$/.test(v) ? v : 'ru';
+  }
   // Переводим только смешанный/иностранный текст: кириллицы < 60%, есть буквы
   // (включая CJK: заголовки на японском тоже нужно переводить).
   function ttWanted(s) {
@@ -5973,7 +5984,7 @@
     for (var i = 0; i < list.length; i++) {
       var it = list[i] || {};
       var t = ttNormText(it.t);
-      if (!ttWanted(t) || ttCache[t] || ttPending[t]) continue;
+      if (!ttWanted(t) || ttCache[t] || ttNoop[t] || ttPending[t]) continue;
       ttPending[t] = 1;
       ttQueue.push({ id: String(it.id || ''), t: t });
       added++;
@@ -5985,33 +5996,70 @@
 
   function ttPump() {
     if (ttBusy > 0 || !ttQueue.length || !ttEnabled()) return;
-    if (Date.now() < ttCooldown) { ttQueue.length = 0; return; }
-    var batch = ttQueue.splice(0, 20), items = [], i;
+    if (Date.now() < ttCooldown) {
+      // Очередь выбрасываем, но снимаем ttPending: иначе эти названия до
+      // перезагрузки считаются «уже в работе» и больше не запрашиваются.
+      for (var q = 0; q < ttQueue.length; q++) delete ttPending[ttQueue[q].t];
+      ttQueue.length = 0;
+      return;
+    }
+    // 12 — это один экран поиска; больше не влезает в бюджет провайдера
+    // (один GET на название), остальное уходит следующим тиком.
+    var batch = ttQueue.splice(0, 12), items = [], i;
     for (i = 0; i < batch.length; i++) items.push({ id: batch[i].id, t: batch[i].t });
     ttBusy++;
-    var t0 = Date.now();
-    http('POST', '/title_tr', { v: 1, lang: 'ru', items: items }, function (r) {
+    var t0 = Date.now(), lang = ttLang();
+    http('POST', '/title_tr', { v: 1, lang: lang, items: items }, function (r) {
       ttBusy--;
-      var ok = 0, k;
+      // Язык сменили, пока запрос был в пути: ответ старого языка в кэш не
+      // кладём, иначе подстановки вернутся на прежнем языке.
+      if (lang !== ttLang()) {
+        for (var q = 0; q < batch.length; q++) delete ttPending[batch[q].t];
+        ttPump();
+        return;
+      }
+      var ok = 0, nSkip = 0, nFail = 0, k;
       if (!r || r.ok === 0) {
         // Нет ключа/провайдер недоступен: не долбим мост каждым ответом сетки.
         ttCooldown = Date.now() + 300000;
         log('title_tr off ' + ((r && r.why) || 'bad'));
-      } else if (r.tr) {
-        for (k = 0; k < r.tr.length; k++) {
-          var e = r.tr[k] || {};
-          var src = ttNormText(e.src), tr = ttNormText(e.t);
-          if (!src || !tr || !ttWanted(src) || tr === src || tr.length > 160) continue;
-          ttCache[src] = tr;
-          ok++;
+      } else {
+        if (r.tr) {
+          for (k = 0; k < r.tr.length; k++) {
+            var e = r.tr[k] || {};
+            var src = ttNormText(e.src), tr = ttNormText(e.t);
+            if (!src || !tr || !ttWanted(src) || tr === src || tr.length > 160) continue;
+            ttCache[src] = tr;
+            ok++;
+          }
+        }
+        // «Нечего переводить» (бренд, латиница, уже русский) — не ошибка, но и
+        // не перевод: помним на сессию, иначе каждый экран спрашивает снова.
+        if (r.skip) {
+          for (k = 0; k < r.skip.length; k++) {
+            var sk = r.skip[k] || {};
+            if (sk.why === 'noop' && sk.src) { ttNoop[ttNormText(sk.src)] = 1; nSkip++; }
+          }
+        }
+        // Мост на паузе (429/cooldown): не возвращаемся к нему 30 с.
+        if (r.fail) {
+          for (k = 0; k < r.fail.length; k++) {
+            var fl = r.fail[k] || {};
+            nFail++;
+            if (fl.why === 'rate' || fl.why === 'cool' || fl.why === 'http429') {
+              ttCooldown = Date.now() + 30000;
+              break;
+            }
+          }
         }
       }
       for (k = 0; k < batch.length; k++) delete ttPending[batch[k].t];
       ttOkCount += ok;
       if (Date.now() - ttLastLog > 3000 || ok === 0) {
         ttLastLog = Date.now();
-        log('title_tr n=' + batch.length + ' ok=' + ok + ' ms='
-          + ((r && r.ms) || (Date.now() - t0)) + ' total=' + ttOkCount);
+        log('title_tr n=' + batch.length + ' ok=' + ok + ' skip=' + nSkip
+          + ' fail=' + nFail + ' ms=' + ((r && r.ms) || (Date.now() - t0))
+          + ' total=' + ttOkCount);
       }
       if (ok) ttApplySoon(0);
       ttPump();
@@ -6023,30 +6071,112 @@
     });
   }
 
-  function ttMarkDot() {
-    var d = document.createElement('span');
-    d.className = 'vot-tt-dot';
-    d.style.display = 'inline-block';
-    d.style.width = '9px';
-    d.style.height = '9px';
-    d.style.borderRadius = '50%';
-    d.style.background = '#3ea6ff';
-    d.style.marginLeft = '8px';
-    d.style.verticalAlign = 'middle';
-    d.style.flex = '0 0 auto';
-    d.setAttribute('aria-hidden', 'true');
-    return d;
+  // Текст листа: ровно один непустой текстовый узел и ни одного дочернего
+  // элемента. Возвращаем узел, а не элемент: подмена nodeValue не убивает
+  // детей (руны, бейджи, иконки), не снимает слушатели и не сбрасывает фокус.
+  function ttLeafTextNode(el) {
+    if (!el || (el.children && el.children.length)) return null;
+    var node = null;
+    for (var c = el.firstChild; c; c = c.nextSibling) {
+      if (c.nodeType !== 3) continue;
+      if (!/\S/.test(c.nodeValue || '')) continue;
+      if (node) return null;          // несколько текстовых узлов — неоднозначно
+      node = c;
+    }
+    return node;
   }
 
-  // Подменяем только листовой узел, чей текст в точности равен названию из
-  // ответа сетки. data-vot-tt хранит хеш источника: при recycle плитки текст
-  // меняется, хеш не совпадает — и карточка переводится заново.
-  function ttApplyOne(el, src, tr) {
-    if (el.getAttribute('data-vot-tt') === ttHash(src)) return false;
-    try { el.textContent = tr; } catch (e) { return false; }
-    el.appendChild(ttMarkDot());
+  // data-vot-tt — хеш источника, data-vot-orig — сам источник. По ним видно,
+  // наш перевод стоит, клиент вернул оригинал или плитку отдали другому ролику.
+  // Маркер — настоящий узел в карточке, а не ::after: CSS-псевдоэлементы в
+  // движке Cobalt ненадёжны, и точка внутри строки обрезается line-clamp.
+  function ttApplyOne(el, src, tr, card) {
+    if (!tr) return false;                  // нет перевода — оригинал остаётся
+    var node = ttLeafTextNode(el);
+    if (!node) return false;
+    if (ttNormText(node.nodeValue) !== src) return false;
+    try { node.nodeValue = tr; } catch (e) { return false; }
     el.setAttribute('data-vot-tt', ttHash(src));
+    el.setAttribute('data-vot-orig', src);
+    // Точка — на внешней плитке, в её левом верхнем углу.
+    ttMarkCard(card);
     return true;
+  }
+
+  // Точка «переведено» на карточке: абсолютный угол плитки, чтобы её не
+  // обрезал ни line-clamp заголовка, ни overflow контейнера текста.
+  // Точка — последний ребёнок плитки, поэтому ищем её по всем детям, иначе
+  // каждый проход добавлял бы ещё одну точку поверх старой.
+  function ttDotOf(card) {
+    for (var c = card.firstChild; c; c = c.nextSibling) {
+      if (c.nodeType === 1 && String(c.className || '').indexOf('vot-tt-dot') >= 0) return c;
+    }
+    return null;
+  }
+
+  function ttMarkCard(card) {
+    if (!card) return false;
+    if (ttDotOf(card)) return true;
+    var d = document.createElement('span');
+    d.className = 'vot-tt-dot';
+    d.setAttribute('aria-hidden', 'true');
+    d.style.cssText = 'position:absolute;top:8px;left:8px;width:10px;height:10px;'
+      + 'border-radius:50%;background:#3ea6ff;box-shadow:0 0 0 2px rgba(0,0,0,0.55);'
+      + 'z-index:5;pointer-events:none;';
+    var pos = '';
+    try { pos = getComputedStyle(card).position; } catch (e2) { }
+    if (!pos || pos === 'static') { try { card.style.position = 'relative'; } catch (e3) { } }
+    try { card.appendChild(d); } catch (e4) { return false; }
+    return true;
+  }
+
+  // Синхронизация маркеров: клиент может перерисовать плитку и выкинуть нашу
+  // точку, оставив перевод, — тогда точка возвращается. Если перевода в плитке
+  // больше нет (плитку отдали другому ролику), точка снимается: метка не врёт.
+  function ttSyncDots(cards) {
+    if (!cards) return;
+    for (var i = 0; i < cards.length && i < 120; i++) {
+      var card = cards[i], live = false, dot = null;
+      try {
+        if (card.parentElement && card.parentElement.closest(TT_CARDS)) continue;
+      } catch (e0) { }
+      try { live = !!card.querySelector('[data-vot-tt]'); } catch (e1) { continue; }
+      dot = ttDotOf(card);
+      if (live && !dot) ttMarkCard(card);
+      else if (!live && dot) { try { dot.parentNode.removeChild(dot); } catch (e2) { } }
+    }
+    // Длинная сетка: точки за пределами первых 120 плиток проверяем отдельно,
+    // иначе после recycle там остаётся ложная метка.
+    var dots = null;
+    try { dots = document.querySelectorAll('.vot-tt-dot'); } catch (e3) { dots = null; }
+    for (i = 0; dots && i < dots.length; i++) {
+      var dp = dots[i].parentElement, dlive = true;
+      try { dlive = !!(dp && dp.querySelector('[data-vot-tt]')); } catch (e4) { }
+      if (!dlive) { try { dots[i].parentNode.removeChild(dots[i]); } catch (e5) { } }
+    }
+  }
+
+  // Выключили pref (или сменили язык) — оригиналы обязаны вернуться, а не
+  // остаться до перезагрузки страницы. Маркер снимается вместе с атрибутом.
+  function ttRestoreAll() {
+    var list = null, n = 0, i;
+    try { list = document.querySelectorAll('[data-vot-tt]'); } catch (e) { return 0; }
+    for (i = 0; i < list.length; i++) {
+      var el = list[i];
+      var src = el.getAttribute('data-vot-orig') || '';
+      var node = ttLeafTextNode(el);
+      if (node && src && ttNormText(node.nodeValue) !== src) {
+        try { node.nodeValue = src; n++; } catch (e2) { }
+      }
+      el.removeAttribute('data-vot-tt');
+      el.removeAttribute('data-vot-orig');
+    }
+    var dots = null;
+    try { dots = document.querySelectorAll('.vot-tt-dot'); } catch (e3) { dots = null; }
+    if (dots) for (i = 0; i < dots.length; i++) {
+      try { dots[i].parentNode.removeChild(dots[i]); } catch (e4) { }
+    }
+    return n;
   }
 
   function ttApply() {
@@ -6055,64 +6185,116 @@
     var has = false;
     for (var k in ttCache) if (Object.prototype.hasOwnProperty.call(ttCache, k)) { has = true; break; }
     if (!has) return;
-    var cards = null, i, j, hits = 0;
-    try { cards = document.querySelectorAll(TT_CARDS); } catch (e) { cards = null; }
-    var scanCards = !!(cards && cards.length);
-    var list = [];
-    if (scanCards) {
-      for (i = 0; i < cards.length && list.length < 90; i++) list.push(cards[i]);
-    } else {
+    var i, j, hits = 0, seen = 0, sample = '';
+    var cards = null;
+    try { cards = document.querySelectorAll(TT_CARDS); } catch (e0) { cards = null; }
+    // Плиток нет — страницу не трогаем вообще. Никакого «сканировать всё»:
+    // именно такой проход раньше правил подписи меню и служебные строки.
+    if (!cards || !cards.length) return;
+    // Маркеры приводим в соответствие с содержимым плиток до подстановки:
+    // клиент мог перерисовать карточку и потерять/унаследовать точку.
+    ttSyncDots(cards);
+    for (i = 0; i < cards.length && hits < 60; i++) {
+      var card = cards[i];
+      // Плитка внутри плитки: точку ставим на внешнюю карточку.
       try {
-        var all = document.querySelectorAll('span,div,h2,h3,yt-formatted-string,p');
-        for (i = 0; i < all.length && list.length < 600; i++) list.push(all[i]);
-      } catch (e2) { return; }
-    }
-    for (i = 0; i < list.length && hits < 40; i++) {
-      var nodes;
-      if (scanCards) {
-        try { nodes = list[i].querySelectorAll('span,div,h2,h3,yt-formatted-string,p'); }
-        catch (e3) { continue; }
-      } else {
-        nodes = [list[i]];
-      }
+        if (card.parentElement && card.parentElement.closest(TT_CARDS)) continue;
+      } catch (e9) { }
+      var nodes = null;
+      // Любые теги: YTLR использует обфусцированные имена элементов, поэтому
+      // список из span/div пропускал заголовки целиком.
+      try { nodes = card.querySelectorAll('*'); }
+      catch (e1) { continue; }
       for (j = 0; j < nodes.length; j++) {
         var el = nodes[j];
-        if (el.children && el.children.length > 1) continue;
+        if (el.closest && el.closest('#vot-ui-root')) continue;
+        // Метку проверяем до фильтра «лист»: элемент мог получить детей
+        // (бейдж/иконку), и тогда старые атрибуты надо снять — иначе точка
+        // останется на карточке, где перевода уже нет.
+        var mark = el.getAttribute ? el.getAttribute('data-vot-tt') : null;
+        var leaf = !(el.children && el.children.length);
+        if (mark) {
+          var osrc = el.getAttribute('data-vot-orig') || '';
+          var cur = ttNormText(el.textContent);
+          if (leaf && osrc && ttCache[osrc] === cur) continue;    // перевод на месте
+          if (leaf && osrc && cur === osrc && ttCache[osrc]) {    // клиент вернул оригинал
+            if (ttApplyOne(el, osrc, ttCache[osrc], card)) { hits++; }
+            continue;
+          }
+          el.removeAttribute('data-vot-tt');
+          el.removeAttribute('data-vot-orig');
+        }
+        // Только чистый лист: у элемента с детьми textContent трогать нельзя.
+        if (!leaf) continue;
         var tx = ttNormText(el.textContent);
         if (!tx || tx.length > 120) continue;
-        var tr = ttCache[tx];
-        if (!tr) continue;
-        if (el.closest && el.closest('#vot-ui-root')) continue;
-        if (ttApplyOne(el, tx, tr)) { hits++; if (hits >= 40) break; }
+        // Точное совпадение с названием из ответа YouTube: под перевод не
+        // попадают ни счётчики просмотров, ни названия каналов.
+        if (!ttCache[tx]) {
+          if (seen < 4 && tx.length > 1) { seen++; sample += tx.slice(0, 30) + ' | '; }
+          continue;
+        }
+        if (ttApplyOne(el, tx, ttCache[tx], card)) hits++;
       }
     }
-    if (hits) log('title_apply n=' + hits);
+    if (hits) {
+      // Наши записи не должны будить observer: снимаем накопленные записи,
+      // иначе каждая подстановка планирует ещё один полный проход.
+      try { if (ttMo) ttMo.takeRecords(); } catch (e4) { }
+      log('title_apply n=' + hits);
+    } else if (seen && Date.now() - ttDomLog > 30000) {
+      ttDomLog = Date.now();
+      log('title_dom cards=' + cards.length + ' miss=' + sample.slice(0, 120));
+    }
   }
 
+  var ttApplyAt = 0;
   function ttApplySoon(delay) {
-    if (ttApplyTimer) return;
+    var at = Date.now() + (delay == null ? 400 : delay);
+    if (ttApplyTimer) {
+      if (at >= ttApplyAt) return;      // уже запланировано не позже
+      clearTimeout(ttApplyTimer);
+    }
+    ttApplyAt = at;
     ttApplyTimer = setTimeout(function () {
-      try { ttApply(); } catch (e) { ttApplyTimer = 0; log('title_apply err ' + (e && e.message)); }
-    }, delay == null ? 400 : delay);
+      ttApplyTimer = 0; ttApplyAt = 0;
+      try { ttApply(); } catch (e) { log('title_apply err ' + (e && e.message)); }
+    }, Math.max(0, at - Date.now()));
   }
 
+  var ttMo = null;
   function setupTitleTr() {
     if (window.__votTitleBatch) return;
     window.__votTitleBatch = ttBatch;
+    // Маркер «переведено» — настоящий span в углу плитки (ttMarkCard), поэтому
+    // CSS-псевдоэлемент здесь больше не нужен: он дублировал точку и обрезался
+    // вместе с заголовком при line-clamp.
     try {
-      var mo = new MutationObserver(function () { ttApplySoon(700); });
+      ttMo = new MutationObserver(function () { ttApplySoon(700); });
       // childList+subtree: YTLR пересобирает плитки при скролле и смене ленты.
-      mo.observe(document.documentElement || document.body, { childList: true, subtree: true });
+      // characterData не слушаем: наши записи в text-node иначе будили бы цикл,
+      // а после пачки мы ещё и снимаем накопленные записи (takeRecords).
+      ttMo.observe(document.documentElement || document.body, { childList: true, subtree: true });
     } catch (e0) { }
     // Страховка для recycle без childList: раз в 4 с, только при живом кэше.
     setInterval(function () {
       try {
-        if (ttEnabled() && document.visibilityState !== 'hidden') ttApplySoon(50);
+        if (!ttEnabled()) return;
+        if (document.visibilityState !== 'hidden') ttApplySoon(50);
       } catch (e1) { }
     }, 4000);
     try {
       window.addEventListener('vot-pref', function (e) {
-        if (e && e.detail && e.detail.key === 'titleTr.enabled') ttApplySoon(100);
+        var k = e && e.detail && e.detail.key;
+        if (k === 'titleTr.enabled') {
+          if (!ttEnabled()) { log('title_restore n=' + ttRestoreAll()); return; }
+          ttApplySoon(100);
+        } else if (k === 'titleTr.lang') {
+          // Язык перевода сменился — старые подстановки невалидны.
+          log('title_restore lang n=' + ttRestoreAll());
+          ttCache = {}; ttNoop = {};
+          ttApplySoon(100);
+        }
       });
     } catch (e2) { }
     log('title_tr hook ready');
@@ -7007,9 +7189,11 @@
   // оверлею (window.__votTitleBatch). Сами тела не логируем: в /log уходят
   // только счётчики. Названия нужны и для карточек сайдбара/главной.
   var ttHooks = 0;
+  // Только ленты с роликами. Guide (меню/подписки) сюда не входит: оттуда в
+  // кэш попадали названия каналов, и перевод затирал подписи меню.
   function ttIsList(u) {
     var s = String(u || '');
-    return /(?:^|\/)youtubei\/v1\/(search|browse|next|guide)(?:[?#]|$)/.test(s);
+    return /(?:^|\/)youtubei\/v1\/(search|browse|next)(?:[?#]|$)/.test(s);
   }
   function ttText(v) {
     if (!v) return '';
@@ -7077,7 +7261,9 @@
       nodes++;
       if (!n || typeof n !== 'object') continue;
       if (Object.prototype.toString.call(n) === '[object Array]') {
-        for (i = 0; i < n.length; i++) stack.push(n[i]);
+        // stack.pop() берёт последний: pushed в обратном порядке, чтобы обход
+        // шёл в порядке ответа (первая карточка экрана — первой в очереди).
+        for (i = n.length - 1; i >= 0; i--) stack.push(n[i]);
         continue;
       }
       var id = n.videoId;

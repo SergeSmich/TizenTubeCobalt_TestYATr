@@ -875,9 +875,11 @@
   // оверлею (window.__votTitleBatch). Сами тела не логируем: в /log уходят
   // только счётчики. Названия нужны и для карточек сайдбара/главной.
   var ttHooks = 0;
+  // Только ленты с роликами. Guide (меню/подписки) сюда не входит: оттуда в
+  // кэш попадали названия каналов, и перевод затирал подписи меню.
   function ttIsList(u) {
     var s = String(u || '');
-    return /(?:^|\/)youtubei\/v1\/(search|browse|next|guide)(?:[?#]|$)/.test(s);
+    return /(?:^|\/)youtubei\/v1\/(search|browse|next)(?:[?#]|$)/.test(s);
   }
   function ttText(v) {
     if (!v) return '';
@@ -945,7 +947,9 @@
       nodes++;
       if (!n || typeof n !== 'object') continue;
       if (Object.prototype.toString.call(n) === '[object Array]') {
-        for (i = 0; i < n.length; i++) stack.push(n[i]);
+        // stack.pop() берёт последний: pushed в обратном порядке, чтобы обход
+        // шёл в порядке ответа (первая карточка экрана — первой в очереди).
+        for (i = n.length - 1; i >= 0; i--) stack.push(n[i]);
         continue;
       }
       var id = n.videoId;

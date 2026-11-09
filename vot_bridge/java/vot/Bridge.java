@@ -274,6 +274,20 @@ public final class Bridge {
     private static final int TT_MAX_CHARS = 120;
     private static final long TT_TTL_MS = 30L * 24 * 3600 * 1000;
     private static final int TT_CACHE_MAX = 5000;
+    // Бюджет ответа: сетку нельзя держать дольше, чем она рисуется. Всё, что не
+    // успело, уходит в fail:budget и переводится следующим тиком.
+    private static final long TT_BUDGET_MS = 6000;
+    // Пауза между GET и один повтор на 429/сеть: без них 12 запросов подряд
+    // получают 429, и половина пачки уходит в fail без причины в логе.
+    private static final int TT_GAP_MS = 160;
+    private static final int TT_RETRY_MS = 600;
+    private static final int TT_RETRIES = 1;
+    private static final long TT_COOL_MS = 60000;
+    private static final String TT_UA = "Mozilla/5.0 (Linux; Android 9; TV) "
+            + "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+    private static final Object TT_LOCK = new Object();
+    private static volatile long sTtCoolUntil;
+    private static volatile long sTtCacheAt;
     private static final String TT_SYS =
             "Ты переводишь названия видео YouTube на русский. Верни СТРОГО JSON "
             + "{\"tr\":[{\"i\":<номер>,\"t\":\"<перевод>\"}]} без markdown и пояснений. "
@@ -360,6 +374,15 @@ public final class Bridge {
         }
         sTitleCache = o;
         return o;
+    }
+
+    // Кэш до 5000 записей — это ~1 МБ JSON; писать его на каждую пачку во время
+    // скролла нельзя (eMMC ТВ), поэтому не чаще раза в 8 с.
+    private static void titleCacheSaveThrottled(JSONObject c) {
+        long now = System.currentTimeMillis();
+        if (now - sTtCacheAt < 8000) return;
+        sTtCacheAt = now;
+        titleCacheSave(c);
     }
 
     // Prune expired entries; when still too big, drop the least recently used.
@@ -528,49 +551,85 @@ public final class Bridge {
 
     // Google Translate web endpoint (provider=google): no key, one title per GET.
     // The bridge cache (30 days) keeps repeated grids free of requests.
+    // Причина отказа едет в тексте IOException (http429|http503|timeout|net|html|
+    // json|empty), чтобы вызывающий мог её залогировать и решить, повторять ли:
+    // повтор html/капчи или пустого ответа только добьёт квоту.
     private static String ttGoogle(String text, String lang) throws IOException {
-        String q = java.net.URLEncoder.encode(text, "UTF-8");
         String url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl="
-                + java.net.URLEncoder.encode(lang, "UTF-8") + "&dt=t&q=" + q;
+                + java.net.URLEncoder.encode(lang, "UTF-8") + "&dt=t&q="
+                + java.net.URLEncoder.encode(text, "UTF-8");
         HttpURLConnection c = null;
         try {
             c = (HttpURLConnection) new URL(url).openConnection();
             c.setConnectTimeout(4000);
-            c.setReadTimeout(9000);
-            c.setRequestProperty("User-Agent",
-                    "Mozilla/5.0 (Linux; Android 9; TV) AppleWebKit/537.36 "
-                    + "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
+            c.setReadTimeout(4000);
+            c.setRequestProperty("User-Agent", TT_UA);
             int code = c.getResponseCode();
             InputStream in = code >= 400 ? c.getErrorStream() : c.getInputStream();
-            String text2 = "";
+            String body = "";
             if (in != null) {
                 ByteArrayOutputStream bo = new ByteArrayOutputStream();
                 byte[] buf = new byte[4096];
                 int n;
                 while ((n = in.read(buf)) > 0) bo.write(buf, 0, n);
                 in.close();
-                text2 = new String(bo.toByteArray(), StandardCharsets.UTF_8);
+                body = new String(bo.toByteArray(), StandardCharsets.UTF_8);
             }
-            if (code < 200 || code >= 300) throw new IOException("http " + code);
-            // [[["перевод","оригинал",null,null,10],[" ..."],...],null,"en",...]
-            JSONArray outer;
-            try {
-                outer = new JSONArray(text2);
-            } catch (Throwable e) {
-                throw new IOException("bad json");
-            }
-            JSONArray segs = outer.optJSONArray(0);
-            StringBuilder sb = new StringBuilder();
-            if (segs != null) {
-                for (int i = 0; i < segs.length(); i++) {
-                    JSONArray s = segs.optJSONArray(i);
-                    if (s != null && s.length() > 0) sb.append(s.optString(0, ""));
-                }
-            }
-            return sb.toString();
+            if (code < 200 || code >= 300) throw new IOException("http" + code);
+            String one = ttParseGoogle(body);
+            if (one.trim().isEmpty()) throw new IOException("empty");
+            return one;
+        } catch (java.net.SocketTimeoutException e) {
+            throw new IOException("timeout");
+        } catch (java.net.UnknownHostException e) {
+            throw new IOException("net");
+        } catch (java.net.ConnectException e) {
+            throw new IOException("net");
         } finally {
             try { if (c != null) c.disconnect(); } catch (Throwable e) { }
         }
+    }
+
+    // [[["перевод","оригинал",null,null,10],[" ..."],...],null,"en",...]
+    // HTML вместо JSON — это страница согласия/капчи: отдельная причина, не "json".
+    private static String ttParseGoogle(String body) throws IOException {
+        String s = body == null ? "" : body.trim();
+        if (s.isEmpty()) throw new IOException("empty");
+        if (s.charAt(0) == '<') throw new IOException("html");
+        JSONArray outer;
+        try {
+            outer = new JSONArray(s);
+        } catch (Throwable e) {
+            throw new IOException("json");
+        }
+        JSONArray segs = outer.optJSONArray(0);
+        StringBuilder sb = new StringBuilder();
+        if (segs != null) {
+            for (int i = 0; i < segs.length(); i++) {
+                JSONArray seg = segs.optJSONArray(i);
+                if (seg != null && seg.length() > 0) sb.append(seg.optString(0, ""));
+            }
+        }
+        return sb.toString();
+    }
+
+    // 429/408/5xx, таймаут и сеть — повторяем. html/json/empty — нет.
+    private static boolean ttRetryable(String why) {
+        if (why == null) return false;
+        if (why.equals("timeout") || why.equals("net")) return true;
+        if (!why.startsWith("http")) return false;
+        String n = why.substring(4);
+        return n.equals("429") || n.equals("408") || n.startsWith("5");
+    }
+
+    // Нечего переводить: бренд, латиница, уже русский текст. Это НЕ ошибка —
+    // такую пару надо запомнить, иначе каждый новый экран просит её заново.
+    private static boolean ttSame(String src, String tr) {
+        String b = ttNorm(tr);
+        // Пустой ответ провайдера — это не «нечего переводить»: иначе сбой
+        // навсегда запоминается как noop и повтор уже не случится.
+        if (b.isEmpty()) return false;
+        return ttNorm(src).equalsIgnoreCase(b);
     }
 
     // Keep only sane translations: one line, bounded length, not the original,
@@ -586,7 +645,16 @@ public final class Bridge {
         return true;
     }
 
+    // Один провайдер на процесс: параллельные запросы сетки (две страницы, два
+    // батча) складываются в серию и получают 429. Второй вызов ждёт, после чего
+    // первый уже положил ответы в кэш и второй отвечает из него.
     private static String handleTitleTr(JSONObject req) {
+        synchronized (TT_LOCK) {
+            return handleTitleTrLocked(req);
+        }
+    }
+
+    private static String handleTitleTrLocked(JSONObject req) {
         long t0 = System.currentTimeMillis();
         JSONObject out = new JSONObject();
         JSONArray trs = new JSONArray(), skips = new JSONArray(), fails = new JSONArray();
@@ -618,6 +686,11 @@ public final class Bridge {
                     String key = sha1hex("1:" + lang + ":" + src);
                     JSONObject e = cache.optJSONObject(key);
                     if (e != null && System.currentTimeMillis() - e.optLong("at", 0) <= TT_TTL_MS) {
+                        if (e.optInt("noop", 0) == 1) {
+                            skips.put(new JSONObject().put("id", id).put("why", "noop")
+                                    .put("src", src));
+                            continue;
+                        }
                         trs.put(new JSONObject().put("id", id).put("t", e.optString("t", ""))
                                 .put("src", src).put("s", "cache"));
                         continue;
@@ -643,15 +716,55 @@ public final class Bridge {
             }
             java.util.ArrayList<String> keys = new java.util.ArrayList<>(missSrc.keySet());
             HashMap<Integer, String> byIdx = new HashMap<>();
+            HashMap<Integer, String> whyByIdx = new HashMap<>();
+            long deadline = t0 + TT_BUDGET_MS;
             if (google) {
+                // По умолчанию «пачка оборвана по 429»; каждый осмотренный
+                // элемент перезапишет причину своей собственной.
+                for (int i = 0; i < keys.size(); i++) whyByIdx.put(i + 1, "cool");
                 // Free web endpoint: one GET per title, best effort. A failed item
                 // keeps the original title and gets no marker.
                 for (int i = 0; i < keys.size(); i++) {
-                    try {
-                        String one = ttGoogle(missSrc.get(keys.get(i)), lang);
-                        if (one != null && !one.trim().isEmpty()) byIdx.put(i + 1, one);
-                    } catch (Throwable e) {
-                        android.util.Log.w("VotBridge", "title_tr google item: " + e);
+                    String src = missSrc.get(keys.get(i));
+                    String why = "budget";
+                    long i0 = System.currentTimeMillis();
+                    if (i0 < deadline && i0 >= sTtCoolUntil) {
+                        for (int att = 0; att <= TT_RETRIES; att++) {
+                            if (att > 0) {
+                                long wait = Math.min(TT_RETRY_MS * att,
+                                        deadline - System.currentTimeMillis() - 400);
+                                if (wait <= 0) break;
+                                try { Thread.sleep(wait); } catch (InterruptedException ie) { }
+                            }
+                            try {
+                                byIdx.put(i + 1, ttGoogle(src, lang));
+                                why = "ok";
+                                break;
+                            } catch (IOException e) {
+                                why = e.getMessage() == null ? "err" : e.getMessage();
+                            }
+                            if (!ttRetryable(why)) break;
+                        }
+                    } else if (i0 < sTtCoolUntil) {
+                        why = "cool";
+                    }
+                    whyByIdx.put(i + 1, why);
+                    // ≤120 символов на строку; ok — только для первых 8, чтобы по
+                    // логу было видно, что пачка идёт, а не только итоговый счёт.
+                    if (!why.equals("ok") || i < 8) {
+                        android.util.Log.i("VotBridge", "title_tr item n=" + (i + 1) + "/"
+                                + keys.size() + " h=" + keys.get(i).substring(0, 8)
+                                + " len=" + src.length() + " why=" + why
+                                + " ms=" + (System.currentTimeMillis() - i0));
+                    }
+                    // 429 — не сбой одного элемента: остальные получат то же, поэто­му
+                    // пачку обрываем, а следующие 60 с отвечаем из кэша (why=cool).
+                    if (why.equals("http429")) {
+                        sTtCoolUntil = System.currentTimeMillis() + TT_COOL_MS;
+                        break;
+                    }
+                    if (i + 1 < keys.size()) {
+                        try { Thread.sleep(TT_GAP_MS); } catch (InterruptedException ie) { }
                     }
                 }
             } else {
@@ -687,39 +800,55 @@ public final class Bridge {
                 }
             }
             long now = System.currentTimeMillis();
-            int okN = 0, failN = 0;
+            int okN = 0, failN = 0, noopN = 0;
             for (int i = 0; i < keys.size(); i++) {
                 String key = keys.get(i);
                 String src = missSrc.get(key);
                 // Providers number from 1; accept 0-based when 1-based is absent.
                 String cand = byIdx.containsKey(i + 1) ? byIdx.get(i + 1) : byIdx.get(i);
-                if (cand != null && ttValid(src, cand)) {
+                JSONArray ids = missIds.get(key);
+                if (cand != null && ttSame(src, cand)) {
+                    // Переводить нечего (бренд/латиница/уже русский): запоминаем
+                    // «noop» на 30 дней, иначе каждый новый экран просит снова.
+                    JSONObject e = new JSONObject();
+                    e.put("noop", 1).put("src", src).put("at", now);
+                    cache.put(key, e);
+                    if (ids != null) {
+                        for (int q = 0; q < ids.length(); q++) {
+                            skips.put(new JSONObject().put("id", ids.optString(q))
+                                    .put("why", "noop").put("src", src));
+                        }
+                    }
+                    noopN++;
+                } else if (cand != null && ttValid(src, cand)) {
                     String t = ttNorm(cand);
                     JSONObject e = new JSONObject();
                     e.put("t", t).put("src", src).put("at", now);
                     cache.put(key, e);
-                    JSONArray ids = missIds.get(key);
                     if (ids != null) {
                         for (int q = 0; q < ids.length(); q++) {
                             trs.put(new JSONObject().put("id", ids.optString(q)).put("t", t)
-                                    .put("src", src).put("s", "llm"));
+                                    .put("src", src).put("s", google ? "google" : "llm"));
                         }
                     }
                     okN++;
                 } else {
-                    JSONArray ids = missIds.get(key);
+                    String why = whyByIdx.containsKey(i + 1) ? whyByIdx.get(i + 1)
+                            : (cand == null ? "no_translation" : "invalid");
                     if (ids != null) {
                         for (int q = 0; q < ids.length(); q++) {
-                            fails.put(new JSONObject().put("id", ids.optString(q)).put("why", "invalid"));
+                            fails.put(new JSONObject().put("id", ids.optString(q)).put("why", why));
                         }
                     }
                     failN++;
                 }
             }
-            if (okN > 0) titleCacheSave(cache);
+            if (okN > 0 || noopN > 0) titleCacheSaveThrottled(cache);
             long ms = System.currentTimeMillis() - t0;
             android.util.Log.i("VotBridge", "title_tr n=" + missSrc.size() + " ok=" + okN
-                    + " fail=" + failN + " cache=" + cache.length() + " ms=" + ms);
+                    + " fail=" + failN + " noop=" + noopN + " skip=" + skips.length()
+                    + " cache=" + cache.length() + " ms=" + ms
+                    + (System.currentTimeMillis() < sTtCoolUntil ? " cool" : ""));
             out.put("ok", 1).put("lang", lang).put("tr", trs).put("skip", skips)
                     .put("fail", fails).put("ms", ms);
             return out.toString();
@@ -751,8 +880,14 @@ public final class Bridge {
 
     private static String titleTrReset() {
         synchronized (Bridge.class) {
-            sTitleCache = new JSONObject();
-            writeSmallFile(titleCachePath(), "{}");
+            // Чистим кэш на месте: подмена ссылки оставляла параллельную пачку
+            // писать в отброшенный объект, и записи терялись.
+            JSONObject c = titleCache();
+            java.util.Iterator<String> it = c.keys();
+            java.util.ArrayList<String> ks = new java.util.ArrayList<>();
+            while (it.hasNext()) ks.add(it.next());
+            for (String k : ks) c.remove(k);
+            titleCacheSave(c);
         }
         return "{\"ok\":1,\"cache\":0}";
     }
@@ -763,9 +898,14 @@ public final class Bridge {
                 JSONObject cfg = new JSONObject();
                 cfg.put("provider", req.optString("provider", "gemini"));
                 cfg.put("model", req.optString("model", "gemini-2.5-flash-lite"));
-                cfg.put("endpoint", req.optString("endpoint", ""));
+                String ep = req.optString("endpoint", "");
+                String oldEp = sTitleCfg == null ? "" : sTitleCfg.optString("endpoint", "");
+                cfg.put("endpoint", ep);
                 if (req.has("key")) cfg.put("key", req.optString("key", ""));
-                else if (sTitleCfg != null) cfg.put("key", sTitleCfg.optString("key", ""));
+                else if (sTitleCfg != null && (ep.isEmpty() || ep.equals(oldEp)))
+                    cfg.put("key", sTitleCfg.optString("key", ""));
+                // Смена endpoint без явного key ключ не переносит: сохранённый
+                // ключ иначе ушёл бы в Authorization на чужой хост.
                 writeSmallFile(titleCfgPath(), cfg.toString());
                 sTitleCfg = cfg;
                 android.util.Log.i("VotBridge", "title_tr cfg provider="

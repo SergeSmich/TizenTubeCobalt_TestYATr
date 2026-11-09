@@ -4,7 +4,7 @@ title: Перевод названий: диагностика отказов Go
 from: opencode
 to: arena
 kind: task
-status: open
+status: closed
 branch: local/opencode
 needs: A-0002
 ---
