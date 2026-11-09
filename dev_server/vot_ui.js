@@ -83,10 +83,7 @@
     'border-radius:50% !important;transform:scale(.95) !important;transform-origin:50% 50%;}',
     '[data-vot-toggle="1"][data-vot-on="1"] [data-vot-ic="1"],',
     '[data-vot-toggle="1"][data-vot-on="1"] [data-vot-all="1"]{color:#0f0f0f !important;fill:#0f0f0f !important;',
-    'stroke:#0f0f0f !important;}',
-    '#vot-toast{position:fixed;right:44px;bottom:64px;z-index:2147483100;background:rgba(0,0,0,.86);',
-    'border-left:6px solid #ffb300;border-radius:12px;padding:16px 26px;font-size:24px;color:#fff;',
-    'max-width:900px;display:none;line-height:1.3;}'
+    'stroke:#0f0f0f !important;}'
   ].join('');
 
   var styleDone = false;
@@ -112,9 +109,9 @@
   }
 
   // ---------- DOM ----------
-  var root = null, panelEl = null, listEl = null, titleEl = null, subEl = null, hintEl = null, toastEl = null;
+  var root = null, panelEl = null, listEl = null, titleEl = null, subEl = null, hintEl = null;
   var cur = null, stack = [];
-  var toastTimer = null, geomN = 0;
+  var geomN = 0;
 
   function mk(tag, cls, text) {
     var e = document.createElement(tag);
@@ -143,9 +140,6 @@
     root.appendChild(back);
     root.appendChild(panelEl);
     (document.body || document.documentElement).appendChild(root);
-    toastEl = mk('div');
-    toastEl.id = 'vot-toast';
-    (document.body || document.documentElement).appendChild(toastEl);
     log('mounted');
   }
 
@@ -455,12 +449,11 @@
   }
 
   // ---------- тост ----------
+  // Отдельного окна больше нет: все уведомления показывает единая витрина
+  // статуса в vot.js (фиксированный размер, гаснет вместе с баром плеера).
   function toast(msg, ms) {
-    build();
-    toastEl.textContent = String(msg);
-    toastEl.style.display = 'block';
-    if (toastTimer) clearTimeout(toastTimer);
-    toastTimer = setTimeout(function () { toastEl.style.display = 'none'; }, ms || 3800);
+    var h = window.VOT_STATUS_TOAST;
+    if (typeof h === 'function') { try { h(msg, ms); } catch (e) { log('toast ERR ' + (e && e.name)); } }
   }
 
   // ---------- клавиши ----------
@@ -474,11 +467,25 @@
 
   function onKey(e) {
     var kc = e.keyCode;
+    // Android TV MENU может попадать в Chromium как 82, ContextMenu (93)
+    // либо вообще только как KeyboardEvent.key; 18 — старый маппинг Cobalt.
+    var menuKey = kc === KEY.MENU || kc === 82 || kc === 93 ||
+      e.key === 'ContextMenu' || e.key === 'Menu';
     var nav = (kc === KEY.UP || kc === KEY.DOWN || kc === KEY.LEFT || kc === KEY.RIGHT ||
-      kc === KEY.ENTER || kc === KEY.BACK || kc === KEY.MENU);
+      kc === KEY.ENTER || kc === KEY.BACK || menuKey);
+    // Панель «открыта» по состоянию, но на экране её нет (клиент успел закрыть
+    // свой попап, анимация не дошла, root потерял класс) — тогда мы глушили ВЕСЬ
+    // пульт при невидимом оверлее. Сверяемся с фактическим классом root.
+    if (cur) {
+      var shown = false;
+      try { shown = !!(root && String(root.className).indexOf('vot-open') >= 0); } catch (e0) { }
+      if (!shown) { cur = null; stack = []; log('key: stale panel, release keys'); }
+    }
     if (cur) {
       if (nav) { e.preventDefault(); e.stopPropagation(); }
       if (e.type !== 'keydown') return;
+      // Пока наша панель открыта, удержание MENU не должно её переоткрывать.
+      if (menuKey && e.repeat) return;
       if (kc === KEY.UP) {
         cur.index = (cur.index - 1 + cur.items.length) % (cur.items.length || 1);
         navLog('up');
@@ -497,15 +504,14 @@
         activate();
       } else if (kc === KEY.BACK) {
         back();
-      } else if (kc === KEY.MENU) {
+      } else if (menuKey) {
         close();
       }
       return;
     }
     if (e.type !== 'keydown') return;
-    if (kc === KEY.F4) { e.preventDefault(); e.stopPropagation(); fire('menu.toggle'); }
-    else if (kc === KEY.F3) { e.preventDefault(); e.stopPropagation(); fire('translate.toggle'); }
-    else if (kc === KEY.MENU) { e.preventDefault(); e.stopPropagation(); fire('menu.toggle'); }
+    // Нет собственной popup-панели вне плеера: MENU/F4 оставляем клиенту/ТВ.
+    if (kc === KEY.F3) { e.preventDefault(); e.stopPropagation(); fire('translate.toggle'); }
   }
 
   // ---------- инициализация ----------

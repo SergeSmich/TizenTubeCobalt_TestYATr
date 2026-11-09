@@ -16,7 +16,7 @@ Remove-Item -Recurse -Force vot_bridge\classes, vot_bridge\dex -ErrorAction Sile
 New-Item -ItemType Directory -Force -Path vot_bridge\classes, vot_bridge\dex | Out-Null
 
 Write-Host "==> javac"
-javac --release 8 -classpath $jar -d vot_bridge\classes vot_bridge\java\vot\*.java
+javac --release 8 -encoding UTF-8 -classpath $jar -d vot_bridge\classes vot_bridge\java\vot\*.java
 if ($LASTEXITCODE -ne 0) { throw "javac failed" }
 
 Write-Host "==> d8"

@@ -1,74 +1,297 @@
-# STATE — TizenTubeCobalt + Yandex VOT (29.10.2026)
+# STATE — serverless VOT (06.11.2026)
+
+## 06.11 (вечер): HOLD на серии поздних ретраев (русский ролик, 9 мин)
+- Симптом (`P541-Kmv-6Q`): больше двух минут висело «язык звука не определён»,
+  потом ролик определился русским и перевод не запускался (это верно).
+- Таймлайн логов: `20:51:37 meta_local … (bot gate)` → 25 с → `20:52:02 late
+  fail` → **HOLD** → ретраи по 45 с (`n=1`, `n=2`) → `20:53:33 meta probe IOS
+  st=OK lang=ru/captions-asr` → `translate skip (late meta)`. Окно ~90 с писало
+  «не определён», хотя опрос продолжался.
+- Причина: ветка `hardLate` ставила `metaPending`, но вызывала `showLangHold`
+  (HOLD считался «честным», потому что серия ретраев долгая). Это противоречит
+  правилу «пока `metaPending` — показывать ожидание».
+- Теперь в `hardLate` вызывается `langWaitStatus(id)`: всё время серии (до 8
+  ретраев по 45 с) окно показывает «определяю язык звука… / OK — перевести
+  сразу», а `showLangHold` остаётся только на исчерпании попыток.
+- Проверено на `.100` (свежий APK): `P541-Kmv-6Q` → `translate wait: lang
+  pending`, затем три `late retry` (25 с, +45 с, +45 с) без `translate hold`,
+  на третьем `meta probe ANDROID st=OK lang=ru` → `meta_local lang=ru late` →
+  `translate skip (late meta)`. HOLD не появлялся.
+
+## 06.11 (вечер): OK съедал первое нажатие при фокусе на кнопке бара
+- Симптом: открыть бар плеера, навести фокус на любую кнопку, нажать OK —
+  срабатывала кнопка перевода, а нужная кнопка только со второго раза.
+- Причина: хоткей HOLD (`holdPending`) перехватывал OK в capture-фазе на
+  `document` при любом фокусе, включая кнопки плеера. Логи:
+  `kdiag cap kc=13 af=YT-BUTTON-CONTAINER` + `hotkey OK kc=13 -> force translate`.
+- `focusOwnsKey()`: OK принадлежит контролу, только если `activeElement`
+  (или его предок) попадает в `FOCUS_CTRL` — `ytlr-button`,
+  `yt-button-container`, `button`, `[role=button|menuitem|checkbox|radio]`,
+  `a[href]`, `input/select/textarea`, `ytlr-player-actions-container`,
+  `ytlr-menu-item`, `ytlr-playlist-item`, `ytlr-toggle-button`,
+  `ytlr-icon-button`, `ytlr-compact-link`. Наша панель (`#vot-ui-root`) и
+  `#vot-status` исключены отдельно.
+- Важно: проверка «что угодно, кроме body» ломала хоткей — при скрытом баре
+  фокус уезжает на `YTLR-WATCH-DEFAULT`, и OK переставал форсировать перевод.
+  Поэтому список именно интерактивных узлов.
+- Проверено на `.100` (`oKIkvEjI2WE`, стабильный HOLD):
+  - фокус на кнопке бара (`kdiag cap kc=13 af=YT-BUTTON-CONTAINER`) —
+    `hotkey OK` и `toggle:` отсутствуют, нажатие доходит до кнопки;
+  - пульт не трогали, бар скрыт (`af=YTLR-WATCH-DEFAULT`) — `hotkey OK kc=13
+    -> force translate` + `toggle: on` + `translate start`, хоткей работает.
+
+## 06.11 (вечер): ложный HOLD на 25-секундном ретрае меты
+- Симптом (ролик на полчаса `C45RuVktN_Y`): окно писало «язык звука не
+  определён / нажмите OK», а через ~25 с перевод включался сам — срабатывал
+  поздний ретрай `/meta_local` после бот-гейта. Пользователь видел «не
+  определён» там, где определение ещё шло.
+- `state.metaPending = id` ставится в начале `fetchMeta` и на каждом
+  запланированном ретрае (META_GAPS, 25 с после гейта, 45 с-цепочка);
+  снимается при найденном языке и при исчерпании попыток.
+- Пока опрос идёт, `startTranslation` вместо HOLD показывает sticky-окно
+  «Перевод: определяю язык звука… / OK — перевести сразу» (sticky нужен,
+  чтобы OK на пульте по-прежнему форсировал перевод). «Язык звука не
+  определён» (`showLangHold`) появляется только после неудачи позднего
+  ретрая / исчерпания `META_GAPS`.
+- Проверено на `.100`: `C45RuVktN_Y` → `translate wait: lang pending` →
+  `meta_local en` → `translate resume` → `translate start lang=en` →
+  `resp status=1`, HOLD не появлялся. `oKIkvEjI2WE` (трейлер без речи, гейт)
+  → HOLD только после `meta_local late fail` (20:23:04), как и задумано.
+
+## 06.11 (вечер): `originalFormatLang` не видел `streamingData` — `ar` вместо `en`
+- `hj3qDOx9g8g` (английский оригинал + десятки автодублей) после первого
+  фикса всё равно давал `meta probe … lang=ar/captions-asr` →
+  `translate start lang=ar`. Причина: `originalFormatLang` искал
+  `adaptiveFormats`/`formats` на **верхнем уровне** player-ответа, а они
+  лежат в `streamingData`. Форматы не находились, `lang` оставался пустым,
+  и в дело шли ASR-субтитры дубля (`ar`). Теперь массивы читаются из
+  `streamingData` (верхний уровень оставлен фолбэком).
+- `publishSource*`/`sabrParamsFromCfg`: `xtags` — base64 protobuf, поэтому
+  `toLowerCase().indexOf("dubbed")` по сырой строке никогда не срабатывал
+  (`dubStripped=0`, хотя дорожка — дубль). Проверка идёт по `xtagsText(xt)`.
+- `publishSource` (ранг `job`, выше `track`) при срезанном дубле больше не
+  публикует язык дубля: берёт `lang`/`acont`/`role` из предыдущей записи
+  этого же видео (там `en` из `track`/`default`); если предыдущей нет —
+  пишет пустой `lang` и `role=PLAIN` (в `served` уже стоит `PLAIN`).
+- Проверено на `.100` (APK `tt203_bridge.apk`): `hj3qDOx9g8g` →
+  `meta probe … ANDROID st=OK lang=en/xtags-original atid=en-US.4` →
+  `meta_local … lang=en from=xtags-original 978ms` →
+  `translate start lang=en` → `translate resume: audio lang=en` →
+  `resp status=1` → `play offset=0.0`. `/source`: `lang=en`,
+  `role=ORIGINAL`, `trackId=en-US.4`, `phase=default`.
+- Побочно замечено: за ~1.5 с до `meta_local` мелькает
+  `translate hold: source lang unknown (source=none)` и сразу
+  `translate resume` — авто-резюм работает, но sticky-окно HOLD на этот
+  кадр может успеть показаться.
+
+## 06.11 (вечер): «иностранный ролик ошибочно определился русским»
+- Две причины и обе закрыты:
+  1) мост брал язык из `videoDetails.defaultAudioLanguage` — у автодублированных
+     роликов это язык **дубля** (ТВ-плеер его и выбирает), а играем мы оригинал
+     (`sp.xtags=""`). Теперь `fillLang` сначала ищет язык **оригинальной**
+     дорожки по `xtags`/`audioTrack` (`originalFormatLang`, `langFrom=
+     xtags-original`); если в ответе только дубли — ставится `dubOnly=1`, и
+     `defaultAudioLanguage` не используется вовсе (лучше hold, чем неверный ru).
+  2) страница тоже публиковала `vdlang` (тот же `defaultAudioLanguage`).
+     `skipTrusted()`: молча решаем «ролик на вашем языке» только при
+     `confidence=HIGH`; если язык пришёл из `defaultLanguage`/`vdlang`, вместо
+     `translate skip` показываем sticky «похоже, звук на русском — OK, всё равно
+     перевести» (`state.origLangFrom`, `skip unconfirmed` в логе).
+- `origLangFrom` хранит источник языка (`captions-asr`/`vdlang`/`xtags-original`/
+  `meta_local`) и сбрасывается в `resetSession`.
+- Мост: `/meta_local?…&retry=1&basic=1` — поздняя попытка только ANDROID/WEB/IOS
+  и мимо негативного кэша (бот-гейт проходит сам). `playabilityStatus.reason`
+  теперь в логе (`why=`) и в ответе (`why`), так что «не бот» и «нужен вход»
+  различимы.
+- В `build_bridge.ps1` добавлен `javac -encoding UTF-8` — русские комментарии
+  в `Bridge.java` иногда не маппились в windows-1251 и ломали сборку.
+- Проверено: `1OqTWGzD0Cs` → `meta probe … ANDROID st=OK lang=en/captions-asr`
+  → `translate start lang=en` → `resp status=1` → `play offset=0.0`.
+
+## 06.11 (вечер): visitorData страницы снимает бот-гейт
+- Причина «опять не определил язык»: `meta_local` минтил po-токен под
+  **собственный** visitor id моста (`PoToken.get(...)` → свежий
+  `visitor_id`). Яндекс быстро помечает такой visitor ботом, и все 6
+  клиентов отвечают `LOGIN_REQUIRED` — язык не определялся вообще.
+- Фикс: страница отправляет `visitorData` из `ytcfg('VISITOR_DATA')` в
+  `/meta_local?videoId=…&visitorData=…`; мост передаёт его в
+  `PoToken.getWithVisitor`. Этим же id страница сама стримит видео, поэтому
+  гейта нет.
+  Проверено после чистой установки: `meta vd page=476` →
+  `meta probe … ANDROID st=OK lang=en/captions-asr` → `meta_local … 385ms`
+  → `translate start lang=en`. На `dF0X_FikdMI`: HOLD → через 1.4 с
+  `translate resume` → `translate start lang=en` → `resp status=1`.
+- Лестница опроса языка сокращена с 9 до 4 шагов (`META_GAPS`
+  `[500,1200,3000,6000]`): каждый заход перебирает 6 клиентов, 60 запросов
+  подряд сами провоцировали гейт. При `LOGIN_REQUIRED`/`not a bot` после
+  второй попытки опрос прекращается (`meta_local … lang unknown (bot gate)`).
+- `req <method> <path>` в логе обрезается до 120 символов: `visitorData`
+  бывает 400+ символов и забивал logcat.
+
+## 06.11 (вечер): стагнация поллинга перевода
+- У роликов без речи Яндекс отвечает `status=2 rem=5` и подсказка не
+  двигается. Раньше опрос шёл вечно каждые 5 с (`poll in 5s rem=5 n=18…`).
+- `poll()`: `state.lastRem`/`state.stall`. После 12 ответов с тем же rem
+  (`~60 с`) пауза растёт до 15 с (`STALL_SOFT`/`STALL_DELAY`), статус —
+  «сервер обрабатывает звук дольше обычного…». Отказ только после 24
+  стагнаций (~4 мин без прогресса): «похоже, в ролике нет речи»
+  (`poll stall 24 rem=5 — stop`).
+- Жёсткий отказ через 60 с сначала поставил, но `oKIkvEjI2WE` (трейлер без
+  голосов) в итоге доехал до `status=1` через несколько минут — такой порог
+  убивал живой перевод, поэтому он мягкий.
 
 ## Цель
-Живой перевод Яндекса (VOT) в TizenTubeCobalt **serverless**: API Яндекса в рантайме + статика
-GitHub/CDN, без форка и без ПК-сервера. Ветка `fix-vot-runtime-injection`, PR в `main` не делать.
-Тест: **`YNDX-00091` (magritte, Android 11, armeabi-v7a) `adb 192.168.1.100:5555`**,
-пакет `io.gh.reisxd.tizentube.cobalt` 2.0.3, activity `dev.cobalt.app.MainActivity`.
-**SberBox 192.168.1.198 НЕ ТРОГАТЬ.** История до 29.10 — `STATE_ARCHIVE.md`.
+Приставка автономна (без ПК). Язык оригинала определяется многоуровнево
+с оценкой достоверности; Яндекс получает язык оригинала, Cobalt играет оригинал.
 
-## ✅ 29.10 ~05:56 — E2E РАБОТАЕТ ПОЛНОСТЬЮ АВТОМАТИЧЕСКИ
-`rtrdroYs67A` (4014 с), без ручных запросов: `translate start` (страница сама) → `status=6` +
-tid → `POST /audiosrc` (сама) → `page-sabr` скачал **81 922 133 Б** itag 140 → 16 частей залито
-→ Яндекс `status=5` → `status=1` + `audioUrl`, страница **включила перевод** (`play offset=…`,
-`vol tr=100 orig=10`). Время: 74.8 с на аудио, ~3 мин до готового перевода.
-Контроль на `hPV-Ql_KGzM` (4199 с): mp3 у Яндекса **4198.654785 с**, 67 179 877 Б — полная длина.
+## Ограничения
+- `.100:5555` — отладка, `.200:5555` — только после E2E.
+- Без PR/коммита, `cfg.json` не коммитить. `vot.js`/`vot_net.js` — только
+  edit/write + `node --check`.
+- Панель фильтров поиска (правая от клавиатуры) — не регрессировать.
+- OAuth-токен живёт ТОЛЬКО в `vot_config_cache.json` моста (бэкап
+  `/data/local/tmp/votcfg.json`); после каждой установки APK восстанавливать.
 
-## Как это работает (три обязательных ингредиента)
-1. **AAC вместо opus**: `/config.aac=true` (теперь дефолт) → страница в `patchCodecs` отвечает
-   «нет» на `audio/webm|opus` в `MS.isTypeSupported` → плеер берёт `audio/mp4; codecs="mp4a.40.2"`,
-   SABR отдаёт **itag 140**. С opus (251) файл — matroska/webm с 25 000 ошибок
-   `non monotonically increasing dts` (сервер отдаёт перекрывающиеся фрагменты не по порядку).
-2. **Init-сегмент из MSE**: SABR отдаёт сессии, которая уже играла, только media-фрагменты.
-   Страница на первом `appendBuffer` аудио-SourceBuffer постит байты в `POST /mseinit?vid=&mime=`
-   (723 Б, `ftyp/dash`), мост пишет их первыми в стейдж. Без init файл вообще не контейнер.
-3. **Тело POST самого плеера без поля 3** (`buffered_ranges`): только эта форма даёт медиа
-   (`raw=2`); наше тело → policy-only (`35/46/47`), `raw=1` (с полем 3) → 0 байт.
-   Плюс пейсинг по таймингам части 35 (`d=`).
+## Сделано (этот заход)
+- `parseXtags`: разделитель в protobuf — служебные байты, не `=`.
+- `dcr=1` больше не `descriptive` (это DRC, а не описание); реальный оригинал
+  `ru.4` перестал падать в низший ранг.
+- `publishDefaultTrack` → `POST /track phase=default` (ранг между `page` и
+  `track`); `mapped=0` не публикуется; `publishTrackInfo` отбрасывает
+  `mapped!=1`.
+- `pageSabrUsable`: пара «wire url + тело POST» теперь годится и из
+  захваченного запроса плеера (`/sabrreq`), не только из `/sabrcfg` — ушло
+  12-секундное ожидание «no fresh player config» и фолбэк на клиентов с
+  `LOGIN_REQUIRED`.
+- `sabrParamsFromCfg`: работает и без `/sabrcfg` (берёт url+ucfg из `/sabrreq`).
+- `publishBridgedDefault` (в мосте, внутри `meta_local`): если страница не
+  увидела player-ответ, дорожка по умолчанию публикуется как `phase=default`.
+- `meta_local`: `itPlayer` теперь с po-токеном (`PoToken.getWithVisitor`);
+  без него WEB отвечал `LOGIN_REQUIRED` почти всегда.
+- `fillLang`: если в player-ответе нет `audioTrack.id` (`audioTracks:[""]`),
+  язык берётся из ASR-субтитров (`kind=asr` / `vssId=a-*`) как `meta_local`
+  с `langFrom=captions-asr` (MEDIUM). Ручные субтитры не используются
+  (unknown beats wrong). Диагностика: `captionLangs` в ответе `/meta_local`.
 
-## Состояние кода
-- `Sabr.java`: `Params.bodyTpl/bodyStrip`, `replayBody(tpl,time,strip)`, `parse()` частей
-  35/52/53 (`nextDelayMs`), `stuckLimit/replayLimit`, `Result.initSegs/dupInit/declMs/pol`,
-  `umpVarint` (заголовки) отдельно от `readVarint` (protobuf).
-- `Bridge.java`: `/mseinit`, `mseInitFor(vid)`, `SabrStage.init(byte[])`, `capturedSabrBody(vid)`,
-  `sAac` (дефолт true) + `/config.aac`, стейджинг в `vot_asrc.bin` → `uploadStaged` (5 295 308 Б),
-  `mp4Head`, `/sabrfile?from=&max=` (4 МБ), `/sabrtest?page=1&raw=N&xtags=`.
-- `vot_net.js`: `hookMse` → `mseInitSend`, `pullConfig` каждые 12 с (in-flight guard),
-  `patchCodecs` (флаг `aac`).
-- Ревью `reviewer` пройдено, обязательные фиксы внесены: `handleAudioRaw` отбивает части
-  стале-поколения (`gen != sAsrcGen`), `SabrStage.init` пробрасывает `IOException`.
-- `javac` OK, `node --check` OK (`vot_net.js` и `assets/vot.js`), закоммичено в ветку.
+## Проверено на `.100` (05.11, APK `tt203_bridge.apk`)
+- ru-оригинал (`a5h6WZoNTgI`, `yf2IKXyKj3c`): `source … role=ORIGINAL lang=ru
+  phase=default` → `translate skip`; тост «ролик на вашем языке «русский»
+  (перевод не нужен)».
+- en-оригинал (`9wq3VHsL_bE`, NASA): `playtrack … id=en-US.4 lang=en
+  mapped=1` → `source … phase=track` → `translate start lang=en` →
+  `resp status=1 tid=462770675` → `play https://vtrans.s3-private…` →
+  тост «Перевод: ГОТОВО — играю», `resync av≈vv`. Перевод Яндекса заработал
+  без ПК и без `audiosrc` (у ролика был кэш перевода).
+- Панель «Фильтры» поиска на месте (не регрессировала).
+- 06.11, прогон ~8 ru-роликов: 5 определились как `ru` через `bridged default`
+  (`audioTracks:["ru.4"]`), 3 — без `audioTrack` вообще
+  (`R7WC5NHrO_w`, `37m9DBC_5Ls`, `Fi6Bk1iyEX4`) и уходили в hold
+  (`bridged default … unmapped=1 keys=[]`). После фикса ASR-фолбэка все три
+  дают `meta_local … lang=ru from=captions-asr` → `translate skip (late meta)`.
+  E2E проверено на `37m9DBC_5Ls`: тост «ролик на вашем языке «русский»».
+- `DqFf1x6YoFw`: hold ~0.8 с (страница не увидела player-ответ), затем
+  `translate skip (late meta)` — норма, но плашка на секунду мелькает.
 
-## 🔎 Известная проблема качества (следующее)
-Плеер ТВ сам выбирает **автодуб**: в захваченном body/wire-url `xtags=acont=dubbed-auto:lang=ar`.
-Значит и init, и SABR-медиа принадлежат арабской дорожке, и Яндекс переводит дубль, а не
-оригинал. Нужно заставить плеер брать оригинальный трек (ytcfg/эксперимент авто-дубля) либо
-просить SABR оригинал и брать init того же формата — проверить на ролике без дублей (xt тег пуст)
-как контроль.
+## 06.11: «99 %» и закачка видео закрыты
+- Причина «99 % и качает дальше»: `audiosrc` реплеил тело плеера как есть, а оно
+  выбирает и видео (`field 22 = 137`) — 668-секундный ролик качался как 106 МБ
+  `itag=137` при ~10 МБ аудио.
+- Проверено на живом устройстве (`/sabrmix`): собственное тело (`our`) с большим
+  (6 КБ) ustreamer-конфигом получает `sabr.malformed_config`, а тело страницы с
+  нашей `field 2` (`page-sel140`) отдаёт `itag=140` при конфиге любого размера.
+- Поэтому `audioSourceJob` берёт тело плеера и меняет только выбор формата
+  (`Sabr.mix(tpl, our, 2)`), стрипает `buffered_ranges`, а `itag` в `Sabr.run`
+  теперь фильтрует медиа: видео-поток из смешанного ответа отбрасывается
+  (`byItag` в логе).
+- Порог успеха: файл < 100 КБ больше не уходит как «дорожка» (раньше один
+  init-сегмент 723 Б маскировал провал).
+- E2E `1OqTWGzD0Cs` (414 с, en, Яндекс `audio=no`): `selAudio itag=140` →
+  8.0 МБ за 15 с (`byItag={140=8.0M, 136=42.8M}`) → 2 чанка → `status=1` через
+  ~50 с → `play` + `restart video from 67.4s`, `vol tr=100 orig=10`.
 
-## 🧪 29.10 ~06:29 — прогон 3 роликов: авто-путь стабилен, но нужен «свежий» ролик
-`rtrdroYs67A`, `hPV-Ql_KGzM`, `jNQXAC9IVRw` у Яндекса **уже в кэше** (`status=1` + `audioUrl`
-через 5 с) → путь звука на них не проверяется. Настоящий тест дал автоплей:
-`uXXBDBwl5RI` (179 с, свежий) — страница сама `translate start` → `status=6` → `audiosrc start`
-(через 8.6 с) → `page-sabr itag=140 init=723` → `done 3 705 493 Б` за 5 с → `status=2`
-(rem 27→5) → `status=1` + `audioUrl`, перевод включился. `mseinit` на всех 4 роликах
-= 723 Б `audio/mp4` (`jNQXAC9IVRw` — 632 Б), смене ролика не мешает.
-Диагностика `audfmt` (список аудиодорожек из player response) **не сработала** — в Cobalt
-player response не виден ни через `ytcfg`, ни через XHR/fetch (`has streamingData=false`),
-поэтому дорожки так не получить. `xtags` у свежего ролика снова `acont=dubbed-auto:…`.
+## Открыто
+- `audiosrc` проверен на en-роликах без перевода (`bqVhMnM2O18`, `1OqTWGzD0Cs`),
+  но клиенты для `meta_local`: `TVHTML5_SIMPLY_EMBEDDED_PLAYER` — no audio
+  format, `VISIONOS/ANDROID/IOS/WEB/TVHTML5` — `LOGIN_REQUIRED`, живой только
+  `ANDROID_VR`.
+- Ролики без `audioTrackId`/xtags и без ASR-субтитров (напр. `m1ZbYo-xGB0`)
+  → язык UNKNOWN → hold; это осознанно («unknown beats wrong»), лечится
+  политикой «Перевести с автоопределением».
+- `meta_local` местами всё ещё `LOGIN_REQUIRED` (po-токен не всегда спасает).
 
 ## Следующий шаг
-1. ✅ Закоммичено: `c898042e7f1` (`vot: serverless полный аудиотрек через SABR replay`).
-   APK на ТВ — сборка 06:16 (с фиксами ревью).
-2. Разобраться с `dubbed-auto`: как отключить автодуб в плеере Cobalt (или запросить оригинал).
-3. Прогонять только **свежие** ролики: закэшированные отвечают `status=1` сразу и путь звука не тестируют.
+1. `.200` (SberBox): APK установлен, миграция кэша проверена
+   (`audioMode:"local"`, `v:2`, токен сохранён); отладка на нём запрещена,
+   smoke-тесты — только на `.100`.
+2. Проверить «Звучит сейчас» в меню `vot-dub` на живом ролике.
+3. Долгие ролики: видео-поток в ответе всё ещё скачивается и выбрасывается
+   (~40 МБ на 4 минуты); при желании — отдельный вариант без `field 22`.
 
-## Грабли
-- `am force-stop`/`kill` запрещены; install APK убивает процесс.
-- `am start … -f 0x10008000` при живом приложении убивает surface → чёрный экран (только холодный старт).
-- Deep-link intent `VIEW watch?v=…` перезагружает страницу на выбор профиля (не всегда ведёт в ролик).
-- `adb forward tcp:18114 tcp:8013`; старый `18014` принадлежит `.198` — не трогать.
-- Логи только `adb logcat -v time -s VotBridge:V`.
-- `Bridge.java` с BOM (`utf-8-sig`); APK `tt203_bridge.apk`; `assets/vot.js` = vot_ui.js + vot.js + vot_net.js.
-- `/translate` без tid: вердикт читается тем же `firstRequest:false` + тот же `videoUrl`+`duration`.
-- `/sabrfile` целиком = OOM; тянуть по 4 МБ (`from`/`max`).
+## 06.11: единое окно статуса перевода
+- Раньше этапы (`#vot-status`) и короткие тосты (`#vot-toast`) были двумя
+  плашками с «плавающим» размером. Теперь окно одно: `#vot-status`, фиксировано
+  `480x100` (`padding 20 + текст 68px/3 строки + шкала 12`), текст в дочернем
+  `#vot-status-text`, шкала — отдельный узел. `#vot-toast` удалён из CSS/DOM,
+  `VOTUI.toast()` делегирует в `window.VOT_STATUS_TOAST`, который перекрывает
+  этап на время показа (`statusToast`, по умолчанию 3800 мс).
+- Видимость решает `statusApply()` по классу из `setStatus`:
+  `#f5a623` = busy и `#e53935` = error — видны всегда (перевод идёт, даже если
+  бар плеера спрятан); `#4caf50` = done и `#90a4ae` = idle — только пока видны
+  элементы управления плеера. После запуска перевода окно не «висит» поверх
+  видео: оно гаснет вместе с баром.
+- Гейт `playerControlsVisible()`: (1) `findVideo()` и видео занимает ≥50 %
+  вьюпорта, (2) `ytlr-player-actions-container` с ненулевым rect и пересечением
+  с вьюпортом, (3) среди 8 предков нет `visibility:hidden`/`aria-hidden=true`
+  и итоговая opacity > 0.05. Причина отказа — в лог:
+  `st gate show=0 … why=novid|vsize|norow|rect0|offscreen|vis|aria|op…`.
+- Проверено на `.100`: на главной `why=rect0` (скрытый плеер в DOM), в ролике
+  с открытым баром `show=1 why=ok`, после автоскрытия бара `show=0 why=aria`,
+  во время перевода `show=1 kind=busy why=aria` (busy игнорирует гейт).
+  Скриншоты `_shots/s5.png`, `s6.png` — окно одного размера на разных этапах.
+  Готовность: `show=0 kind=done why=aria` (бар скрыт) → `show=1 kind=done
+  why=ok` после появления бара — «хвоста» после запуска перевода нет.
+
+## 06.11: sticky-HOLD, OK для ручного запуска, больше клиентов меты
+- HOLD-окно теперь видно и без бара (`sticky=1`): `_shots/hold2.png`,
+  `hold3.png`, `bond1.png` — «язык звука не определён» на чёрном экране.
+  Лог: `st gate show=1 kind=idle sticky=1 why=rect0|norow`.
+- Ручной запуск при HOLD: перехват **OK** (keyCode 13/23) в capture-фазе,
+  только пока `holdPending()` (langWaitForId этого ролика + sticky idle).
+  Проверено на `oKIkvEjI2WE`: `hotkey OK kc=13 -> force translate` →
+  `toggle: on` → `translate start … lang=auto` → `resp status=2 rem=71` →
+  поллинг. F4 (115/134) оставлен для клавиатуры, но `adb input keyevent 134`
+  до JS не доходит (Cobalt отдаёт kc=177 + 115 только в kiiag, обработчик
+  не срабатывает), поэтому в тексте окна осталось только «нажмите OK».
+  Android KEYCODE_F4=134, DOM keyCode F4=115 — оба в обработчике.
+- `meta_local` перебирает 6 клиентов: ANDROID → IOS → TVHTML5_EMBEDDED →
+  WEB → ANDROID_VR → TVHTML5; статусы в ответе по именам клиентов
+  (`androidStatus`, `iosStatus`, …). Это не помогло `oKIkvEjI2WE` (Bond-
+  трейлер): у ролика нет ни `audioTracks`, ни ASR-субтитров, ни
+  `defaultAudioLanguage`, ни `audioTrack.id` — `ANDROID st=OK` с пустыми
+  `tracks/caps`, остальные LOGIN_REQUIRED/ERROR.
+- Причина «не определяет en» на трейлерах: в трейлере нет голосов (только
+  музыка/шумы), поэтому у него и нет языковых метаданных — ASR-субтитров
+  нет. Это не баг определения: язык у такого ролика отсутствует физически.
+  HOLD + OK (авто) — корректное поведение; для роликов с речью
+  (`1OqTWGzD0Cs`, `UNwV7qtH6y4`, `-nY5b9fBHxw`) определение идёт через
+  `captions-asr` и перевод стартует сам.
+- `playtrack`/`reportPlayingTrack`: `audMapFresh(id)` (videoId + TTL 120 с) и
+  сверка с `capVideoId()`; иначе константный `en-US.4` из SABR размечал
+  чужой ролик как «english original». `playtrack skip … stale map` /
+  `(mismatch)` в логе.
+- `fetch player` теперь логируется per-vid (`fetch player vid=…`), чтобы
+  видеть ответы preview-роликов; watch player-response JS-хуку по-прежнему
+  не виден.
+
+## Отложенный баг: навигация пульта после простоя
+- Симптом: после ~5 с без нажатий бар плеера скрывается; первое «вправо»
+  ставит фокус на прогресс-бар (`ytlr-multi-markers-player-bar-renderer`),
+  следующее — на вырожденный `yt-focusable-container 1920x12`
+  (`yt-focus-container 0x0`); YouTube уходит в режим глав/маркеров и ряд
+  кнопок демонтируется (`btn=3 our=0`).
+- `injectVotBtn` не виноват: в рабочем состоянии `our=1`, в сломанном — 0.
+- План лечения (не делать без явной просьбы): перехватывать `ArrowRight`, когда
+  фокус в `ytlr-progress-bar` / 12px-контейнере, и переносить фокус на первую
+  кнопку `ytlr-player-actions-container`.
+- Временный `bar dump` в `vot.js` (~4079–4120) пока оставлен для диагностики:
+  печатает список кнопок с rect/aria/dis.

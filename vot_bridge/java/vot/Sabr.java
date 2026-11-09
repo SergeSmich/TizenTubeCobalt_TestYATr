@@ -153,6 +153,16 @@ public final class Sabr {
         public long firstByteMs;
         public String err = "";
         public final HashMap<Integer, Integer> parts = new HashMap<>();
+        // Media bytes per itag: a replayed body that still selects a video
+        // format answers with both streams, and this is how we tell a truly
+        // audio-only answer from a mixed one.
+        public final java.util.LinkedHashMap<Integer, Long> mediaByItag =
+                new java.util.LinkedHashMap<>();
+        // xtags из media header (поле 5): роль и язык реально отдаваемой
+        // дорожки, например `acont=original:lang=en-US`. Это единственный
+        // источник языка, который не зависит от InnerTube и его бот-гейта.
+        public final java.util.LinkedHashMap<Integer, String> trackXtags =
+                new java.util.LinkedHashMap<>();
         final java.util.HashSet<Integer> inited = new java.util.HashSet<>();
         Hdr lastHdr;
         byte[] cookie;
@@ -165,6 +175,8 @@ public final class Sabr {
                     + (declaredMs > 0 ? " declMs=" + declaredMs : "")
                     + (pol.isEmpty() ? "" : " pol=" + pol)
                     + (droppedBytes > 0 ? " dropped=" + droppedBytes : "")
+                    + (mediaByItag.isEmpty() ? "" : " byItag=" + mediaByItag)
+                    + (trackXtags.isEmpty() ? "" : " xt=" + trackXtags)
                     + (err.isEmpty() ? "" : " err=" + err);
         }
     }
@@ -194,6 +206,8 @@ public final class Sabr {
             o.put("clen", r.contentLength);
             o.put("endMs", r.endMs);
             o.put("parts", r.parts.toString());
+            o.put("byItag", r.mediaByItag.toString());
+            if (!r.trackXtags.isEmpty()) o.put("xtags", r.trackXtags.toString());
             if (!r.err.isEmpty()) o.put("err", r.err);
         } catch (Throwable e) {
             try { o.put("err", String.valueOf(e)); } catch (Throwable ignored) { }
@@ -220,7 +234,7 @@ public final class Sabr {
         int lastSeq = 0;
         long lastDurMs = 0;
         byte[] cookie = null;
-        int target = p.bodyTpl != null ? 0 : p.itag;   // replay: accept whatever itag the server streams
+        int target = p.itag;   // 0 = take whatever the stream carries
         long prevBytes = -1;
         long prevEnd = 0;
         int stuck = 0;
@@ -254,7 +268,7 @@ public final class Sabr {
             // turned a 6 MB track into 109 MB once.
             Buf buf = new Buf();
             parse(resp, r, hdrs, target, buf, gotMedia, maxEnd);
-            if (target <= 0 && r.itag > 0) target = r.itag;
+            if (p.bodyTpl == null && target <= 0 && r.itag > 0) target = r.itag;
             endTimeMs = maxEnd[0];
             if (r.cookie != null) cookie = r.cookie;
 
@@ -703,6 +717,56 @@ public final class Sabr {
         return o.toByteArray();
     }
 
+    // ------------------------------------------------- audio-only request
+    //
+    // The player's own POST selects both a video format (field 22 = 137) and
+    // audio (field 23 = 140), so the streamer answers with a mixed stream and
+    // the audio job downloaded 106 MB of itag 137 for a 668 s video. Our own
+    // builder asks for one audio itag only, but the request is accepted only
+    // when it carries field 5 of the player's own body (the ustreamer config
+    // issued for this session) — see `our+page5` in /sabrmix. Field 2 of the
+    // captured body tells which itag the player picked.
+
+    // First audio itag the body selects (field 2 entries), then field 23.
+    public static int audioItagOf(byte[] body) {
+        if (body == null || body.length == 0) return 0;
+        int fallback = 0;
+        for (Object[] e : chunks(body)) {
+            int f = ((Integer) e[0]).intValue();
+            byte[] c = (byte[]) e[1];
+            int[] h = chunkHdr(c);
+            if (f == 2 && h[1] == 2) {
+                Msg m = Msg.parse(c, h[3], c.length - h[3]);
+                int fit = (int) m.num(1, 0);
+                if (isAudioItag(fit)) return fit;
+            } else if (f == 23 && h[1] == 0) {
+                fallback = (int) readVarint(c, new int[]{h[2]});
+            }
+        }
+        return fallback;
+    }
+
+    private static boolean isAudioItag(int it) {
+        return it == 139 || it == 140 || it == 141
+                || it == 249 || it == 250 || it == 251
+                || it == 233 || it == 234 || it == 599 || it == 600;
+    }
+
+    // Field number + wire type + payload offsets inside one chunk of chunks().
+    private static int[] chunkHdr(byte[] c) {
+        int[] pos = new int[]{0};
+        long tag = readVarint(c, pos);
+        int f = (int) (tag >>> 3);
+        int w = (int) (tag & 7);
+        int afterTag = pos[0];
+        int payload = afterTag;
+        if (w == 2) {
+            readVarint(c, pos);
+            payload = pos[0];
+        }
+        return new int[]{f, w, afterTag, payload};
+    }
+
     // Drop the listed top-level fields from a message.
     public static byte[] drop(byte[] base, int... fields) throws IOException {
         java.util.HashSet<Integer> gone = new java.util.HashSet<>();
@@ -890,6 +954,7 @@ public final class Sabr {
         long durationMs;
         long contentLength;
         boolean init;
+        String xtags = "";
     }
 
     private static void parse(byte[] b, Result r, Map<Integer, Hdr> hdrs, int target,
@@ -916,6 +981,16 @@ public final class Sabr {
                     h.startMs = m.num(11, 0);
                     h.durationMs = m.num(12, 0);
                     h.contentLength = m.num(14, 0);
+                    byte[] xt0 = m.buf(5);
+                    if (xt0 != null && xt0.length > 0 && xt0.length < 200) {
+                        String xs = new String(xt0, StandardCharsets.UTF_8);
+                        if (xs.indexOf("acont") >= 0 || xs.indexOf("lang") >= 0) {
+                            h.xtags = xs;
+                            if (!r.trackXtags.containsKey(Integer.valueOf(h.itag))) {
+                                r.trackXtags.put(Integer.valueOf(h.itag), xs);
+                            }
+                        }
+                    }
                     hdrs.put((int) m.num(1, 0), h);
                     if (target <= 0 && h.itag > 0) {
                         target = h.itag;
@@ -954,6 +1029,8 @@ public final class Sabr {
                         r.dupInitSegs++;
                     }
                     r.mediaBytes += Math.max(0, len);
+                    Long seen = r.mediaByItag.get(it);
+                    r.mediaByItag.put(it, (seen == null ? 0L : seen) + Math.max(0, len));
                     break;
                 }
                 case P_MEDIA_END: {

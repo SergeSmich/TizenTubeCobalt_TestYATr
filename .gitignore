@@ -381,3 +381,8 @@ Thumbs.db
 desktop.ini
 vot_bridge/classes/
 vot_bridge/*.dex
+
+# local runtime secrets / scratch (VOT bridge)
+/cfg.json
+/_tmp_cookies.db
+

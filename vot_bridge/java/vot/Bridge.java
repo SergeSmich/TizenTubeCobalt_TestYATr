@@ -72,15 +72,21 @@ public final class Bridge {
 
     // ---- overlay serving ----
     // The overlay ships inside the APK (assets/vot.js = ui + vot + net glued at
-    // build time), so a fresh install works with no PC on the network. The dev
-    // server stays as an optional live override: when it answers, its file wins
-    // and is cached, so the next build picks the same code.
-    private static final String PC_BASE = "http://192.168.1.186:8013";
-    private static final String OVERLAY_SOURCE = PC_BASE + "/vot.js";
-    private static final String CONFIG_SOURCE = PC_BASE + "/vot_config.json";
+    // build time) and is served from there: the box is self-sufficient, no PC
+    // and no LAN server anywhere. Settings live in the same asset-defaults plus
+    // the on-TV cache (vot_config_cache.json) the overlay itself writes.
     private static final String OVERLAY_ASSET = "vot.js";
     private static volatile byte[] sOverlay;
     private static volatile String sLastConfig = "";
+    // What the bridge actually handed to the player / pushed to Yandex for the
+    // last audio job: role, language, itag, whether a dub was stripped. The
+    // overlay asks for it over GET /source?videoId=… so "which language is
+    // playing" stops being a guess made from two different data sets.
+    private static volatile JSONObject sSrcInfo;
+
+    private static synchronized void srcInfo(JSONObject o) {
+        sSrcInfo = o;
+    }
 
     // ---- audio playback state (accessed on sAudioHandler thread) ----
     private static final Object AUDIO_LOCK = new Object();
@@ -110,16 +116,11 @@ public final class Bridge {
     // "votjs" (vot.js marker) or "skip" (don't touch, just keep polling).
     private static volatile String sFaMode = "audio";
     // Serverless switches handed to the overlay via /config:
-    // audioMode : "off" (PC filler as before) | "local" (bridge resolves the
-    //             audio URL itself and feeds it to Yandex without a PC)
-    //             "capture" (harvest the player's own MSE audio — default: it is
-    //             the only path Google does not gate)
-    // pcFill    : may the overlay ask the PC dev server for the source audio
-    // "local": the bridge pulls the audio-only track from googlevideo itself and
-    // pushes it to Yandex (full length, background, player untouched). This is
-    // the standalone path; "capture" (MSE tee) stays as a fallback only.
+    // audioMode : "local" (bridge resolves the audio URL itself and feeds it to
+    //             Yandex without a PC — the standalone path, player untouched)
+    //             | "off" | "capture" (harvest the player's own MSE audio — a
+    //             fallback only).
     private static volatile String sAudioMode = "local";
-    private static volatile boolean sPcFill = false;
     // A/B: make the player pick AAC (itag 140) instead of opus. SABR replay
     // streams whatever format the player selected — with opus the staged track
     // is webm/opus and Yandex refuses it. Verified on the TV: default (opus)
@@ -128,7 +129,17 @@ public final class Bridge {
     // the default: the player can play mp4a in MSE (it asked and appended it),
     // and the whole local-audio path needs it.
     private static volatile boolean sAac = true;
-
+    // Язык, который не переводим (переопределяет настройку страницы; пусто —
+    // страница решает сама). Нужен и как сервисный рычаг для проверок на ТВ.
+    private static volatile String sSkipLang = "";
+    // Ручной выбор озвучки для текущего ролика ('dub' | 'yandex'), тоже
+    // сервисный рычаг: страница применяет его как выбор в меню.
+    private static volatile String sDubPick = "";
+    // Разрешить AV1 (по умолчанию false: декодер бокса отдаёт чёрный экран).
+    private static volatile boolean sAv1 = false;
+    // "auto" | "avc": заставлять ли плеер брать только H.264. По умолчанию
+    // "avc" — на этом боксе av1 и vp9 дают чёрный кадр.
+    private static volatile String sVcodec = "avc";
     // ---- TV-side paths (needed to read Cobalt's cookie store) ----
     private static volatile String sDataDir = "";
     private static volatile String sCacheDir = "";
@@ -155,9 +166,6 @@ public final class Bridge {
         Thread t = new Thread(Bridge::serve, "vot-bridge");
         t.setDaemon(true);
         t.start();
-        Thread f = new Thread(Bridge::overlayFetcher, "vot-overlay-fetch");
-        f.setDaemon(true);
-        f.start();
         Thread w = new Thread(Bridge::warmUp, "vot-warm");
         w.setDaemon(true);
         w.start();
@@ -192,8 +200,7 @@ public final class Bridge {
     }
 
     // The overlay compiled into the APK: works offline, on a fresh install, with
-    // no dev server anywhere. /vot.js serves these bytes until a PC override
-    // shows up.
+    // no dev server anywhere. /vot.js serves exactly these bytes.
     private static void loadOverlayFromAssets() {
         try {
             InputStream in = sAppCtx.getAssets().open(OVERLAY_ASSET);
@@ -212,8 +219,8 @@ public final class Bridge {
         return (sDataDir == null || sDataDir.isEmpty() ? "" : sDataDir + "/") + "vot_config_cache.json";
     }
 
-    // Config that came from the dev server once is cached on the TV, so the
-    // device keeps its settings (token, audioMode, ...) with the PC switched off.
+    // Settings the overlay posts to /config are cached here (vot_config_cache.json)
+    // so a reboot keeps them without any LAN server.
     private static void loadCachedConfig() {
         try {
             File f = new File(configCachePath());
@@ -224,8 +231,24 @@ public final class Bridge {
             if (b == null || b.length == 0) return;
             String s = new String(b, StandardCharsets.UTF_8).trim();
             if (s.isEmpty()) return;
-            sLastConfig = s;
-            handleConfig(new JSONObject(s));
+            JSONObject cached = new JSONObject(s);
+            // Кэш старых сборок писал audioMode:"capture" и ПК-поля (pcFill,
+            // fillLang, fillFormat, fillMaxWait). ПК больше нет, а capture —
+            // только аварийный фолбэк: такие файлы не должны навязывать режим,
+            // иначе приставка молча остаётся без автономного звука. Маркер
+            // "v">=2 ставит только новая сборка при осознанном POST /config.
+            if (cached.optInt("v", 0) < 2) {
+                boolean legacy = cached.has("audioMode") || cached.has("pcFill");
+                cached.remove("audioMode");
+                cached.remove("pcFill");
+                cached.remove("fillLang");
+                cached.remove("fillFormat");
+                cached.remove("fillMaxWait");
+                if (legacy) android.util.Log.i("VotBridge",
+                        "config cache legacy -> defaults (audioMode=" + sAudioMode + ")");
+            }
+            sLastConfig = cached.toString();
+            handleConfig(cached);
             android.util.Log.i("VotBridge", "config from cache " + s.length() + "B");
         } catch (Throwable e) {
             android.util.Log.w("VotBridge", "config cache read failed: " + e);
@@ -242,129 +265,11 @@ public final class Bridge {
         }
     }
 
-    private static void overlayFetcher() {
-        int fails = 0;
-        while (true) {
-            try {
-                byte[] b = httpGet(OVERLAY_SOURCE);
-                if (b != null && b.length > 0) {
-                    sOverlay = b;
-                    fails = 0;
-                    android.util.Log.i("VotBridge", "overlay refreshed " + b.length + " bytes");
-                } else {
-                    fails++;
-                }
-            } catch (Throwable e) {
-                fails++;
-                if (fails < 3) android.util.Log.w("VotBridge", "overlay fetch failed: " + e);
-            }
-            if (reloadConfig()) fails = 0;
-            // No dev server is the normal case for a shipped build: back off
-            // instead of hammering a dead LAN address every 8 seconds.
-            long wait = fails >= 3 ? 300000L : 8000L;
-            try { Thread.sleep(wait); } catch (InterruptedException e) { return; }
-        }
-    }
-
-    // Settings normally live in vot_config.json next to vot.js on the PC dev
-    // server; every accepted config is also cached on the TV (see
-    // loadCachedConfig) so the box is self-sufficient once it has seen one.
-    private static boolean reloadConfig() {
-        try {
-            byte[] b = httpGet(CONFIG_SOURCE);
-            if (b == null || b.length == 0) return false;
-            String s = new String(b, StandardCharsets.UTF_8).trim();
-            if (s.isEmpty()) return false;
-            if (s.equals(sLastConfig)) return true;
-            JSONObject o = new JSONObject(s);
-            sLastConfig = s;
-            handleConfig(o);
-            saveConfigCache(s);
-            return true;
-        } catch (Throwable e) {
-            android.util.Log.w("VotBridge", "config fetch failed: " + e);
-            return false;
-        }
-    }
-
-    private static byte[] httpGet(String url) throws IOException {
-        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
-        c.setConnectTimeout(5000);
-        c.setReadTimeout(5000);
-        c.setRequestProperty("User-Agent", "vot-bridge/1");
-        int code = c.getResponseCode();
-        if (code != 200) { c.disconnect(); return null; }
-        byte[] b = YandexClient.readAll(c.getInputStream());
-        c.disconnect();
-        return b;
-    }
-
-    // ---- PC filler ----------------------------------------------------------
-    // The TV cannot give Yandex the source audio (every InnerTube client answers
-    // LOGIN_REQUIRED and the urls it does return are refused with 403: no
-    // poToken). The PC dev server can: yt-dlp with the browser cookies downloads
-    // the track and uploads it to Yandex, after which this translationId turns
-    // into status=1 on its own. The request is forwarded in a background thread
-    // so the TV never waits for a 50 MB download.
-    private static byte[] pcPost(String url, byte[] body) throws IOException {
-        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
-        c.setConnectTimeout(5000);
-        c.setReadTimeout(15000);
-        c.setRequestMethod("POST");
-        c.setDoOutput(true);
-        c.setRequestProperty("Content-Type", "application/json; charset=utf-8");
-        c.setRequestProperty("User-Agent", "vot-bridge/1");
-        c.getOutputStream().write(body);
-        int code = c.getResponseCode();
-        byte[] b = null;
-        if (code == 200) b = YandexClient.readAll(c.getInputStream());
-        c.disconnect();
-        android.util.Log.i("VotBridge", "pc POST " + url + " -> " + code);
-        return b;
-    }
-
-    // Read-only proxy for /fill_status on the PC: lets the overlay stop waiting
-    // as soon as the filler has actually failed (e.g. expired cookies).
-    private static String handleFillStatus(String id) {
-        if (id == null || id.isEmpty()) return "{\"state\":\"none\",\"res\":{}}";
-        try {
-            byte[] b = httpGet(PC_BASE + "/fill_status?videoId=" + java.net.URLEncoder.encode(id, "UTF-8"));
-            if (b == null) return "{\"state\":\"offline\",\"res\":{}}";
-            return new String(b, StandardCharsets.UTF_8);
-        } catch (Throwable e) {
-            return "{\"state\":\"offline\",\"res\":{\"error\":\""
-                    + safeJson(String.valueOf(e.getMessage())) + "\"}}";
-        }
-    }
-
-    private static JSONObject handleFill(JSONObject req) throws Exception {
-        final String id = req.optString("videoId", req.optString("id", "")).trim();
-        if (id.isEmpty()) throw new IOException("missing videoId");
-        final double dur = req.optDouble("duration", 0);
-        final String tid = req.optString("tid", "");
-        final String lang = req.optString("lang", "");
-        JSONObject r = new JSONObject();
-        r.put("queued", true);
-        r.put("videoId", id);
-        Thread t = new Thread(() -> {
-            try {
-                JSONObject o = new JSONObject();
-                o.put("videoId", id);
-                o.put("duration", dur);
-                o.put("tid", tid);
-                o.put("lang", lang);
-                byte[] resp = pcPost(PC_BASE + "/fill", o.toString().getBytes(StandardCharsets.UTF_8));
-                android.util.Log.i("VotBridge", "fill " + id + " -> "
-                        + (resp == null ? "null" : new String(resp, StandardCharsets.UTF_8)));
-            } catch (Throwable e) {
-                android.util.Log.e("VotBridge", "fill " + id + " failed: " + e);
-            }
-        }, "vot-fill");
-        t.setDaemon(true);
-        t.start();
-        android.util.Log.i("VotBridge", "fill queued id=" + id + " dur=" + dur + " tid=" + tid);
-        return r;
-    }
+    // ---- PC filler: removed ------------------------------------------------
+    // The bridge used to proxy /fill and /fill_status to a dev server on the LAN
+    // (yt-dlp with browser cookies downloaded the track and uploaded it). The app
+    // is now autonomous on the box: the SABR/page-audio path below fetches the
+    // original track itself, so those endpoints answer 410 "no pc".
 
     // Full-body GET for downloading source audio (DASH itag URL). googlevideo
     // throttles plain full downloads via the "n" param but serves Range requests
@@ -1027,32 +932,240 @@ public final class Bridge {
 
     // Pick the best audio format out of a WEB player response: opus 251 first,
     // then m4a 140, then whatever audio track has a plain URL.
-    private static JSONObject pickAudio(JSONObject playerJson) {
-        JSONObject sd = playerJson.optJSONObject("streamingData");
-        JSONArray fmts = sd == null ? null : sd.optJSONArray("adaptiveFormats");
+    // ---- audio track metadata (language + role) ------------------------------
+    // Innertube describes each audio format with `xtags` and/or `audioTrack`.
+    // `xtags` is either the plain string `acont=original:lang=en-US` or a
+    // base64-encoded protobuf of repeated {1:key, 2:value} pairs (the TV client
+    // sends the protobuf form). Roles:
+    //   original      — the video's own voice
+    //   dubbed        — a dub the uploader added
+    //   dubbed-auto   — YouTube's automatic dub (the TV player prefers it!)
+    //   descriptive   — audio description for the blind
+    // `dcr=1` is NOT descriptive: it is the DRC (dynamic-range-compressed)
+    // variant of the same track and can share the itag with the clean one.
+    // Treating it as descriptive demoted the real original track (ru.4 with
+    // dcr=1) to the lowest rank, and the auto-dub won the pick.
+    // audioIsDefault is NOT a role: the default track can be the auto-dub
+    // YouTube picked for the account/interface language.
+    private static final int ROLE_ORIGINAL = 0;
+    private static final int ROLE_PLAIN = 1;     // no role marker at all
+    private static final int ROLE_DUB = 2;
+    private static final int ROLE_AUTODUB = 3;
+    private static final int ROLE_DESC = 4;
+
+    private static final class TrackMeta {
+        String lang = "";        // normalised to the base code ("en-US" -> "en")
+        String acont = "";
+        int role = ROLE_PLAIN;
+        boolean isDefault;
+        boolean originalByName;
+        String id = "";
+    }
+
+    private static final class AudioChoice {
+        JSONObject fmt;
+        TrackMeta meta;
+        int itag;
+    }
+
+    private static String roleName(int role) {
+        return role == ROLE_ORIGINAL ? "ORIGINAL" : role == ROLE_DUB ? "DUB"
+                : role == ROLE_AUTODUB ? "AUTODUB" : role == ROLE_DESC ? "DESC" : "PLAIN";
+    }
+
+    private static int roleOfName(String n) {
+        String v = n == null ? "" : n.trim();
+        return "ORIGINAL".equals(v) ? ROLE_ORIGINAL : "DUB".equals(v) ? ROLE_DUB
+                : "AUTODUB".equals(v) ? ROLE_AUTODUB : "DESC".equals(v) ? ROLE_DESC : ROLE_PLAIN;
+    }
+
+    // "en-US" -> "en", "ru (original)" -> "ru", "EN_us" -> "en".
+    private static String langBase(String s) {
+        String v = s == null ? "" : s.trim().toLowerCase();
+        v = v.replace('\u2010', '-').replace('\u2011', '-').replace('_', '-');
+        int p = v.indexOf('(');
+        if (p > 0) v = v.substring(0, p).trim();
+        int d = v.indexOf('-');
+        if (d > 0) v = v.substring(0, d);
+        return v.trim();
+    }
+
+    // xtags in text form: pass the plain "k=v:k=v" string through, decode the
+    // base64 protobuf form into the same text.
+    private static String xtagsText(String raw) {
+        String s = raw == null ? "" : raw.trim();
+        if (s.isEmpty()) return "";
+        if (s.indexOf('=') >= 0) return s;
+        try {
+            byte[] b;
+            try {
+                b = Base64.decode(s, Base64.NO_WRAP | Base64.URL_SAFE);
+            } catch (Throwable e1) {
+                b = Base64.decode(s, Base64.DEFAULT);
+            }
+            return xtagsPbText(b);
+        } catch (Throwable e) {
+            return "";
+        }
+    }
+
+    // Repeated {1:string key, 2:string value} -> "acont=original:lang=en-US".
+    private static String xtagsPbText(byte[] b) {
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < b.length) {
+            long[] k = pbVarint(b, i);
+            if (k == null) break;
+            i = (int) k[1];
+            int wt = (int) (k[0] & 7);
+            if (wt != 2) {
+                if (wt == 0) { long[] v = pbVarint(b, i); if (v == null) break; i = (int) v[1]; }
+                else if (wt == 5) i += 4;
+                else if (wt == 1) i += 8;
+                else break;
+                continue;
+            }
+            long[] ln = pbVarint(b, i);
+            if (ln == null) break;
+            int n = (int) ln[0];
+            i = (int) ln[1];
+            if (n < 0 || i + n > b.length) break;
+            String key = "", val = "";
+            int j = i, end = i + n;
+            while (j < end) {
+                long[] k2 = pbVarint(b, j);
+                if (k2 == null) break;
+                j = (int) k2[1];
+                int f2 = (int) (k2[0] >>> 3), w2 = (int) (k2[0] & 7);
+                if (w2 != 2) {
+                    if (w2 == 0) { long[] v2 = pbVarint(b, j); if (v2 == null) break; j = (int) v2[1]; }
+                    else if (w2 == 5) j += 4;
+                    else if (w2 == 1) j += 8;
+                    else break;
+                    continue;
+                }
+                long[] l2 = pbVarint(b, j);
+                if (l2 == null) break;
+                int n2 = (int) l2[0];
+                j = (int) l2[1];
+                if (n2 < 0 || j + n2 > end) break;
+                String str = new String(b, j, n2, StandardCharsets.UTF_8);
+                if (f2 == 1) key = str; else if (f2 == 2) val = str;
+                j += n2;
+            }
+            if (!key.isEmpty()) {
+                if (sb.length() > 0) sb.append(':');
+                sb.append(key).append('=').append(val);
+            }
+            i = end;
+        }
+        return sb.toString();
+    }
+
+    private static long[] pbVarint(byte[] b, int i) {
+        long v = 0;
+        int sh = 0;
+        while (i < b.length && sh < 64) {
+            int c = b[i++] & 0xff;
+            v |= (long) (c & 0x7f) << sh;
+            sh += 7;
+            if ((c & 0x80) == 0) return new long[]{v, i};
+        }
+        return null;
+    }
+
+    private static TrackMeta parseTrack(JSONObject f) {
+        TrackMeta m = new TrackMeta();
+        if (f == null) return m;
+        fillKv(m, xtagsText(f.optString("xtags", "")));
+        JSONObject at = f.optJSONObject("audioTrack");
+        if (at != null) {
+            m.id = at.optString("id", "");
+            if (m.lang.isEmpty()) m.lang = langBase(m.id);
+            m.isDefault = at.optBoolean("audioIsDefault", false);
+            if (at.optBoolean("isAutoDubbed", false)) m.acont = "dubbed-auto";
+            String dn = at.optString("displayName", "");
+            if (dn.toLowerCase().indexOf("original") >= 0) m.originalByName = true;
+        }
+        roleOf(m);
+        return m;
+    }
+
+    // "acont=original:lang=en-US" -> fields. Unknown keys are ignored.
+    private static void fillKv(TrackMeta m, String xt) {
+        if (m == null || xt == null || xt.isEmpty()) return;
+        String[] parts = xt.split(":");
+        for (int i = 0; i < parts.length; i++) {
+            int e = parts[i].indexOf('=');
+            if (e <= 0) continue;
+            String k = parts[i].substring(0, e).trim().toLowerCase();
+            String v = parts[i].substring(e + 1).trim();
+            if ("acont".equals(k)) m.acont = v.toLowerCase();
+            else if ("lang".equals(k) && m.lang.isEmpty()) m.lang = langBase(v);
+            // `dcr`/`drc` — вариант с динамическим сжатием, роль не меняет.
+        }
+    }
+
+    private static void roleOf(TrackMeta m) {
+        if (m == null) return;
+        String a = m.acont == null ? "" : m.acont;
+        if (a.indexOf("descriptive") >= 0) m.role = ROLE_DESC;
+        else if (a.indexOf("dubbed-auto") >= 0 || a.indexOf("autodub") >= 0) m.role = ROLE_AUTODUB;
+        else if (a.indexOf("dubbed") >= 0) m.role = ROLE_DUB;
+        else if (a.indexOf("original") >= 0 || m.originalByName) m.role = ROLE_ORIGINAL;
+        else m.role = ROLE_PLAIN;
+    }
+
+    private static int itagScore(int itag) {
+        return itag == 140 ? 100 : itag == 251 ? 80 : itag == 250 ? 70
+                : itag == 249 ? 60 : itag == 139 ? 50 : 10;
+    }
+
+    // true when `a` should replace `b` as the audio track to play/upload.
+    private static boolean betterAudio(AudioChoice a, AudioChoice b) {
+        // 1) logical role first: original > plain > dub > auto-dub > descriptive.
+        if (a.meta.role != b.meta.role) return a.meta.role < b.meta.role;
+        // 2) a known language beats an unknown one.
+        boolean al = !a.meta.lang.isEmpty(), bl = !b.meta.lang.isEmpty();
+        if (al != bl) return al;
+        // 3) same role, different languages: the player's own default keeps
+        //    playback continuity; bitrate is NOT comparable across languages.
+        if (!a.meta.lang.equals(b.meta.lang)) return a.meta.isDefault && !b.meta.isDefault;
+        // 4) same logical track: codec Yandex accepts, then default.
+        int sa = itagScore(a.itag), sb = itagScore(b.itag);
+        if (sa != sb) return sa > sb;
+        return a.meta.isDefault && !b.meta.isDefault;
+    }
+
+    private static AudioChoice chooseAudio(JSONArray fmts, boolean requireUrl) {
         if (fmts == null) return null;
-        JSONObject best = null;
-        int bestScore = -1;
+        AudioChoice best = null;
         for (int i = 0; i < fmts.length(); i++) {
             JSONObject f = fmts.optJSONObject(i);
             if (f == null) continue;
-            String url = f.optString("url", "");
-            if (url.isEmpty()) continue;
             int itag = f.optInt("itag", 0);
             String mime = f.optString("mimeType", "");
             boolean audio = mime.startsWith("audio/") || (itag >= 139 && itag <= 141)
                     || itag == 249 || itag == 250 || itag == 251;
             if (!audio) continue;
-            // 140 (AAC in mp4) first: it is the format Yandex is already proven
-            // to accept (the whole earlier E2E ran on itag 140), Opus is fallback.
-            int score = itag == 140 ? 100 : itag == 139 ? 90 : itag == 251 ? 60
-                    : itag == 250 ? 50 : itag == 249 ? 40 : 10;
-            if (score > bestScore) {
-                bestScore = score;
-                best = f;
-            }
+            if (requireUrl && f.optString("url", "").isEmpty()) continue;
+            AudioChoice c = new AudioChoice();
+            c.fmt = f;
+            c.itag = itag;
+            c.meta = parseTrack(f);
+            if (best == null || betterAudio(c, best)) best = c;
         }
         return best;
+    }
+
+    private static JSONObject pickAudio(JSONObject playerJson) {
+        JSONObject sd = playerJson.optJSONObject("streamingData");
+        AudioChoice c = chooseAudio(sd == null ? null : sd.optJSONArray("adaptiveFormats"), true);
+        if (c == null) return null;
+        android.util.Log.i("VotBridge", "audio pick role=" + roleName(c.meta.role)
+                + " lang=" + (c.meta.lang.isEmpty() ? "-" : c.meta.lang)
+                + " itag=" + c.itag + " def=" + (c.meta.isDefault ? 1 : 0));
+        return c.fmt;
     }
 
     // ------------------------------------------------------------ SABR path
@@ -1068,39 +1181,29 @@ public final class Bridge {
         long clen;
         long bitrate;
         String mime = "";
+        TrackMeta meta;
     }
 
     private static SabrPick pickSabrAudio(JSONObject playerJson) {
         JSONObject sd = playerJson.optJSONObject("streamingData");
         if (sd == null || sd.optString("serverAbrStreamingUrl", "").isEmpty()) return null;
-        JSONArray fmts = sd.optJSONArray("adaptiveFormats");
-        if (fmts == null) return null;
-        SabrPick best = null;
-        int bestScore = -1;
-        for (int i = 0; i < fmts.length(); i++) {
-            JSONObject f = fmts.optJSONObject(i);
-            if (f == null) continue;
-            int itag = f.optInt("itag", 0);
-            String mime = f.optString("mimeType", "");
-            boolean audio = mime.startsWith("audio/") || (itag >= 139 && itag <= 141)
-                    || itag == 249 || itag == 250 || itag == 251;
-            if (!audio) continue;
-            int score = itag == 140 ? 100 : itag == 251 ? 80 : itag == 250 ? 70
-                    : itag == 249 ? 60 : itag == 139 ? 50 : 10;
-            if (score <= bestScore) continue;
-            SabrPick p = new SabrPick();
-            p.itag = itag;
-            p.lmt = numField(f, "lastModified");
-            p.clen = numField(f, "contentLength");
-            p.bitrate = numField(f, "bitrate");
-            p.mime = mime;
-            p.xtags = f.optString("xtags", "");
-            JSONObject at = f.optJSONObject("audioTrack");
-            if (at != null) p.trackId = at.optString("id", "");
-            best = p;
-            bestScore = score;
-        }
-        return best;
+        AudioChoice c = chooseAudio(sd.optJSONArray("adaptiveFormats"), false);
+        if (c == null) return null;
+        SabrPick p = new SabrPick();
+        p.itag = c.itag;
+        p.lmt = numField(c.fmt, "lastModified");
+        p.clen = numField(c.fmt, "contentLength");
+        p.bitrate = numField(c.fmt, "bitrate");
+        p.mime = c.fmt.optString("mimeType", "");
+        p.xtags = c.fmt.optString("xtags", "");
+        p.trackId = c.meta.id;
+        p.meta = c.meta;
+        android.util.Log.i("VotBridge", "sabr pick role=" + roleName(c.meta.role)
+                + " lang=" + (c.meta.lang.isEmpty() ? "-" : c.meta.lang)
+                + " acont=" + (c.meta.acont == null || c.meta.acont.isEmpty() ? "-" : c.meta.acont)
+                + " itag=" + p.itag + " def=" + (c.meta.isDefault ? 1 : 0)
+                + " xt=" + (p.xtags.isEmpty() ? "-" : p.xtags));
+        return p;
     }
 
     // InnerTube writes numbers as strings ("5661002", "1759..."), so parse the
@@ -1482,6 +1585,10 @@ public final class Bridge {
         String url = cfg.optString("url", "");
         if (url.isEmpty()) throw new IOException("no url");
         sSabrCfg = cfg;
+        // Публикуем дорожку сразу, не дожидаясь аудио-задачи: так /source
+        // отвечает и в режиме capture (там задачи нет вообще), и до старта
+        // перевода. Это ровно та дорожка, которую играет Cobalt.
+        publishSourceFromPage(cfg);
         o.put("ok", 1);
         o.put("urlLen", url.length());
         o.put("ucfg", cfg.optString("ucfg", "").length());
@@ -1650,16 +1757,30 @@ public final class Bridge {
         }
     }
 
-    // True only when both halves of the SABR pair were captured for *this*
-    // video. An unknown id counts as acceptable (older page builds do not send
-    // it); a known different id does not.
+    // True when the SABR pair (wire url + the player's own ustreamer config) can
+    // be trusted for *this* video. Two sources qualify:
+    //   1) /sabrcfg posted by the page for this very video;
+    //   2) the player's own SABR POST captured from the wire (/sabrreq) for this
+    //      video — it carries the wire url AND field 5 of its body.
+    // The second source matters: on TV the page does not re-post the config for
+    // every video, so sSabrCfg kept the previous video's id and the audio job
+    // waited its full 12 s and then fell back to a client the bot gate blocks.
+    // An unknown id counts as acceptable (older page builds do not send it); a
+    // known different id does not.
     private static boolean pageSabrUsable(String videoId) {
         JSONObject c = sSabrCfg;
-        if (c == null || sSabrUcfg == null || sSabrUcfg.length == 0) return false;
-        String cv = c.optString("vid", "");
-        if (!cv.isEmpty() && !cv.equals(videoId)) return false;
-        if (!sSabrUcfgVid.isEmpty() && !sSabrUcfgVid.equals(videoId)) return false;
-        return true;
+        if (c != null && sSabrUcfg != null && sSabrUcfg.length > 0) {
+            String cv = c.optString("vid", "");
+            boolean ok = true;
+            if (!cv.isEmpty() && !cv.equals(videoId)) ok = false;
+            if (!sSabrUcfgVid.isEmpty() && !sSabrUcfgVid.equals(videoId)) ok = false;
+            if (ok) return true;
+        }
+        JSONObject r = sSabrReq;
+        if (r == null) return false;
+        if (!videoId.equals(r.optString("vid", ""))) return false;
+        if (r.optString("url", "").isEmpty()) return false;
+        return capturedSabrBody(videoId) != null;
     }
 
     // Base64 of the config the player sends; empty when nothing was captured yet.
@@ -1669,31 +1790,37 @@ public final class Bridge {
         return Base64.encodeToString(c, Base64.NO_WRAP);
     }
 
-    // Params for "our" request, taken from the page's own config.
+    // Params for "our" request, taken from the page's own config and, when it
+    // is missing or belongs to another video, straight from the player's own
+    // captured SABR request (url + body).
     private static Sabr.Params sabrParamsFromCfg(int itagOverride) {
         JSONObject cfg = sSabrCfg;
         Sabr.Params p = new Sabr.Params();
-        if (cfg == null) return p;
         p.videoId = videoIdOfPage();
         // The config's `serverAbrStreamingUrl` answers 403 without a po token;
         // the url the player actually POSTs to (captured from the wire, with
         // alr/cpn/cver/rn/spc) is accepted as is.
         JSONObject req = sSabrReq;
         String wire = req == null ? "" : req.optString("url", "").trim();
-        p.url = wire.isEmpty() ? cfg.optString("url", "") : wire;
+        if (!wire.isEmpty()) p.url = wire;
+        else p.url = cfg == null ? "" : cfg.optString("url", "");
         // Prefer the config copied out of the player's own request; the copy in
         // the player response gets `sabr.malformed_config`.
         String fromBody = sabrUcfgB64();
-        p.ustreamerConfig = fromBody.isEmpty() ? cfg.optString("ucfg", "") : fromBody;
-        p.visitorData = cfg.optString("vd", "");
-        p.itag = itagOverride > 0 ? itagOverride : cfg.optInt("itag", 0);
-        p.lmt = longOf(cfg.optString("lmt", ""));
+        p.ustreamerConfig = !fromBody.isEmpty() ? fromBody
+                : cfg == null ? "" : cfg.optString("ucfg", "");
+        p.visitorData = cfg == null ? "" : cfg.optString("vd", "");
+        p.itag = itagOverride > 0 ? itagOverride
+                : cfg == null ? 0 : cfg.optInt("itag", 0);
+        p.lmt = cfg == null ? 0L : longOf(cfg.optString("lmt", ""));
         // The TV player picks the auto-dubbed track (`acont=dubbed-auto:lang=xx`)
         // and the SABR server answers such a request with a policy/seek frame
         // instead of media (resp≈170 B, no MEDIA part). Yandex needs the
         // original voice anyway, so drop the dub and ask for the plain track.
-        String xt = cfg.optString("xtags", "");
-        if (xt.toLowerCase().indexOf("dubbed") >= 0) {
+        String xt = cfg == null ? "" : cfg.optString("xtags", "");
+        // `xtags` is normally base64 protobuf, so a plain text search misses
+        // `dubbed` entirely and the dub would be requested as is.
+        if (xtagsText(xt).toLowerCase().indexOf("dubbed") >= 0) {
             xt = "";
             p.lmt = 0;   // lmt belongs to the dubbed track
         }
@@ -1770,6 +1897,7 @@ public final class Bridge {
                 o.put("media", p.optLong("media", 0));
                 o.put("segs", p.optInt("segs", 0));
                 o.put("parts", p.optString("parts", ""));
+                o.put("byItag", p.optString("byItag", ""));
                 if (p.has("err")) o.put("err", p.optString("err", ""));
                 o.put("hex", hexHead(resp, 16));
             }
@@ -1812,6 +1940,7 @@ public final class Bridge {
         String[] names = new String[]{"page", "page+our4", "page-sel140", "page-sel140+pa",
                 "page-sel140+pa+ctx", "page-sel140+pa+ctx+abr", "page-sel140-min",
                 "our", "our+page5", "our+page5+ctx"};
+        out.put("audioItag", Sabr.audioItagOf(page));
         for (int i = 0; i < names.length; i++) {
             byte[] body;
             try {
@@ -1959,6 +2088,7 @@ public final class Bridge {
                 out.put("media", parsed.optLong("media", 0L));
                 out.put("segs", parsed.optInt("segs", 0));
                 out.put("parts", parsed.optString("parts", ""));
+                if (parsed.has("xtags")) out.put("xtags", parsed.optString("xtags", ""));
             } else {
                 out.put("errBody", new String(resp, 0, Math.min(resp.length, 300),
                         StandardCharsets.UTF_8));
@@ -2534,7 +2664,216 @@ public final class Bridge {
 
     private static void asrcSet(JSONObject o) {
         sAsrcState = o;
+        try {
+            // Any successful audio job publishes what the bridge actually gave
+            // the player / pushed to Yandex: the overlay reads it over /source.
+            if (o != null && "done".equals(o.optString("state", ""))) {
+                publishSource(o.optString("videoId", ""), o.optString("client", ""),
+                        o.optInt("itag", 0), o.optLong("size", 0L));
+            }
+        } catch (Throwable e) { }
     }
+
+    // The page's own track choice, in the bridge's terms: the SABR request drops
+    // a `dubbed` xtags (the server answers dubs with a policy frame), so the
+    // bytes Yandex gets are the plain/original voice.
+    private static void publishSource(String videoId, String client, int itag, long size) {
+        JSONObject c = sSabrCfg;
+        String xt = c == null ? "" : c.optString("xtags", "");
+        String xtText = xtagsText(xt);
+        TrackMeta m = new TrackMeta();
+        try { fillKv(m, xtText); roleOf(m); } catch (Throwable e) { }
+        int stripped = xtText.toLowerCase().indexOf("dubbed") >= 0 ? 1 : 0;
+        if (stripped == 1) {
+            // The job asked for the plain track, so this record says nothing
+            // about the original voice: keep the language already known for
+            // this video instead of publishing the dub's one as the original.
+            JSONObject prev = sSrcInfo;
+            String prevVid = prev == null ? "" : prev.optString("videoId", "");
+            String prevLang = prev == null ? "" : prev.optString("lang", "");
+            if (prev != null && videoId != null && videoId.equals(prevVid)
+                    && !prevLang.isEmpty()) {
+                m.lang = prevLang;
+                m.acont = prev.optString("acont", "");
+                m.role = roleOfName(prev.optString("role", ""));
+            } else {
+                m.lang = "";
+                m.acont = "";
+                m.role = ROLE_PLAIN;
+            }
+        }
+        writeSourceInfo(SRC_RANK_JOB, videoId, client, itag, size, xt, m, stripped);
+    }
+
+    // Same record, published the moment the page posts its SABR config: the
+    // track the player streams is known before any audio job exists (and even
+    // when audioMode=capture, where there is no job at all). Only a hint: the
+    // config is the bridge's pick, not proof of what the player renders.
+    private static void publishSourceFromPage(JSONObject cfg) {
+        if (cfg == null) return;
+        String vid = cfg.optString("vid", "");
+        String xt = cfg.optString("xtags", "");
+        if (vid.isEmpty() || xt.isEmpty()) return;
+        TrackMeta m = new TrackMeta();
+        try { fillKv(m, xtagsText(xt)); roleOf(m); } catch (Throwable e) { }
+        int stripped = xtagsText(xt).toLowerCase().indexOf("dubbed") >= 0 ? 1 : 0;
+        writeSourceInfo(SRC_RANK_PAGE, vid, "page", cfg.optInt("itag", 0), 0L, xt, m, stripped);
+    }
+
+    // The track the bridge's own player response marks as default. On TV the
+    // page often never sees the player response for the next video (the Cobalt
+    // client keeps its own copy), so `/source` stayed empty, the overlay held
+    // and translation never started. The hint is published as `phase=default`:
+    // below the player's own SABR track, above the bridge's page plan.
+    private static JSONObject publishBridgedDefault(JSONObject j, String videoId) {
+        JSONObject res = new JSONObject();
+        try {
+            JSONObject sd = j.optJSONObject("streamingData");
+            JSONArray fmts = sd == null ? null : sd.optJSONArray("adaptiveFormats");
+            JSONObject caps = j.optJSONObject("captions");
+            JSONObject rend = caps == null ? null
+                    : caps.optJSONObject("playerCaptionsTracklistRenderer");
+            JSONArray tracks = rend == null ? null : rend.optJSONArray("audioTracks");
+            if (fmts == null || tracks == null || tracks.length() == 0) return res;
+            java.util.HashMap<String, TrackMeta> map = new java.util.HashMap<>();
+            for (int i = 0; i < fmts.length() && i < 200; i++) {
+                JSONObject f = fmts.optJSONObject(i);
+                if (f == null) continue;
+                TrackMeta tm = parseTrack(f);
+                if (tm.id != null && !tm.id.isEmpty() && !tm.lang.isEmpty()) map.put(tm.id, tm);
+            }
+            int idx = rend.optInt("defaultAudioTrackIndex", 0);
+            if (idx < 0 || idx >= tracks.length()) idx = 0;
+            JSONObject t = tracks.optJSONObject(idx);
+            String tid = t == null ? "" : t.optString("audioTrackId", "");
+            TrackMeta m = map.get(tid);
+            if (m == null) {
+                android.util.Log.i("VotBridge", "bridged default vid=" + videoId
+                        + " id=" + tid + " unmapped=1 keys=" + map.keySet());
+                return res;
+            }
+            JSONObject extra = new JSONObject();
+            extra.put("mapped", 1);
+            extra.put("trackId", tid);
+            extra.put("source", "bridged-default");
+            writeSourceInfo(SRC_RANK_DEFAULT, videoId, "bridged", 0, 0L, "", m, 0, extra);
+            res.put("ok", 1);
+            res.put("lang", m.lang);
+            res.put("audioTrackId", tid);
+            res.put("acont", m.acont == null ? "" : m.acont);
+            res.put("role", roleName(m.role));
+            android.util.Log.i("VotBridge", "bridged default vid=" + videoId + " id=" + tid
+                    + " lang=" + m.lang + " acont=" + res.optString("acont"));
+        } catch (Throwable e) {
+            android.util.Log.w("VotBridge", "bridged default failed: " + e);
+        }
+        return res;
+    }
+
+    // The audio track the page's own SABR request streams: protobuf field 69 of
+    // the POST body carries its id (`en-US.4`). The player never puts xtags in
+    // that request, so the page maps the id back to the player response and
+    // sends role/acont along (`mapped=1`).
+    // mapped=0 is dropped on purpose: on TV that field is a constant
+    // (`en-US.4`) that exists in no video, and the language guessed from its
+    // prefix turned every Russian original into "English" and sent it to
+    // translation. Unknown beats wrong here.
+    private static void publishTrackInfo(JSONObject req) {
+        if (req.optInt("mapped", 0) != 1) return;
+        String vid = req.optString("vid", "");
+        String tid = req.optString("trackId", "");
+        if (vid.isEmpty() || tid.isEmpty()) return;
+        String lang = req.optString("lang", "");
+        if (lang.isEmpty()) return;
+        TrackMeta m = new TrackMeta();
+        m.id = tid;
+        m.lang = langBase(lang);
+        m.acont = req.optString("acont", "");
+        if (req.optInt("dubbed", 0) == 1) {
+            m.role = m.acont.toLowerCase().indexOf("auto") >= 0 ? ROLE_AUTODUB : ROLE_DUB;
+        } else {
+            roleOf(m);
+            if (m.role == ROLE_PLAIN) m.role = ROLE_ORIGINAL;
+        }
+        int stripped = 0;   // nothing was cut here: this is what the player streams
+        JSONObject o = new JSONObject();
+        try {
+            o.put("mapped", req.optInt("mapped", 0));
+            o.put("trackId", tid);
+        } catch (Throwable e) { }
+        writeSourceInfo(srcRank(req.optString("phase", "track")), vid, "player",
+                req.optInt("itag", 0), 0L, req.optString("xtags", ""), m, stripped, o);
+    }
+
+    // 1 — the bridge's own page config (a plan), 2 — the track the player's
+    // player-response marks as default, 3 — the track the SABR request carries
+    // (mapped to xtags), 4 — a finished audio job (the bytes Yandex/player
+    // really got). A lower rank never overwrites a higher one for one video.
+    private static final int SRC_RANK_PAGE = 1;
+    private static final int SRC_RANK_DEFAULT = 2;
+    private static final int SRC_RANK_TRACK = 3;
+    private static final int SRC_RANK_JOB = 4;
+
+    private static int srcRank(String phase) {
+        return "job".equals(phase) ? SRC_RANK_JOB
+                : "track".equals(phase) ? SRC_RANK_TRACK
+                : "default".equals(phase) ? SRC_RANK_DEFAULT : SRC_RANK_PAGE;
+    }
+
+    private static String srcPhase(int rank) {
+        return rank == SRC_RANK_JOB ? "job"
+                : rank == SRC_RANK_TRACK ? "track"
+                : rank == SRC_RANK_DEFAULT ? "default" : "page";
+    }
+
+    private static synchronized void writeSourceInfo(int rank, String videoId, String client,
+                                                     int itag, long size, String xt, TrackMeta m,
+                                                     int stripped) {
+        writeSourceInfo(rank, videoId, client, itag, size, xt, m, stripped, null);
+    }
+
+    private static synchronized void writeSourceInfo(int rank, String videoId, String client,
+                                                     int itag, long size, String xt, TrackMeta m,
+                                                     int stripped, JSONObject extra) {
+        try {
+            JSONObject prev = sSrcInfo;
+            if (prev != null && videoId != null && !videoId.isEmpty()
+                    && videoId.equals(prev.optString("videoId", ""))
+                    && rank < srcRank(prev.optString("phase", "page"))) {
+                return;   // keep the better record we already have
+            }
+            String phase = srcPhase(rank);
+            JSONObject o = new JSONObject();
+            o.put("ok", 1);
+            o.put("phase", phase);
+            o.put("videoId", videoId == null ? "" : videoId);
+            o.put("client", client == null ? "" : client);
+            o.put("itag", itag);
+            o.put("size", size);
+            o.put("xtags", xt == null ? "" : xt);
+            o.put("acont", m.acont == null ? "" : m.acont);
+            o.put("lang", m.lang == null ? "" : m.lang);
+            o.put("role", roleName(m.role));
+            o.put("dubStripped", stripped);
+            o.put("served", stripped == 1 ? "PLAIN" : roleName(m.role));
+            if (extra != null) {
+                java.util.Iterator<String> it = extra.keys();
+                while (it.hasNext()) {
+                    String k = it.next();
+                    o.put(k, extra.opt(k));
+                }
+            }
+            o.put("at", System.currentTimeMillis());
+            srcInfo(o);
+            android.util.Log.i("VotBridge", "source id=" + videoId + " client=" + client
+                    + " itag=" + itag + " role=" + roleName(m.role)
+                    + " lang=" + (m.lang == null || m.lang.isEmpty() ? "-" : m.lang)
+                    + " dubStripped=" + stripped + " phase=" + phase);
+        } catch (Throwable e) {
+            android.util.Log.w("VotBridge", "source info failed: " + e);
+        }
+    }
+
 
     private static JSONObject asrcState(String state, String videoId) {
         JSONObject o = new JSONObject();
@@ -2655,7 +2994,10 @@ public final class Bridge {
                         + (System.currentTimeMillis() - t0));
             }
             JSONObject pcfg = sSabrCfg;
-            if (pcfg != null && sSabrUcfg != null) {
+            // The page config may belong to a video the user already left; the
+            // player's own captured request (url + body) is a valid second
+            // source — see pageSabrUsable.
+            if (pcfg != null || sSabrReq != null) {
                 if (!pageSabrUsable(videoId)) {
                     lastErr = "page-sabr: no fresh player config (cfg="
                             + pageCfgVid() + " ucfg=" + sSabrUcfgVid + ")";
@@ -2689,14 +3031,40 @@ public final class Bridge {
                         // from one run, where every other body shape gave 0.
                         byte[] tpl = capturedSabrBody(videoId);
                         if (tpl != null) {
-                            sp.bodyTpl = tpl;
+                            // Replay the player's own body, but with our audio
+                            // format in field 2 (`page-sel140` in /sabrmix).
+                            // Both of the other two shapes were verified on the
+                            // live capture and both fail on some videos:
+                            //   - the unmodified page body selects video too
+                            //     (field 22 = 137) and streamed 106 MB of itag
+                            //     137 for one 668 s video;
+                            //   - our own body with the page's ustreamer config
+                            //     answers sabr.malformed_config as soon as that
+                            //     config is the large (6 KB) per-session one.
+                            // Keeping the page's field 1/16/19 (abr state,
+                            // preferred audio formats, streamer context) and
+                            // replacing only the selection is accepted for both
+                            // sizes; the itag filter below keeps the media audio
+                            // only even when the answer is mixed.
+                            int audioItag = Sabr.audioItagOf(tpl);
+                            if (audioItag <= 0) audioItag = 140;
+                            sp.itag = audioItag;
+                            // The player's pick may be the auto-dub
+                            // (`acont=dubbed`); Yandex needs the original voice,
+                            // so ask for the plain track of that itag.
+                            sp.lmt = 0;
+                            sp.xtags = "";
+                            byte[] our = Sabr.requestBody(sp, 0);
+                            sp.bodyTpl = Sabr.mix(tpl, our, 2);
                             sp.bodyStrip = true;
-                            sp.itag = 0;            // take whatever itag the server streams
                             sp.expectedLength = 0;  // the page's clen belongs to another itag
+                            android.util.Log.i("VotBridge", "audiosrc page-sabr selAudio"
+                                    + " itag=" + audioItag + " body=" + sp.bodyTpl.length
+                                    + " page=" + tpl.length + " our=" + our.length);
                         }
                         int it = sp.itag > 0 ? sp.itag : 140;
-                        // Progress hint only: 128 kbps AAC ≈ 16 kB/s.
-                        long est = durSec > 1 ? (long) (durSec * 16000.0) : 0L;
+                        // Progress hint only: AAC 128 kbps measured ~20 kB/s.
+                        long est = durSec > 1 ? (long) (durSec * 20000.0) : 0L;
                         SabrStage stage = new SabrStage(videoId, it, est, t0);
                         byte[] init = mseInitFor(videoId);
                         if (init != null) stage.init(init);
@@ -2709,8 +3077,10 @@ public final class Bridge {
                                 + " init=" + (init == null ? 0 : init.length)
                                 + " mime=" + (sMseInitMime.isEmpty() ? "-" : sMseInitMime)
                                 + " xt=" + (sp.xtags.isEmpty() ? "-" : sp.xtags)
-                                + " cfgXt=" + (pcfg.optString("xtags", "").isEmpty()
+                                + " cfgXt=" + (pcfg == null || pcfg.optString("xtags", "").isEmpty()
                                         ? "-" : pcfg.optString("xtags", ""))
+                                + " src=" + (pcfg != null && videoId.equals(pcfg.optString("vid", ""))
+                                        ? "page" : "req")
                                 + " at=" + (System.currentTimeMillis() - t0));
                         Sabr.Result sr;
                         long size;
@@ -2723,7 +3093,11 @@ public final class Bridge {
                         android.util.Log.i("VotBridge", "audiosrc page-sabr " + sr.summary()
                                 + " staged=" + size + " est=" + est
                                 + " boxes=" + mp4Head(stage.file()));
-                        if (size > 0) {
+                        // A failed run still leaves an init segment (723 B) in
+                        // the file, which used to be uploaded as a "track": the
+                        // page then reported success and played 0 s of audio.
+                        // Anything below this is not a usable track.
+                        if (size > 100000) {
                             long sent = uploadStaged(gen, videoId, videoUrl, translationId,
                                     gotItag, size, t0);
                             JSONObject ok = asrcState("done", videoId);
@@ -3150,8 +3524,8 @@ public final class Bridge {
 
 
     // Port of dev_server/yt_lang.py: original language in ~0.5 s without the PC.
-    private static String metaLocal(String videoId) {
-        synchronized (META_CACHE) {
+    private static String metaLocal(String videoId, String pageVd, boolean retry, boolean basic) {
+        if (!retry) synchronized (META_CACHE) {
             MetaEntry e = META_CACHE.get(videoId);
             if (e != null) {
                 long age = System.currentTimeMillis() - e.at;
@@ -3169,33 +3543,104 @@ public final class Bridge {
         JSONObject out = new JSONObject();
         boolean ok = false;
         try {
-            String used = "WEB";
-            JSONObject j = itPlayer(videoId, false);
-            String st = playability(j);
-            if (!"OK".equals(st)) {
-                // Без живого логина WEB на большинстве роликов отдаёт
-                // UNPLAYABLE/LOGIN_REQUIRED, а ANDROID_VR тот же ролик отдаёт:
-                // язык берём из его ответа (yt_lang.py опирался на WEB+куки).
-                out.put("webStatus", st);
-                used = "ANDROID_VR";
-                j = itPlayer(videoId, true);
-                st = playability(j);
+            // Без po-токена InnerTube отвечает LOGIN_REQUIRED «Sign in to
+            // confirm you're not a bot» почти на каждом ролике, поэтому язык из
+            // собственного запроса моста не определялся. Аудио-задача токен
+            // минтит (pot=1), здесь его не было (pot=0).
+            // visitorData страницы (если JS его прислал) лучше собственного:
+            // гейт привязан к visitor id, а страница этим же id спокойно
+            // стримит видео. Свой свежий visitor Яндекс быстро помечает ботом.
+            PoToken.Tokens pt = null;
+            String haveVd = (pageVd == null) ? "" : pageVd;
+            try { pt = PoToken.getWithVisitor(sAppCtx, videoId, haveVd); } catch (Throwable ignore) { }
+            if (!haveVd.isEmpty()) {
+                android.util.Log.i("VotBridge", "meta vd page=" + haveVd.length());
+            }
+            String pvd = pt == null ? null : pt.visitorData;
+            String ppo = pt == null ? null : pt.playerPot;
+            // Перебираем клиентов, пока хоть один не даст язык. Ответ с
+            // LOGIN_REQUIRED тоже годится: videoDetails/captions в нём бывают,
+            // а играть этим ответом не нужно — нужна только мета. Раньше
+            // первый «OK» обрывал поиск, и ролик без audioTracks уходил в hold,
+            // хотя у другого клиента язык был.
+            // Больше клиентов = больше шансов, что хоть один отдаст мету:
+            // у части роликов WEB/TV упираются в бот-гейт или не содержат
+            // captions, а ANDROID/IOS/embedded их отдают. Порядок: сначала
+            // мобильные (реже гейтятся и обычно отдают audioTrack/captions),
+            // WEB/VR/TV — как раньше в конце.
+            Client[] clients = basic
+                    ? new Client[]{C_ANDROID, C_IOS}
+                    : new Client[]{C_ANDROID, C_IOS, C_TV_EMB,
+                    C_WEB, C_VR, C_TV};
+            String used = "";
+            String lastStatus = "";
+            String lastReason = "";
+            int gate = 0;
+            JSONObject j = null;
+            JSONObject meta = null;
+            String lang = "";
+            for (int i = 0; i < clients.length; i++) {
+                used = clients[i].name;
+                j = itPlayer(videoId, clients[i], pvd, ppo);
+                String st = playability(j);
+                String rs = playReason(j);
+                JSONObject probe = new JSONObject();
+                String got = fillLang(j, probe);
+                // Диагностика: какой клиент что отдал (без самих форматов).
+                android.util.Log.i("VotBridge", "meta probe " + videoId + " " + clients[i].name
+                        + " st=" + st + " lang=" + got
+                        + (got.isEmpty() ? "" : "/" + probe.optString("langFrom", ""))
+                        + " atid=" + probe.optString("audioTrackId", "")
+                        + " tracks=" + probe.optJSONArray("audioTracks")
+                        + " caps=" + probe.optJSONArray("captionLangs")
+                        + (rs.isEmpty() ? "" : " why=" + rs));
+                // Статусы по именам клиентов, а не по индексу: порядок перебора
+                // теперь не совпадает с «web/vr/tv».
+                out.put(clients[i].name.toLowerCase() + "Status", st);
+                lastStatus = st;
+                lastReason = rs;
+                // Бот-гейт отвечает одинаково всем клиентам: три первых отказа
+                // подряд означают, что остальные три тоже не помогут, а каждый
+                // лишний заход только продлевает пометку visitor'а.
+                if ("LOGIN_REQUIRED".equals(st)) {
+                    if (++gate >= 3) break;
+                } else {
+                    gate = 0;
+                }
+                if (got.isEmpty()) continue;
+                meta = probe;
+                lang = got;
+                break;
             }
             out.put("client", used);
-            if (!"OK".equals(st)) {
+            out.put("videoId", videoId);
+            out.put("login", sCookieLoggedIn ? 1 : 0);
+            if (lang.isEmpty()) {
                 out.put("ok", false);
-                out.put("err", ("playability=" + st + " " + playReason(j)).trim());
+                out.put("err", ("no confirmed selected audio language (" + lastStatus + ")").trim());
+                // Причина от Яндекса отличает «подтвердите, что вы не бот»
+                // (гейт по частоте — проходит сам) от «нужен вход» (возраст/
+                // регион): во втором случае HOLD навсегда, и это честно.
+                if (!lastReason.isEmpty()) out.put("why", lastReason);
             } else {
-                String lang = fillLang(j, out);
-                out.put("videoId", videoId);
-                out.put("login", sCookieLoggedIn ? 1 : 0);
-                if (lang.isEmpty()) {
-                    out.put("ok", false);
-                    out.put("err", "no audio/caption language");
-                } else {
-                    ok = true;
-                    out.put("ok", true);
+                if (meta != null) {
+                    java.util.Iterator<String> it = meta.keys();
+                    while (it.hasNext()) {
+                        String k = it.next();
+                        out.put(k, meta.opt(k));
+                    }
                 }
+                // Публикуем «дорожку по умолчанию» из собственного ответа моста:
+                // на ТВ страница часто не видит player-ответ следующего ролика,
+                // и без этого /source остаётся пустым (оверлей держит hold).
+                // Публикуем только по играбельному ответу: в LOGIN_REQUIRED
+                // форматов нет.
+                if ("OK".equals(lastStatus)) {
+                    JSONObject bd = publishBridgedDefault(j, videoId);
+                    if (bd.optInt("ok", 0) == 1) out.put("bridged", bd);
+                }
+                ok = true;
+                out.put("ok", true);
             }
         } catch (Throwable e) {
             try {
@@ -3212,7 +3657,8 @@ public final class Bridge {
             META_CACHE.put(videoId, new MetaEntry(System.currentTimeMillis(), ok, out));
         }
         android.util.Log.i("VotBridge", "meta_local " + videoId + " "
-                + (ok ? "lang=" + out.optString("lang") : "err=" + out.optString("err"))
+                + (ok ? "lang=" + out.optString("lang") + " from=" + out.optString("langFrom", "audio")
+                : "err=" + out.optString("err"))
                 + " " + ms + "ms");
         return out.toString();
     }
@@ -3227,8 +3673,114 @@ public final class Bridge {
         return ps == null ? "" : ps.optString("reason", "");
     }
 
-    // lang/audioTracks/title/duration из ответа player'а — как в yt_lang.py:
-    // порядок дорожек нестабилен, поэтому берём defaultAudioTrackIndex, а не [0].
+    // ASR caption language: detected from the audio track, so it is a valid hint
+    // for the original language. Manual captions are authored and may be
+    // translated, so they are not used (unknown beats wrong).
+    private static String[] captionLangHint(JSONObject rend) {
+        if (rend == null) return null;
+        JSONArray ct = rend.optJSONArray("captionTracks");
+        if (ct == null) return null;
+        for (int i = 0; i < ct.length() && i < 40; i++) {
+            JSONObject t = ct.optJSONObject(i);
+            if (t == null) continue;
+            String vss = t.optString("vssId", "");
+            boolean asr = "asr".equalsIgnoreCase(t.optString("kind", "")) || vss.startsWith("a-");
+            if (!asr) continue;
+            String code = langBase(t.optString("languageCode", ""));
+            if (code.isEmpty() || "und".equals(code)) continue;
+            return new String[]{code, "captions-asr"};
+        }
+        return null;
+    }
+
+    // audioTrack.id в adaptiveFormats — тег дорожки вида "en-US.4" (язык-регион.
+    // роль). Он объявлен самим player-ответом, поэтому годится как подсказка для
+    // роликов с единственной дорожкой: у них массива audioTracks в captions нет,
+    // ASR-субтитров может не быть, и раньше такие уходили в hold с unknown.
+    private static String[] audioFormatLang(JSONObject j) throws Exception {
+        JSONObject sd = j.optJSONObject("streamingData");
+        JSONArray fmts = sd == null ? null : sd.optJSONArray("adaptiveFormats");
+        if (fmts == null) return null;
+        String first = "";
+        for (int i = 0; i < fmts.length() && i < 200; i++) {
+            JSONObject f = fmts.optJSONObject(i);
+            JSONObject at = f == null ? null : f.optJSONObject("audioTrack");
+            if (at == null) continue;
+            // `audioIsDefault` у TV-плеера часто стоит на автодубле (ru), а не
+            // на оригинале: ролик с английским оригиналом уходил в «русский» и
+            // перевод молча пропускался. Дубль не может быть языком оригинала.
+            TrackMeta tm = parseTrack(f);
+            if (tm.role == ROLE_DUB || tm.role == ROLE_AUTODUB) continue;
+            String id = at.optString("id", "").toLowerCase();
+            int cut = id.length();
+            int p = id.indexOf('.');
+            if (p > 0) cut = p;
+            p = id.indexOf('-');
+            if (p > 0 && p < cut) cut = p;
+            String code = id.substring(0, cut).trim();
+            if (code.length() < 2 || code.length() > 3) continue;
+            boolean letters = true;
+            for (int k = 0; k < code.length(); k++) {
+                char c = code.charAt(k);
+                if (c < 'a' || c > 'z') { letters = false; break; }
+            }
+            if (!letters) continue;
+            if ("und".equals(code) || "mis".equals(code) || "zxx".equals(code)) continue;
+            if (at.optBoolean("audioIsDefault", false)) return new String[]{code, "audioTrack"};
+            if (first.isEmpty()) first = code;
+        }
+        return first.isEmpty() ? null : new String[]{first, "audioTrack"};
+    }
+
+    // defaultAudioTrackIndex — диагностическая подсказка, не выбранная дорожка.
+    // Ни этот индекс, ни субтитры не подтверждают язык звучащего звука.
+    // Язык ОРИГИНАЛЬНОЙ дорожки из самих аудиоформатов (role ORIGINAL по
+    // xtags/audioTrack). Если в ответе только дубли — возвращаем null и
+    // помечаем out.dubOnly=1: defaultAudioLanguage в этом случае описывает
+    // дубль, а не оригинал, и решать по нему «ролик на моём языке» нельзя.
+    private static String[] originalFormatLang(JSONObject j, JSONObject out) {
+        String[] arrays = new String[]{"adaptiveFormats", "formats"};
+        JSONObject sd = j.optJSONObject("streamingData");
+        boolean dub = false;
+        String lang = "";
+        String id = "";
+        for (int a = 0; a < arrays.length; a++) {
+            // In a player response the tracks live under `streamingData`; the
+            // top-level arrays are only a fallback for already-unwrapped JSON.
+            JSONArray arr = j.optJSONArray(arrays[a]);
+            if (arr == null && sd != null) arr = sd.optJSONArray(arrays[a]);
+            if (arr == null) continue;
+            // Форматов бывает >100 (оригинал + десятки автодублей), и
+            // оригинальная дорожка часто лежит далеко за первыми 80.
+            for (int i = 0; i < arr.length() && i < 200; i++) {
+                JSONObject f = arr.optJSONObject(i);
+                if (f == null) continue;
+                if (f.optString("mimeType", "").indexOf("audio") < 0) continue;
+                if (f.optJSONObject("audioTrack") == null && f.optString("xtags", "").isEmpty()) continue;
+                TrackMeta m = parseTrack(f);
+                if (m.lang.isEmpty()) continue;
+                // PLAIN — дорожка без пометки роли: в player-ответе это и есть
+                // основная/оригинальная. Дубли всегда несут `acont=dubbed*`.
+                if (m.role == ROLE_ORIGINAL || m.role == ROLE_PLAIN) {
+                    if (lang.isEmpty()) { lang = m.lang; id = m.id; }
+                } else if (m.role == ROLE_DUB || m.role == ROLE_AUTODUB) {
+                    dub = true;
+                }
+            }
+            if (!lang.isEmpty()) break;
+        }
+        if (!lang.isEmpty()) {
+            if (out != null) {
+                try { out.put("origTrackId", id); } catch (Throwable ignored) { }
+            }
+            return new String[]{lang, "xtags-original"};
+        }
+        if (dub && out != null) {
+            try { out.put("dubOnly", 1); } catch (Throwable ignored) { }
+        }
+        return null;
+    }
+
     private static String fillLang(JSONObject j, JSONObject out) throws Exception {
         String atid = "";
         int idx = 0;
@@ -3250,17 +3802,70 @@ public final class Bridge {
             }
         }
         if (atid.equalsIgnoreCase("none") || atid.equalsIgnoreCase("null")) atid = "";
-        int dot = atid.indexOf('.');
-        String lang = dot > 0 ? atid.substring(0, dot) : atid;
-        if (lang.isEmpty() && rend != null) {
-            JSONArray ct = rend.optJSONArray("captionTracks");
-            JSONObject c0 = ct == null || ct.length() == 0 ? null : ct.optJSONObject(0);
-            if (c0 != null) lang = c0.optString("languageCode", "");
+        // Сохраняем default track лишь для диагностики. Язык звука не известен
+        // даже при одном объявленном треке без подтверждения фактического выбора.
+        // Exception: a video with no audioTrack at all (InnerTube returns
+        // `audioTracks:[""]`). Then the language comes from ASR captions: it is
+        // recognized from the audio itself. That is a meta_local hint (MEDIUM in
+        // TrackDecision), not proof of the track role.
+        String lang = "";
+        String langFrom = "";
+        boolean dubOnly = false;
+        // Сначала роль дорожки из самих форматов: explicit ORIGINAL или PLAIN.
+        // Это прямой ответ player-ответа, а ASR-субтитры распознаются из ТОГО
+        // звука, который играет плеер, — у автодублированных роликов они на
+        // языке дубля (ar) и не должны перебивать оригинал (en).
+        String[] ol = originalFormatLang(j, out);
+        if (ol != null) {
+            lang = ol[0];
+            langFrom = ol[1];
+        } else {
+            dubOnly = out.optInt("dubOnly", 0) == 1;
+            if (!dubOnly) {
+                String[] hint = captionLangHint(rend);
+                if (hint != null) {
+                    lang = hint[0];
+                    langFrom = hint[1];
+                }
+            }
+        }
+        // Последний шанс для роликов с единственной дорожкой: у них массива
+        // audioTracks нет вовсе, и раньше такие уходили в hold. Поле
+        // defaultAudioLanguage объявляет сам player-ответ (это не догадка по
+        // названию ролика), поэтому принимаем его как подсказку MEDIUM.
+        // Но если в ответе есть только дубли — это язык дубля, не оригинала.
+        if (lang.isEmpty() && !dubOnly) {
+            JSONObject vd0 = j.optJSONObject("videoDetails");
+            String dal = vd0 == null ? "" : langBase(vd0.optString("defaultAudioLanguage", ""));
+            if (!dal.isEmpty() && !"und".equals(dal)) {
+                lang = dal;
+                langFrom = "defaultLanguage";
+            }
+        }
+        if (lang.isEmpty()) {
+            String[] at = audioFormatLang(j);
+            if (at != null) {
+                lang = at[0];
+                langFrom = at[1];
+            }
         }
         out.put("lang", lang);
+        if (!langFrom.isEmpty()) out.put("langFrom", langFrom);
         out.put("audioTrackId", atid);
         out.put("audioIndex", idx);
         out.put("audioTracks", ids);
+        JSONArray capLangs = new JSONArray();
+        if (rend != null) {
+            JSONArray ct = rend.optJSONArray("captionTracks");
+            int nct = ct == null ? 0 : ct.length();
+            for (int i = 0; i < nct && i < 6; i++) {
+                JSONObject t = ct.optJSONObject(i);
+                if (t == null) continue;
+                capLangs.put(t.optString("languageCode", "") + ":"
+                        + (t.optString("kind", "").isEmpty() ? "manual" : t.optString("kind", "")));
+            }
+        }
+        out.put("captionLangs", capLangs);
         JSONObject vd = j.optJSONObject("videoDetails");
         if (vd != null) {
             out.put("title", vd.optString("title", ""));
@@ -3295,7 +3900,10 @@ public final class Bridge {
             if (parts.length < 2) return;
             String method = parts[0];
             String path = parts[1];
-            android.util.Log.i("VotBridge", "req " + method + " " + path);
+            // Короткие пути логируем целиком, но длинные параметры (visitorData
+            // бывает по 400+ символов) только обрезаем — иначе logcat пухнет.
+            String logPath = path.length() > 120 ? (path.substring(0, 120) + "…") : path;
+            android.util.Log.i("VotBridge", "req " + method + " " + logPath);
 
             if ("OPTIONS".equals(method)) {
                 OutputStream out = cs.getOutputStream();
@@ -3394,6 +4002,11 @@ public final class Bridge {
                             it, queryParam(path, "visitorData")).toString();
                 } else if (path.startsWith("/sabrcfg")) {
                     resp = handleSabrCfg(body).toString();
+                } else if (path.startsWith("/track")) {
+                    // Что плеер реально стримит (audioTrackId из его SABR-запроса).
+                    if (body.length == 0) throw new IOException("empty body");
+                    publishTrackInfo(new JSONObject(new String(body, StandardCharsets.UTF_8)));
+                    resp = "{\"ok\":1}";
                 } else if (path.startsWith("/sabrdiag")) {
                     int it = 0;
                     try {
@@ -3437,18 +4050,10 @@ public final class Bridge {
                 } else if (path.startsWith("/audio")) {
                     JSONObject req = body.length > 0 ? new JSONObject(new String(body, StandardCharsets.UTF_8)) : new JSONObject();
                     resp = handleAudio(req).toString();
-                } else if (path.startsWith("/fill_status")) {
-                    String fid = "";
-                    int q = path.indexOf("videoId=");
-                    if (q >= 0) {
-                        fid = path.substring(q + 8);
-                        int amp = fid.indexOf('&');
-                        if (amp >= 0) fid = fid.substring(0, amp);
-                    }
-                    resp = handleFillStatus(fid);
-                } else if (path.startsWith("/fill")) {
-                    JSONObject req = body.length > 0 ? new JSONObject(new String(body, StandardCharsets.UTF_8)) : new JSONObject();
-                    resp = handleFill(req).toString();
+                } else if (path.startsWith("/fill_status") || path.startsWith("/fill")) {
+                    // The LAN filler is gone: the box fetches the track itself.
+                    code = 410;
+                    resp = "{\"state\":\"none\",\"res\":{},\"err\":\"no pc\"}";
                 } else if (path.startsWith("/session")) {
                     JSONObject r = new JSONObject();
                     YandexSession se = YandexClient.ensureSession();
@@ -3492,10 +4097,22 @@ public final class Bridge {
                     Client urlClient = clientByName(queryParam(path, "client"));
                     resp = handleYtUrl(vid, urlClient == null ? C_VR : urlClient,
                             "1".equals(queryParam(path, "pot"))).toString();
+                } else if (path.startsWith("/source")) {
+                    JSONObject si = sSrcInfo;
+                    String vid = queryParam(path, "videoId");
+                    if (si == null) {
+                        resp = "{\"ok\":0,\"why\":\"no audio job yet\"}";
+                    } else if (!vid.isEmpty() && !vid.equals(si.optString("videoId", ""))) {
+                        resp = "{\"ok\":0,\"why\":\"other video\"}";
+                    } else {
+                        resp = si.toString();
+                    }
                 } else if (path.startsWith("/meta_local")) {
                     String vid = queryParam(path, "videoId");
                     if (vid.isEmpty()) throw new IOException("missing videoId");
-                    resp = metaLocal(vid);
+                    resp = metaLocal(vid, queryParam(path, "visitorData"),
+                            "1".equals(queryParam(path, "retry")),
+                            "1".equals(queryParam(path, "basic")));
                 } else if (path.startsWith("/log")) {
                     String msg = body.length > 0 ? new String(body, StandardCharsets.UTF_8) : "";
                     android.util.Log.i("VotBridge", "js: " + msg);
@@ -3541,8 +4158,18 @@ public final class Bridge {
         o.put("proxyMode", sProxyMode == null ? "off" : sProxyMode);
         o.put("faMode", sFaMode == null ? "audio" : sFaMode);
         o.put("audioMode", sAudioMode == null ? "off" : sAudioMode);
-        o.put("pcFill", sPcFill);
         o.put("aac", sAac);
+        // Диагностический/сервисный рычаг: язык, который не переводим. Пусто —
+        // страница оставляет своё значение из настроек.
+        o.put("skipLang", sSkipLang == null ? "" : sSkipLang);
+        o.put("dubPick", sDubPick == null ? "" : sDubPick);
+        // Видеокодек AV1: на этом боксе аппаратный декодер не отдаёт кадры
+        // (чёрный экран), поэтому страница по умолчанию av01 отклоняет.
+        // true — вернуть выбор кодека плееру (для проверок).
+        o.put("av1", sAv1);
+        // Предпочтение видеокодека: "auto" (как выбирает плеер) или "avc"
+        // (только H.264 — обход чёрного экрана на этом боксе).
+        o.put("vcodec", sVcodec == null ? "avc" : sVcodec);
         return o;
     }
 
@@ -3556,8 +4183,26 @@ public final class Bridge {
             if (req.has("proxyMode")) sProxyMode = req.optString("proxyMode", "off");
             if (req.has("faMode")) sFaMode = req.optString("faMode", "audio");
             if (req.has("audioMode")) sAudioMode = req.optString("audioMode", "off");
-            if (req.has("pcFill")) sPcFill = req.optBoolean("pcFill", true);
             if (req.has("aac")) sAac = req.optBoolean("aac", false);
+            if (req.has("skipLang")) sSkipLang = req.optString("skipLang", "");
+            if (req.has("dubPick")) sDubPick = req.optString("dubPick", "");
+            if (req.has("av1")) sAv1 = req.optBoolean("av1", false);
+            if (req.has("vcodec")) sVcodec = req.optString("vcodec", "avc");
+            // Осознанная настройка из UI: помечаем версией, чтобы следующий
+            // старт принял её (а не отбросил как legacy), и кладём на диск.
+            try {
+                JSONObject keep = new JSONObject(configJson().toString());
+                keep.remove("hasToken");
+                // Токен живёт только в памяти/кэше и отдаётся наружу лишь как
+                // флаг hasToken — в файл его кладём, иначе lively умрёт после
+                // перезапуска.
+                if (sOauthToken != null && !sOauthToken.isEmpty()) keep.put("token", sOauthToken);
+                keep.put("v", 2);
+                sLastConfig = keep.toString();
+                saveConfigCache(sLastConfig);
+            } catch (Throwable e) {
+                android.util.Log.w("VotBridge", "config cache save failed: " + e);
+            }
             android.util.Log.i("VotBridge", "config " + configJson().toString());
         }
         return configJson();

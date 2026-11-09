@@ -23,23 +23,26 @@
   var POLL_FAST_TRIES = 3;
   var POLL_SLOW = 8000;
   var POLL_SLOW_MAX = 20000;
-  // How long we keep asking Yandex while the PC is downloading/uploading the
-  // source audio. The PC needs 30-150 s (download + 10 chunks), and Yandex
-  // answers 6 the whole time, so the normal "status 6 = dead end" logic must
-  // not apply - it used to kill the translation 5 s after the fill started.
-  var PC_FILL_WAIT = 600000;
+  // У роликов без речи (трейлеры, музыка, шумы) Яндекс отвечает status=2 с
+  // rem=5 и может не двигать подсказку минутами; но job на сервере при этом
+  // иногда всё-таки доготовится (проверено на oKIkvEjI2WE: rem=5 несколько
+  // минут, потом status=1). Поэтому сначала просто разряжаем опросы, а
+  // отказываемся только когда прогресса нет совсем.
+  var STALL_SOFT = 12;      // ~60 с без движения rem → реже опрашиваем
+  var STALL_DELAY = 15000;  // пауза в стагнации
+  var STALL_LIMIT = 24;     // 12×5 с + 12×15 с ≈ 4 мин без движения → отказ
   // How long we wait for the page player to actually land on 0:00 when we
   // rewind the video as the translation starts.
   var RESTART_MAX_WAIT = 4000;
   // Сколько ждём язык оригинала, когда перевод уже готов, а язык ещё неизвестен
   // (перевод не запускаем, пока не знаем, что ролик не на исключённом языке).
-  // Быстрый детектор на ПК отвечает за ~0.4-1 с, yt-dlp-фолбэк — до 10 с;
+  // Источник — мост (/source и /meta_local), ответ приходит за 0.1-1 с;
   // таймаут ограничивает худший случай, чтобы перевод не потерялся навсегда.
   var LANG_GATE_MS = 6000;
-  // Паузы между опросами языка оригинала: первый ответ ПК отдаёт за 0.4-1 с
-  // (быстрый детектор), поэтому первые попытки частые — иначе язык приезжал
-  // только через 2.5 с и гейт старта зря тормозил.
-  var META_GAPS = [400, 600, 900, 1500, 2500, 2500, 2500, 2500, 2500];
+  // Паузы между опросами языка оригинала: мост отвечает быстро, поэтому первые
+  // попытки частые — иначе язык приезжал только через 2.5 с и гейт старта зря
+  // тормозил.
+  var META_GAPS = [500, 1200, 3000, 6000];
   var MARK = 'VOT-OVERLAY-V14';
 
   // Повторная инъекция того же скрипта в ту же страницу (TizenTube подгружает
@@ -78,9 +81,24 @@
     // We used to send "auto", which is a separate, nearly empty shard — every
     // request started a fresh synthesis (~50 s) or ended in status 6.
     lang: 'en',
-    // Язык оригинала (с ПК) и последний статус для панели. Пустые по умолчанию:
-    // язык становится известен асинхронно, после /fill_status.
+    // Язык оригинала и последний статус для панели. Пустые по умолчанию:
+    // язык становится известен асинхронно (мост: /source, /meta_local).
     origLang: '',
+    // Язык дорожки, которую плеер реально отдаёт в SABR (`xtags`): это то, что
+    // звучит на ТВ, включая автодуб (`acont=dubbed-auto:lang=xx`). Приходит на
+    // первом же POST плеера, поэтому доступен раньше InnerTube-метаданных.
+    audioLang: '',
+    audioAcont: '',
+    audioDubbed: false,
+    // Дорожка из SABR-запроса плеера: id (`en-US.4`) и признак того, что роль
+    // подтверждена player-ответом (xtags), а не выведена из одного id.
+    audioTrackId: '',
+    audioMapped: false,
+    // Автодуб на «моём языке» (prefLang): предложение выбрать автодуб или
+    // перевод Яндекса. `dubOffer` — id ролика, для которого предложение висит,
+    // `dubPick` — что выбрал пользователь ('dub' | 'yandex'). Оба на ролик.
+    dubOffer: null,
+    dubPick: null,
     uiStatus: '',
     altLangTried: false,
     audioTried: false,
@@ -90,6 +108,12 @@
     // id ролика, перевод которого отменён навсегда: язык оригинала оказался
     // исключённым (skipLang). Сбрасывается при смене ролика.
     skipLangBlock: null,
+    // Автостарт удержан, пока не известен язык звука этого ролика.
+    langWaitForId: null,
+    // Идёт опрос /meta_local для этого ролика (запланирован следующий заход).
+    // Пока он есть, «язык не определён» показывать рано: поздний ретрай через
+    // 25 с проходит бот-гейт, и перевод стартует сам.
+    metaPending: null,
     // id ролика, для которого пользователь вручную включил перевод кнопкой:
     // ручное включение обходит правило skipLang.
     forceTranslate: null,
@@ -108,17 +132,17 @@
     // id ролика, для которого пользователь включил перевод кнопкой: подсветка
     // кнопки должна стать белой СРАЗУ по нажатию, ещё до ответа Яндекса.
     wantOn: null,
-    pcTried: false,
-    pcDeadline: 0,
-    pcFailed: false,
-    pcDone: false,
-    pcWaits: 0,
-    // Сколько раз продлевали ожидание ПК-филлера после «timeout waiting»
-    // (сервер синтезирует дольше своего max_wait). Кэп — в handleResp.
-    pcExtends: 0,
+    // Что мост фактически отдал звуком для этого ролика (GET /source):
+    // {role, lang, itag, dubStripped}. Пусто, пока аудио-задача не завершилась.
+    src: null,
     // Сколько опросов сделано для текущего ролика: по нему растёт пауза, когда
     // сервер не прислал подсказку remaining (иначе спали бы опросы подряд).
     polls: 0,
+    // Стагнация remaining: у роликов без речи (трейлеры, музыка) Яндекс
+    // отвечает status=2, rem=5 и больше не двигается. Без счётчика поллинг
+    // шёл бы вечно каждые 5 с.
+    lastRem: -2,
+    stall: 0,
     // Путь E (audioMode:"capture"): звук, который штатный плеер уже получил по
     // SABR и отдал в MSE, пишется в мост как cache/cap_<videoId>.mp4.
     capTried: false,
@@ -132,6 +156,11 @@
     sixWaits: 0
   };
 
+  // Надёжный сигнал о дорожке может прийти до первого тика watch watcher.
+  // Держим его по videoId до инициализации состояния конкретного ролика.
+  var earlyAudioTrack = null;
+  // Язык из player-ответа тоже приходит раньше, чем watcher переключит ролик.
+  var earlyMetaLang = null;
   var statusEl = null;
 
   function log(m) {
@@ -159,7 +188,19 @@
   } catch (e) { }
 
   // ---- on-screen status pill (styled via CSSOM — inline style attr is CSP-blocked)
+  // Единая «витрина»: все этапы перевода, ошибки, готовность и короткие тосты
+  // показываются в ОДНОМ окне фиксированного размера (раньше было два окна —
+  // #vot-status и #vot-toast — и ширина/высота «плавали» по тексту).
+  // Видимость: этапы «в пути» и ошибки — всегда; готовность и справочные строки
+  // — только пока на экране элементы управления плеера, и гаснут сами после
+  // запуска перевода.
+  var ST_W = 480, ST_H = 100;
   var barEl = null, barFill = null, barTimer = null, barStart = 0, barRem = 0;
+  var stText = '', stColor = '#90a4ae', stProg = null;
+  var stKind = 'idle';               // busy | error | done | idle
+  var stToastMsg = '', stToastUntil = 0, stToastTimer = null;
+  var stShown = false, stGatePrev = -1, gateWhy = '-';
+  var stSticky = false;              // сообщение требует действия — видно всегда
 
   function ensureStatus() {
     if (statusEl) return statusEl;
@@ -178,16 +219,25 @@
       s.borderLeft = '4px solid #90a4ae';
       s.fontFamily = 'Roboto, Arial, sans-serif';
       s.fontSize = '16px';
-      s.lineHeight = '1.4';
-      s.maxWidth = '440px';
+      s.lineHeight = '1.35';
+      s.width = ST_W + 'px';
+      s.height = ST_H + 'px';
+      s.boxSizing = 'border-box';
+      s.overflow = 'hidden';
       s.pointerEvents = 'none';
       s.whiteSpace = 'pre-wrap';
       s.wordBreak = 'break-word';
+      s.display = 'none';
       // Шкала ожидания перевода живёт отдельным узлом: textContent у контейнера
-      // стёр бы её, поэтому текст пишем в дочерний <div>.
+      // стёр бы её, поэтому текст пишем в дочерний <div>. Высота текста выбрана
+      // так, чтобы окно было одного размера: 20px паддингов + 68px текста
+      // (3 строки) + 12px шкалы = ровно ST_H.
       var txt = document.createElement('div');
       txt.id = 'vot-status-text';
-      txt.textContent = MARK + ' — ожидание видео';
+      txt.textContent = '';
+      var tx = txt.style;
+      tx.height = '68px';
+      tx.overflow = 'hidden';
       el.appendChild(txt);
       var bar = document.createElement('div');
       var bs = bar.style;
@@ -233,33 +283,151 @@
   }
 
   // prog: число (осталось секунд, шкала растёт) | 'wait' (бегущий сегмент) |
-  // undefined (прячем шкалу — перевод готов/ошибка).
-  function setProgress(prog) {
+  // null/undefined (шкалу прячем — перевод готов/ошибка).
+  function barApply(prog, visible) {
     if (!barEl) return;
-    if (prog === undefined || prog === null || prog === false) {
+    if (!visible || prog === undefined || prog === null || prog === false) {
       if (barTimer) { clearTimeout(barTimer); barTimer = null; }
       barStart = 0;
       barRem = 0;
-      barEl.style.display = 'none';
+      if (barEl.style.display !== 'none') barEl.style.display = 'none';
       return;
     }
     if (!barStart) barStart = Date.now();
     barRem = (typeof prog === 'number' && isFinite(prog) && prog > 0) ? prog : 0;
-    barEl.style.display = 'block';
+    if (barEl.style.display !== 'block') barEl.style.display = 'block';
     if (!barTimer) barTimer = setTimeout(barTick, 0);
   }
 
-  function setStatus(text, color, prog) {
-    try { state.uiStatus = String(text || ''); } catch (e0) { }
+  // Видны ли сейчас элементы управления плеера (бар). Пилюля «готово» и
+  // справочные строки не должны висеть поверх видео, когда бар скрыт.
+  // Важно: `ytlr-player-actions-container` остаётся в DOM и на главной
+  // (скрытый плеер предыдущего ролика), поэтому мало найти узел — нужен
+  // полноэкранный <video> и попадание ряда в видимую область.
+  function playerControlsVisible() {
+    try {
+      var v = null;
+      try { v = findVideo(); } catch (e0) { v = null; }
+      if (!v) { gateWhy = 'novid'; return false; }
+      var vw = window.innerWidth || 1920, vh = window.innerHeight || 1080;
+      var vr = v.getBoundingClientRect();
+      if (!(vr.width >= vw * 0.5 && vr.height >= vh * 0.5)) { gateWhy = 'vsize'; return false; }
+      var el = document.querySelector('ytlr-player-actions-container');
+      if (!el) { gateWhy = 'norow'; return false; }
+      var r = el.getBoundingClientRect();
+      if (!(r.width > 1 && r.height > 1)) { gateWhy = 'rect0'; return false; }
+      if (r.right <= 0 || r.bottom <= 0 || r.left >= vw || r.top >= vh) { gateWhy = 'offscreen'; return false; }
+      var n = el, op = 1, i = 0;
+      while (n && n.nodeType === 1 && i < 8) {
+        var cs = null;
+        try { cs = window.getComputedStyle ? getComputedStyle(n) : null; } catch (e1) { cs = null; }
+        if (cs) {
+          if (cs.visibility === 'hidden') { gateWhy = 'vis'; return false; }
+          var o = parseFloat(cs.opacity);
+          if (isFinite(o) && o < op) op = o;
+        }
+        if (n.getAttribute && n.getAttribute('aria-hidden') === 'true') { gateWhy = 'aria'; return false; }
+        n = n.parentNode;
+        i++;
+      }
+      if (!(op > 0.05)) { gateWhy = 'op' + op.toFixed(2); return false; }
+      gateWhy = 'ok';
+      return true;
+    } catch (e2) { gateWhy = 'err'; return false; }
+  }
+
+  // Перерисовка витрины: решает, ЧТО показывать (тост важнее этапа) и НАДО ли
+  // показывать окно вообще.
+  function statusApply() {
     try {
       var el = ensureStatus();
       if (!el) return;
-      var txt = el.firstChild;
-      if (txt && txt.nodeType === 1) txt.textContent = text;
-      else el.textContent = text;
-      el.style.borderLeft = '4px solid ' + (color || '#90a4ae');
-      setProgress(prog);
+      var now = Date.now(), msg, color, prog = null, show = false;
+      if (stToastMsg && now < stToastUntil) {
+        msg = stToastMsg; color = '#ffb300';
+        show = true;
+      } else {
+        msg = stText; color = stColor; prog = stProg;
+        if (msg) {
+          // busy/error/sticky — всегда; «готово» и справочные строки — только
+          // вместе с баром плеера (после запуска перевода окно не висит).
+          if (stKind === 'busy' || stKind === 'error' || stSticky) show = true;
+          else show = playerControlsVisible();
+        }
+      }
+      if (stToastMsg && !(now < stToastUntil)) {
+        stToastMsg = '';
+        if (stToastTimer) { clearTimeout(stToastTimer); stToastTimer = null; }
+      }
+      if (msg) {
+        var txt = el.firstChild;
+        if (txt && txt.nodeType === 1) {
+          if (txt.textContent !== msg) txt.textContent = msg;
+        } else if (el.textContent !== msg) el.textContent = msg;
+        var bl = '4px solid ' + color;
+        if (el.style.borderLeft !== bl) el.style.borderLeft = bl;
+      }
+      barApply(prog, show);
+      var disp = show ? 'block' : 'none';
+      if (el.style.display !== disp) el.style.display = disp;
+      stShown = show;
+      // Диагностика гейта — одна строка на смену состояния (для логов на ТВ).
+      var g = show ? 1 : 0;
+      if (g !== stGatePrev) {
+        stGatePrev = g;
+        log('st gate show=' + g + ' kind=' + stKind + ' toast=' + (stToastMsg ? 1 : 0)
+          + (stSticky ? ' sticky=1' : '') + ' why=' + gateWhy);
+      }
     } catch (e) { }
+  }
+
+  // Короткие уведомления (раньше — отдельное окно #vot-toast) идут в ту же
+  // витрину и перекрывают текущий этап на время показа.
+  function statusToast(m, ms) {
+    var dur = ms || 3800;
+    stToastMsg = String(m || '');
+    stToastUntil = Date.now() + dur;
+    if (stToastTimer) clearTimeout(stToastTimer);
+    stToastTimer = setTimeout(function () {
+      stToastTimer = null;
+      if (Date.now() >= stToastUntil) { stToastMsg = ''; statusApply(); }
+    }, dur + 40);
+    statusApply();
+  }
+
+  // vot_ui.js (загружается раньше) делегирует сюда свои тосты.
+  try { window.VOT_STATUS_TOAST = statusToast; } catch (eST) { }
+
+  // Фоновый тик (из основного интервала): показывает/прячет окно вслед за
+  // элементами управления плеера.
+  function statusTick() {
+    if (!stText && !stToastMsg) return;
+    // busy/error/sticky видны всегда — пересчитывать гейт незачем.
+    if (stKind === 'busy' || stKind === 'error' || stSticky) return;
+    statusApply();
+  }
+
+  // sticky=true — сообщение требует действия пользователя (например, «язык не
+  // определён: включите перевод кнопкой 文A»), поэтому оно видно и без бара
+  // плеера: иначе подсказка появляется только вместе с элементами управления.
+  function setStatus(text, color, prog, sticky) {
+    try { state.uiStatus = String(text || ''); } catch (e0) { }
+    stText = String(text || '');
+    stColor = color || '#90a4ae';
+    stProg = (prog === undefined) ? null : prog;
+    stSticky = !!sticky;
+    if (!stText) {
+      stKind = 'idle';
+    } else if (stColor === '#e53935') {
+      stKind = 'error';
+    } else if (stColor === '#4caf50') {
+      stKind = 'done';
+    } else if (stColor === '#f5a623') {
+      stKind = 'busy';
+    } else {
+      stKind = 'idle';
+    }
+    statusApply();
   }
 
   function http(method, path, body, cb, err) {
@@ -790,7 +958,13 @@
       var ph = String((s && s.phase) || '');
       var part = Number(s && s.part || 0);
       var nparts = Number(s && s.chunks || 0);
-      var pct = tot > 0 ? Math.min(99, Math.round(got / tot * 100)) : 0;
+      // `total` — объявленная длина аудиоформата из ответа player'а, а `bytes` —
+      // сколько реально пришло из SABR: сегменты повторяются (ретраи, повторный
+      // init), поэтому байт бывает больше объявленного («29350 / 24534 КБ»).
+      // Процент и пару «скачано / всего» показываем только пока не перевалили;
+      // дальше — одно число, иначе шкала выглядит сломанной.
+      var over = tot > 0 && got > tot;
+      var pct = tot > 0 ? Math.min(99, Math.round(got / Math.max(tot, got) * 100)) : 0;
       var head;
       if (ph === 'upload') head = 'отправляю звук в фоне ' + pct + '%';
       else if (ph === 'download' || got > 0) head = 'качаю звук в фоне ' + pct + '%';
@@ -798,9 +972,10 @@
       // Номер части показываем только когда их правда несколько: на коротком
       // ролике «часть 1/1» в статусе выглядит как сбой.
       var sub = nparts > 1 && part > 0 ? ' (часть ' + Math.min(part, nparts) + '/' + nparts + ')' : '';
-      setStatus('Перевод: ' + head + sub + '\n'
-        + (tot > 0 ? Math.round(got / 1024) + ' / ' + Math.round(tot / 1024) + ' КБ' : '…'),
-        '#f5a623', 'wait');
+      var sizeText = '…';
+      if (got > 0 && over) sizeText = Math.round(got / 1024) + ' КБ';
+      else if (tot > 0) sizeText = Math.round(got / 1024) + ' / ' + Math.round(tot / 1024) + ' КБ';
+      setStatus('Перевод: ' + head + sub + '\n' + sizeText, '#f5a623', 'wait');
       setTimeout(function () { pollSrc(id, dur, t0); }, SRC_POLL_MS);
     }, function (e) {
       log('audiosrc status ERR ' + e);
@@ -924,30 +1099,6 @@
     }
 
     next();
-  }
-
-  // Ask the PC dev server to download the track and push it into the Yandex
-  // cache for the shard the TV is currently polling (state.lang). Shared by the
-  // status=6 and status=0 ladders so both failures end in the same recovery.
-  function pcFill(id, dur, r, why) {
-    if (state.curId !== id) return; // stale callback from the previous video
-    state.pcTried = true;
-    state.pcDeadline = Date.now() + PC_FILL_WAIT;
-    state.busy = false;
-    var tidPc = String((r && r.translationId) || state.translationId || '');
-    log(why + ' -> pc fill id=' + id + ' tid=' + tidPc + ' lang=' + state.lang);
-    setStatus('Перевод: ПК готовит звук…\nобычно до минуты', '#f5a623', 'wait');
-    http('POST', '/fill',
-      { videoId: id, duration: dur, tid: tidPc, lang: state.lang },
-      function (fr) {
-        log('fill queued ' + JSON.stringify(fr || {}));
-        poll(id, dur, 120);
-      },
-      function (e) {
-        log('fill ERR ' + e);
-        state.busy = false;
-        setStatus('Перевод: ПК недоступен\n' + e, '#e53935');
-      });
   }
 
   // ---- Путь E: звук из MSE -------------------------------------------------
@@ -1091,17 +1242,9 @@
     return true;
   }
 
-  function pcFillAllowed() {
-    // Лог и решение должны совпадать: раньше отсутствие конфига писалось как
-    // «cfg_off=1», хотя филлер в этом случае разрешён.
-    if (uiPref('pcFill.enabled', true) === false) { log('pcFill denied: pref off'); return false; }
-    if (state.cfg && state.cfg.pcFill === false) { log('pcFill denied: cfg off'); return false; }
-    if (state.pcTried) { log('pcFill denied: already tried'); return false; }
-    return true;
-  }
-
-  // Both shards are dead (or the task id is terminal): the same ladder as
-  // status=6 — look in the other shard, then let the PC fill the cache.
+  // Both shards are dead (or the task id is terminal): look in the other shard.
+  // The box feeds Yandex itself (bridge audio job), so there is no LAN filler
+  // left to escalate to.
   function escalate(id, dur, r, why) {
     if (!state.altLangTried && uiPref('otherShard.enabled', true) !== false) {
       state.altLangTried = true;
@@ -1116,14 +1259,13 @@
       setTimeout(function () { if (state.curId === id) startTranslation(id, dur, alt); }, 200);
       return true;
     }
-    if (pcFillAllowed()) { pcFill(id, dur, r, why); return true; }
     return false;
   }
 
   // Single response handler for both the first request and the polls.
   function handleResp(r, id, dur, fallbackRem) {
     // A poll scheduled for the previous video can land after the user switched:
-    // acting on it would poison altLangTried/pcTried/retried for the new video.
+    // acting on it would poison altLangTried/src/retried for the new video.
     if (state.curId !== id) return;
     // Язык оригинала пришёл позже и оказался исключённым (русский): перевод
     // уже не нужен, не начинаем воспроизведение и не тратим запросы.
@@ -1164,76 +1306,6 @@
       state.busy = false;
       gateReady(id, r.audioUrl, true);
       poll(id, dur, r.remaining != null ? r.remaining : fallbackRem);
-      return;
-    }
-    // While the PC filler runs, Yandex keeps answering 6 (audio requested) or 0
-    // (nothing yet) until the bytes land. Waiting is the whole point here, so
-    // never let those codes reach the failure branches below.
-    if (state.pcTried && !state.pcDone && (r.status === 6 || r.status === 0)) {
-      state.busy = false;
-      // ПК-филлер уже упал (нет куки / yt-dlp не смог скачать звук). Опрос
-      // дальше бессмысленен, но и молча выходить нельзя: на экране оставалось
-      // старое «ПК готовит звук…», и пользователь не понимал, что случилось.
-      if (state.pcFailed) {
-        log('fill failed -> stop polling status=' + r.status);
-        setStatus('Перевод: сервер не отдаёт этот ролик\nПК-филлер не смог скачать звук', '#e53935');
-        return;
-      }
-      if (!state.pcDeadline) state.pcDeadline = Date.now() + PC_FILL_WAIT;
-      var left = Math.round((state.pcDeadline - Date.now()) / 1000);
-      if (left <= 0) {
-        log('fill timeout, giving up');
-        setStatus('Перевод: ПК не справился\nвыберите другой ролик', '#e53935');
-        return;
-      }
-      // Every few waits ask the bridge how the PC job is doing: a dead filler
-      // (expired cookies, no yt-dlp) must not keep the user waiting 10 minutes,
-      // and a finished one means Yandex has the audio now — a fresh first
-      // request then reads the cache instead of leaning on the old verdict.
-      state.pcWaits = (state.pcWaits || 0) + 1;
-      if (state.pcWaits % 4 === 1) {
-        http('GET', '/fill_status?videoId=' + encodeURIComponent(id), null, function (fr) {
-          if (!fr || state.curId !== id || state.pcFailed || state.pcDone) return;
-          if (fr.state === 'ok') {
-            state.pcDone = true;
-            state.pcDeadline = 0;
-            log('fill done on PC -> re-request');
-            setStatus('Перевод: звук загружен, проверяю…', '#3fb950');
-            startTranslation(id, dur, state.lang);
-            return;
-          }
-          if (fr.state === 'err' || fr.state === 'offline') {
-            var why = (fr.res && (fr.res.error || fr.res.status)) || fr.state;
-            // "timeout waiting for the translation" — это НЕ провал филлера:
-            // звук уже загружен, Яндекс просто ещё синтезирует (у нас замер
-            // 648-секундного ролика: status=3, rem≈175с, дольше max_wait ПК).
-            // Раньше мы гасили опрос и показывали ошибку, хотя перевод вот-вот
-            // должен был появиться. Продолжаем ждать своим опросом.
-            if (/timeout waiting/i.test(String(why))) {
-              // Продлеваем ожидание, но не бесконечно: /fill_status помнит
-              // последний результат и отдаёт его вечно, так что без счётчика
-              // провалившаяся задача держала бы опрос часами.
-              state.pcExtends = (state.pcExtends || 0) + 1;
-              if (state.pcExtends <= 5) {
-                log('fill: server still synthesizing (' + why + ') -> keep polling n=' + state.pcExtends);
-                state.pcDeadline = Math.max(state.pcDeadline || 0, Date.now() + 120000);
-                return;
-              }
-              log('fill: still synthesizing after ' + state.pcExtends + ' extensions, giving up');
-            }
-            state.pcFailed = true;
-            state.pcDeadline = 0;
-            state.busy = false;
-            log('fill failed state=' + fr.state + ' why=' + why);
-            setStatus('Перевод: ПК не смог\n' + String(why).slice(0, 90), '#e53935');
-          }
-        }, function () { });
-      }
-      log('fill wait status=' + r.status + ' left=' + left + 's');
-      // poll() sets its own status text, so set ours after it to keep the
-      // "PC is preparing the audio" message visible during the whole wait.
-      poll(id, dur, 2);
-      setStatus('Перевод: ПК готовит звук…\nещё до ' + left + 'с', '#f5a623', left > 0 ? left : 'wait');
       return;
     }
     if (r.status === 0) {
@@ -1277,11 +1349,6 @@
       // whatever we get there can be filled from the PC). Without this ladder a
       // single dead task made the video untranslatable forever.
       if (escalate(id, dur, r, 'status=0')) return;
-      if (state.pcDone) {
-        log('status=0 after fill -> failed');
-        setStatus('Перевод: сервер не принял звук\nвыберите другой ролик', '#e53935');
-        return;
-      }
       log('FAILED msg=' + msg);
       setStatus('Перевод: не удалось\n' + msg, '#e53935');
       return;
@@ -1338,15 +1405,7 @@
         return;
       }
       state.busy = false;
-      if (state.pcDone) {
-        // The PC did upload the track and Yandex still answers "audio requested":
-        // the upload was refused (wrong container) or the cache is cold for this
-        // shard. Nothing left to try from here.
-        log('status=6 after fill -> failed');
-        setStatus('Перевод: сервер не принял звук\nвыберите другой ролик', '#e53935');
-        return;
-      }
-      log('status=6 dead (both shards empty)');
+      log('status=6 dead (both shards empty, bridge audio failed)');
       setStatus('Перевод: сервер не отдаёт этот ролик\nвыберите другой', '#e53935');
       return;
     }
@@ -1570,43 +1629,90 @@
     if (uiPref('translate.enabled', true) === false) {
       state.busy = false;
       log('translate skipped: disabled by button id=' + id);
-      setStatus('Перевод выключен\nвключить: кнопка 文A в баре (или F4)', '#90a4ae');
+      setStatus('Перевод выключен\nвключить: кнопка 文A в баре', '#90a4ae');
       return;
     }
-    // Перевод нужен «с иностранного на русский», поэтому по умолчанию
-    // исключён русский: ролик на русском переводить не надо. Ручное нажатие
-    // кнопки «Перевод: выкл» (state.forceTranslate) правило игнорирует.
-    var skip = (state.forceTranslate === id) ? '' : String(uiPref('skipLang', 'ru') || '').toLowerCase();
-    var orig = String(state.origLang || '').toLowerCase();
-    // Язык оригинала приходит с ПК асинхронно (yt-dlp, холодный кэш ~10 с).
-    // Если решить сразу, русский ролик успеет уехать в перевод — ждём метаданные.
-    if (skip && !orig) {
-      var mt = metaTries || 0;
-      // Язык оригинала теперь приходит и в первом ответе Яндекса (поле 8),
-      // поэтому yt-dlp больше не на критическом пути: одна короткая попытка
-      // поймать тёплый кэш метаданных (~0.1–0.4 с), дальше стартуем сразу.
-      // Если язык окажется исключённым, handleResp гасит перевод ДО запуска
-      // звука (maybeSkipNow) — русский ролик не успевает заиграть.
-      if (mt < 1) {
-        log('translate waiting for source lang try=' + (mt + 1) + ' id=' + id);
-        setTimeout(function () {
-          if (state.curId === id) startTranslation(id, dur, lang, mt + 1);
-        }, 500);
+    // Решение о языке — по TrackDecision (источник + достоверность). Ручная
+    // кнопка/пункт меню (forceTranslate) правило обходят: человек уже сказал
+    // «переводить», поэтому при неизвестном языке уходим в автоопределение.
+    var d = trackDecision(id);
+    var skip = (state.forceTranslate === id) ? '' : langBase(uiPref('skipLang', 'ru'));
+    // Дубль (в т.ч. автодуб) — это НЕ язык оригинала: по нему нельзя ни
+    // решить «ролик на моём языке», ни выбрать шард Яндекса. Такой случай
+    // обрабатываем как «язык оригинала неизвестен».
+    var dubRole = (d.role === 'AUTODUB' || d.role === 'DUB');
+    if (!skip) {
+      if (!d.language || dubRole) lang = 'auto';
+    } else if (d.confidence === 'NONE' || !d.language || dubRole) {
+      // Язык неизвестен — это НЕ повод переводить русский ролик вслепую и не
+      // повод бросать иностранный. unknownPolicy:
+      //   hold — ждём подтверждённый язык (по умолчанию);
+      //   ask  — то же, но 文A/пункт меню переводят с автоопределением;
+      //   auto — явный переключатель: переводим с lang:"auto" сразу.
+      var pol = String(uiPref('unknownPolicy', 'hold') || 'hold');
+      if (pol === 'auto') {
+        log('translate: lang unknown (source=' + d.source + ') -> auto per policy id=' + id);
+        lang = 'auto';
+      } else {
+        var mt = metaTries || 0;
+        if (mt < 1) {
+          log('translate waiting for source lang try=' + (mt + 1) + ' id=' + id);
+          setTimeout(function () {
+            if (state.curId === id) startTranslation(id, dur, lang, mt + 1);
+          }, 500);
+          return;
+        }
+        // Кириллический title, субтитры и шард Яндекса не доказывают язык звука.
+        // Держим автостарт, но не ставим skipLangBlock: если язык придёт позже,
+        // maybeSkipNow запустит перевод иностранного ролика автоматически.
+        state.busy = false;
+        state.langWaitForId = id;
+        if (state.metaPending === id) {
+          // Мета ещё опрашивается (после бот-гейта заход повторяется через
+          // 25 с и обычно проходит). «Не определён» в этот момент — ложь:
+          // язык придёт, и перевод стартует сам. Держим окно ожидания; OK,
+          // как и раньше, форсирует перевод немедленно.
+          log('translate wait: lang pending (source=' + d.source + ') id=' + id);
+          langWaitStatus(id);
+        } else {
+          log('translate hold: source lang unknown (source=' + d.source + ') id=' + id);
+          setStatus(langHoldText(), '#90a4ae', null, 1);
+        }
+        schedulePaint();
         return;
       }
-      log('translate: source lang unknown, starting anyway id=' + id);
-    }
-    if (skip && orig && langBase(orig) === langBase(skip)) {
+    } else if (d.playingRussian) {
+      // «Ролик на вашем языке» без подтверждённой дорожки — только подсказка:
+      // у автодублированных роликов defaultAudioLanguage описывает ДУБЛЬ, а
+      // играем мы оригинал. Такой «ru» уже ошибочно отменял перевод
+      // иностранного ролика, поэтому спрашиваем, а не молчим.
+      if (!skipTrusted(d)) {
+        state.busy = false;
+        state.langWaitForId = id;
+        log('translate hold: lang=' + d.language + ' unconfirmed (' + d.confidence
+          + '/' + d.source + '/' + String(state.origLangFrom || '-') + ') id=' + id);
+        setStatus('Перевод: похоже, звук на русском\nнажмите OK — всё равно перевести', '#90a4ae', null, 1);
+        schedulePaint();
+        return;
+      }
       state.busy = false;
-      log('translate skipped: source lang=' + orig + ' matches skipLang=' + skip + ' id=' + id);
-      setStatus('Перевод: ролик на языке «' + langLabel(orig) + '»\n(исключён в настройках)', '#90a4ae');
+      log('translate skipped: ' + d.source + ' lang=' + d.language
+        + ' = skipLang (' + d.confidence + ') id=' + id);
+      setStatus('Перевод: ролик на вашем языке «' + langLabel(d.language) + '»\n(перевод не нужен)', '#90a4ae');
       return;
     }
     state.busy = true;
-    state.lang = (lang && lang !== 'auto') ? lang : (uiPref('shard', 'auto') === 'en' ? 'en' : (lang || state.lang || 'en'));
+    // Язык запроса = язык оригинала, когда он известен: Яндекс ключует кэш
+    // перевода по нему. 'auto' остаётся только явным выбором, а выбранный шард
+    // (shard=en) — ручной настройкой.
+    state.lang = (lang === 'auto') ? 'auto'
+      : (d.language || ((lang && lang !== 'auto') ? lang
+        : (uiPref('shard', 'auto') === 'en' ? 'en' : (state.lang || 'en'))));
     state.title = (typeof document.title === 'string') ? document.title : '';
     setStatus('Перевод: отправляю запрос…\nvideo=' + id + ' · ' + Math.round(dur) + 'с', '#f5a623');
-    log('translate start id=' + id + ' dur=' + dur.toFixed(1) + ' lang=' + state.lang);
+    log('translate start id=' + id + ' ts=' + Date.now()
+      + ' dur=' + dur.toFixed(1) + ' lang=' + state.lang
+      + ' title=' + String(state.title || '').slice(0, 40));
     http('POST', '/translate',
       { videoUrl: watchUrl(id), duration: dur, firstRequest: true, lang: state.lang, targetLang: 'ru', title: state.title },
       function (r) { handleResp(r, id, dur, 30); },
@@ -1622,12 +1728,35 @@
     var rem = (typeof remaining === 'number' && isFinite(remaining)) ? remaining : -1;
     if (rem === 0 && !(holdMs > 0)) { state.busy = false; setStatus('Перевод: нет готового перевода', '#e53935'); return; }
     state.polls = (state.polls || 0) + 1;
+    // Стагнация (только для обычного status=2). status=6 (holdMs) живёт по
+    // своим правилам: там сервер сам тянет звук, и rem врёт.
+    if (holdMs > 0) {
+      state.lastRem = -2;
+      state.stall = 0;
+    } else if (rem > 0 && rem === state.lastRem) {
+      state.stall = (state.stall || 0) + 1;
+    } else {
+      state.stall = 0;
+    }
+    if (holdMs <= 0) state.lastRem = rem;
+    if (holdMs <= 0 && state.stall >= STALL_LIMIT) {
+      state.busy = false;
+      setStatus('Перевод: сервер не смог обработать звук\nпохоже, в ролике нет речи', '#e53935', 0, true);
+      log('poll stall ' + state.stall + ' rem=' + rem + ' — stop');
+      return;
+    }
+    var stalled = (holdMs <= 0 && state.stall >= STALL_SOFT);
     var delay;
     if (holdMs > 0) {
       // status=6: сервер сам тянет звук. Пауза фиксированная и длинная, чтобы
       // не долбить /translate, и не зависит от rem (он там врёт: 57 → 1 через
       // считанные минуты).
       delay = holdMs;
+    } else if (stalled) {
+      // rem не двигается: job на сервере либо уже мёртв, либо очень долгий.
+      // Опрашиваем редко, чтобы не жечь запросы, но не бросаем сразу —
+      // такие переводы иногда всё-таки доготовляются.
+      delay = STALL_DELAY;
     } else if (rem < 0) {
       delay = (state.polls <= POLL_FAST_TRIES)
         ? POLL_NO_HINT
@@ -1637,11 +1766,13 @@
       // translation shows up much sooner, so never sleep longer than POLL_MAX.
       delay = Math.min(Math.max(POLL_BASE, rem * 1000), POLL_MAX);
     }
-    setStatus((holdMs > 0
-      ? 'Перевод: сервер готовит звук…'
-      : (state.active ? 'Перевод: играю, доготовится…' : 'Перевод: в очереди/переводится…')) +
-      (rem > 0 ? ' (~' + rem + 'с)' : ''), '#f5a623', rem > 0 ? rem : 'wait');
-    log('poll in ' + (delay / 1000).toFixed(0) + 's rem=' + rem + ' n=' + state.polls);
+    setStatus((stalled
+      ? 'Перевод: сервер обрабатывает звук дольше обычного…'
+      : (holdMs > 0
+        ? 'Перевод: сервер готовит звук…'
+        : (state.active ? 'Перевод: играю, доготовится…' : 'Перевод: в очереди/переводится…'))) +
+      (rem > 0 && !stalled ? ' (~' + rem + 'с)' : ''), '#f5a623', rem > 0 && !stalled ? rem : 'wait');
+    log('poll in ' + (delay / 1000).toFixed(0) + 's rem=' + rem + ' n=' + state.polls + (stalled ? ' stall=' + state.stall : ''));
     setTimeout(function () {
       // За время ожидания перевод мог быть отменён (пришёл язык из skipLang).
       if (state.skipLangBlock === id || state.curId !== id) { state.busy = false; return; }
@@ -1751,16 +1882,28 @@
     });
   }
 
-  // Перевод готов, но язык оригинала ещё не известен. Раньше звук стартовал
-  // сразу, и русский ролик, у которого уже был готовый перевод в кэше Яндекса,
-  // успевал заиграть переводом на несколько секунд — пока с ПК не приезжал язык
-  // и «исключённый язык» не гасил звук. Теперь держим запуск, пока язык не
-  // придёт (быстрый детектор на ПК ~0.4-1 с), но не дольше LANG_GATE_MS:
-  // оригинал при этом продолжает играть, паузы нет.
+  // Дополнительная защита для уже запрошенного перевода: готовый звук из кэша
+  // Яндекса нельзя включать при неизвестном или исключённом языке дорожки.
   function gateReady(id, url, partial) {
-    var skip = langBase(uiPref('skipLang', 'ru'));
-    // Правило выключено или язык уже известен — обычный путь без задержки.
-    if (!skip || state.origLang || state.forceTranslate === id) {
+    if (state.curId !== id || state.skipLangBlock === id || state.offForId === id
+        || uiPref('translate.enabled', true) === false) return;
+    var forced = state.forceTranslate === id;
+    var d0 = trackDecision(id);
+    if (!forced && d0.playingRussian) {
+      log('lang gate: ' + d0.source + ' lang=' + d0.language + ' excluded -> no audio id=' + id);
+      return;
+    }
+    // Язык известен (даже приблизительно) — решаем сразу. MEDIUM не повод
+    // держать готовый звук: неизвестность не должна съедать перевод навсегда.
+    // Исключение — дубль: его язык не описывает оригинал.
+    var dubRole = (d0.role === 'AUTODUB' || d0.role === 'DUB');
+    if (forced || (d0.confidence !== 'NONE' && !dubRole)) {
+      if (partial) onPartial(url); else onReady(url);
+      return;
+    }
+    var pol = String(uiPref('unknownPolicy', 'hold') || 'hold');
+    if (pol === 'auto') {
+      log('lang gate: lang unknown -> play (policy=auto) id=' + id);
       if (partial) onPartial(url); else onReady(url);
       return;
     }
@@ -1769,7 +1912,7 @@
     state.gate = { id: id, url: url, partial: !!partial, until: Date.now() + gateMs };
     setStatus('Перевод: готов, проверяю язык ролика…', '#f5a623', 'wait');
     log('lang gate wait id=' + id + ' url=' + String(url).slice(0, 40) +
-      ' max=' + Math.round(gateMs) + 'ms');
+      ' max=' + Math.round(gateMs) + 'ms policy=' + pol);
 
     function deliver(g) {
       state.gate = null;
@@ -1791,14 +1934,27 @@
         log('lang gate: translate disabled -> drop');
         return;
       }
-      if (state.origLang) {
-        log('lang gate: lang=' + state.origLang + ' -> play');
+      if (state.forceTranslate === id) { deliver(g); return; }
+      var d = trackDecision(id);
+      if (d.playingRussian) {
+        state.gate = null;
+        log('lang gate: ' + d.source + ' lang=' + d.language + ' excluded -> no audio id=' + id);
+        return;
+      }
+      if (d.confidence !== 'NONE' && d.role !== 'AUTODUB' && d.role !== 'DUB') {
+        log('lang gate: lang=' + d.language + ' (' + d.source + '/' + d.confidence + ') -> play');
         deliver(g);
         return;
       }
       if (Date.now() >= g.until) {
-        log('lang gate: lang unknown -> start anyway');
-        deliver(g);
+        // Не теряем готовый URL: поздний подтверждённый язык либо ручная 文A
+        // должны включить ЭТОТ звук, а не отправлять /translate повторно.
+        state.langWaitForId = id;
+        log('lang gate: lang unknown (' + d.source + ') -> hold id=' + id);
+        setStatus(pol === 'ask'
+          ? 'Перевод: язык звука не определён\nнажмите OK — перевести (авто)'
+          : 'Перевод: язык звука не определён\nнажмите OK — включить перевод', '#90a4ae', null, 1);
+        schedulePaint();
         return;
       }
       setTimeout(tick, 200);
@@ -1923,8 +2079,7 @@
       if (c && typeof c.lang === 'string' && c.lang) state.lang = c.lang;
       log('config lively=' + c.lively + ' token=' + (c.hasToken ? 'yes' : 'no') +
         ' worker=' + (c.worker || '-') + ' proxy=' + (c.proxyMode || 'off') +
-        ' audio=' + (c.audioMode || 'off') + ' pcFill=' + (c.pcFill === false ? 0 : 1) +
-        ' lang=' + state.lang);
+        ' audio=' + (c.audioMode || 'off') + ' lang=' + state.lang);
     }, function (e) { log('config ERR ' + e); });
   }, function (e) {
     setStatus('Перевод: мост недоступен\n' + e, '#e53935');
@@ -1940,7 +2095,10 @@
         log('watch left -> stop');
         stopAudio(true);
         state.curId = null;
+        earlyAudioTrack = null;
+        earlyMetaLang = null;
         state.busy = false;
+        state.langWaitForId = null;
         state.wantOn = null;
         setStatus('Перевод: ожидание видео…', '#90a4ae');
       }
@@ -1954,6 +2112,17 @@
     // Язык оригинала относится к конкретному ролику: без сброса предыдущее
     // значение (например ru) применится к новому видео и оно будет пропущено.
     state.origLang = '';
+    state.origLangFrom = '';
+    state.langWaitForId = null;
+    // Язык звучащей дорожки относится к ролику так же, как и язык оригинала.
+    state.audioLang = '';
+    state.audioAcont = '';
+    state.audioDubbed = false;
+    state.audioTrackId = '';
+    state.audioMapped = false;
+    // Выбор озвучки (автодуб или Яндекс) действует только на свой ролик.
+    state.dubOffer = null;
+    state.dubPick = null;
     state.skipLangBlock = null;
     state.forceTranslate = null;
     state.offForId = null;
@@ -1971,12 +2140,7 @@
     state.uploading = false;
     state.pageRelay = false;
     state.retried = false;
-    state.pcTried = false;
-    state.pcDeadline = 0;
-    state.pcFailed = false;
-    state.pcDone = false;
-    state.pcWaits = 0;
-    state.pcExtends = 0;
+    state.src = null;
     state.capTried = false;
     state.capBusy = false;
     state.capFailed = false;
@@ -1985,6 +2149,11 @@
     state.sixSince = 0;
     state.sixWaits = 0;
     state.polls = 0;
+    state.lastRem = -2;
+    state.stall = 0;
+    state.metaLate = null;
+    state.metaLateN = 0;
+    state.metaPending = null;
     state.livelyVoice = false;
     state.playedOnce = false;
     state.restarting = false;
@@ -1992,6 +2161,14 @@
     http('POST', '/stop', { }, function () { }, function () { });
     setStatus('Перевод: видео найдено, жду плеер…\nvideo=' + id, '#90a4ae');
     log('watch detected id=' + id);
+    // После полного сброса применяем только подтверждённую дорожку этого id.
+    var early = earlyAudioTrack;
+    earlyAudioTrack = null;
+    if (early && early.id === id) window.__votAudioTrack(early.ti, id);
+    // Язык из ответа плеера, пришедший до переключения watcher.
+    var em = earlyMetaLang;
+    earlyMetaLang = null;
+    if (em && em.id === id) window.__votMetaLang(em.id, em.lang, em.src);
     // Ряд кнопок перерисовывается под новый ролик: подсветку ставим сразу,
     // не дожидаясь тика (иначе кнопка на секунду гаснет).
     try { schedulePaint(); } catch (ep) { }
@@ -2033,7 +2210,9 @@
     try { localStorage.setItem('vot-ui-' + k, JSON.stringify(v)); } catch (e2) { }
   }
   function uiToast(m, ms) {
-    try { if (window.VOTUI) VOTUI.toast(m, ms); } catch (e) { }
+    // Одно окно статуса: тост не открывает вторую плашку, а перекрывает этап.
+    try { statusToast(m, ms); return; } catch (e) { }
+    try { if (window.VOTUI) VOTUI.toast(m, ms); } catch (e2) { }
   }
 
   // Громкость перевода живёт ВНЕ страницы: звук играет нативный MediaPlayer
@@ -2102,206 +2281,495 @@
     return String(code || '').toLowerCase().split('-')[0];
   }
 
-  // Базовый URL ПК-сервера: мост на ТВ (/fill_status и др.) проксирует только
-  // фиксированные пути, поэтому /meta спрашиваем у ПК напрямую.
-  var PC_BASE = 'http://192.168.1.186:8013';
+  // ---- TrackDecision: что известно о языке звука и насколько верить --------
+  // Раньше смешивались две разные задачи: (1) с какого языка переводить и
+  // (2) гарантия, что Cobalt играет оригинал. Здесь решается первая: собираем
+  // всё, что реально известно о языке звучащей дорожки, с оценкой достоверности.
+  // Источники по убыванию надёжности:
+  //   user       — человек нажал 文A/выбрал пункт меню: спорить не с чем;
+  //   source     — мост отдал /source: роль и язык дорожки, ушедшей в Яндекс;
+  //   audioTrack — xtags из SABR-запроса (на ТВ JS их не видит: оставлено как
+  //                источник на случай, если плеер когда-нибудь отдаст их);
+  //   meta_local — подсказки player-ответа: MEDIUM, звук они не доказывают;
+  //   none       — UNKNOWN: включается unknownPolicy (hold по умолчанию).
+  // `audioIsDefault`/`defaultAudioTrackIndex` источником НЕ считаются: дефолтной
+  // дорожкой может оказаться автодуб, подставленный под язык аккаунта.
+  // Можно ли молча решить «ролик уже на вашем языке»? Только по сигналу о
+  // реально звучащей дорожке (HIGH). Подсказка defaultAudioLanguage — это язык
+  // ДУБЛЯ у автодублированных роликов, а играем мы оригинал.
+  function skipTrusted(d) {
+    if (!d) return false;
+    if (d.confidence === 'HIGH') return true;
+    if (d.source === 'meta_local' && (state.origLangFrom === 'defaultLanguage'
+      || state.origLangFrom === 'vdlang')) return false;
+    return true;
+  }
 
-  function httpPC(method, path, body, cb, err) {
-    try {
-      var x = new XMLHttpRequest();
-      x.open(method, PC_BASE + path, true);
-      if (body) x.setRequestHeader('Content-Type', 'application/json');
-      x.onreadystatechange = function () {
-        if (x.readyState !== 4) return;
-        if (x.status === 200) {
-          try { cb(JSON.parse(x.responseText)); } catch (e) { (err || function () { })(e); }
-        } else {
-          (err || function () { })(new Error('http ' + x.status + ' ' + String(x.responseText || '').slice(0, 160)));
-        }
-      };
-      x.onerror = function () { (err || function () { })(new Error('network')); };
-      x.send(body ? JSON.stringify(body) : null);
-    } catch (e) { (err || function () { })(e); }
+  function trackDecision(id) {
+    var skip = langBase(uiPref('skipLang', 'ru'));
+    var d = {
+      role: 'UNKNOWN', language: '', source: 'none', confidence: 'NONE',
+      availableRussianDub: false, playingRussian: false, dubSuppressedByPolicy: false
+    };
+    var s = state.src;
+    if (s && s.lang && s.role && s.role !== 'AUTODUB' && s.role !== 'DUB') {
+      d.role = String(s.role);
+      d.language = langBase(s.lang);
+      // track — дорожка из SABR-запроса самого плеера (факт того, что звучит);
+      // default — дорожка, объявленная в player-ответе дорожкой по умолчанию
+      // (SABR-запрос на ТВ id не даёт); job — байты, которые мост отдал
+      // плееру/Яндексу; page — только конфиг моста, то есть план, а не факт.
+      d.source = s.phase === 'track' ? 'sabr-track'
+        : s.phase === 'default' ? 'sabr-default'
+        : s.phase === 'job' ? 'source' : 'bridged';
+      // mapped=0 — id дорожки не нашёлся в player-ответе: язык известен, а
+      // оригинал это или дубль — нет. Такому сигналу верим как MEDIUM.
+      d.confidence = s.dubStripped ? 'MEDIUM'
+        : (s.phase === 'page' || s.phase === 'default'
+          || (s.phase === 'track' && s.mapped === 0)) ? 'MEDIUM' : 'HIGH';
+    } else if (state.audioLang) {
+      d.role = state.audioDubbed ? 'AUTODUB' : 'PLAIN';
+      d.language = langBase(state.audioLang);
+      // Дорожка из SABR-запроса самого плеера: это факт, а не подсказка.
+      // mapped=true — id дорожки нашёлся в player-ответе, значит роль (дубль
+      // или оригинал) подтверждена xtags. mapped=false — известен только id.
+      d.source = state.audioMapped ? 'sabr-track' : 'audioTrack';
+      d.confidence = state.audioDubbed ? 'LOW'
+        : (state.audioMapped ? 'HIGH' : 'MEDIUM');
+    } else if (state.origLang) {
+      d.role = 'PLAIN';
+      d.language = langBase(state.origLang);
+      d.source = 'meta_local';
+      d.confidence = 'MEDIUM';
+    }
+    if (s && s.dubStripped) {
+      // Дубль существует, но SABR его не отдаёт (мост режет xtags, иначе сервер
+      // отвечает policy-кадром). Предлагать «автодуб / Яндекс» в этом случае
+      // нельзя: автодуба пользователь всё равно не услышит.
+      d.dubSuppressedByPolicy = true;
+      if (skip && langBase(s.lang) === skip) d.availableRussianDub = true;
+    }
+    if (skip && d.language && d.language === skip) d.playingRussian = true;
+    if (state.forceTranslate === id) { d.source = 'user'; d.confidence = 'HIGH'; }
+    return d;
   }
 
   // Ролик оказался на исключённом языке (по умолчанию русский) уже после старта
   // перевода: гасим звук перевода и блокируем повторный запуск для этого id.
-  function maybeSkipNow(id, lang) {
+  // `why` уточняет источник: язык оригинала или уже звучащая дорожка (автодуб).
+  function maybeSkipNow(id, lang, why) {
     var skip = langBase(uiPref('skipLang', 'ru'));
-    if (!skip || langBase(lang) !== skip) return;
+    // Решает TrackDecision (учитывает /source, SABR-дорожку и метаданные);
+    // аргумент остаётся запасным сигналом для только что пришедшего значения.
+    var d = trackDecision(id);
+    var heard = d.language || langBase(lang);
+    var waiting = state.langWaitForId === id;
+    // Явное нажатие 文A или выбор Яндекса в меню — не отменять поздними метаданными.
+    if (state.forceTranslate === id) return;
+    // «Похоже, на вашем языке» без подтверждённой дорожки: не блокируем перевод
+    // молча, а спрашиваем OK (как при неизвестном языке).
+    if (skip && heard === skip && !skipTrusted(d)) {
+      if (state.skipLangBlock === id) return;
+      log('skip unconfirmed: ' + (why || d.source) + ' lang=' + heard
+        + ' (' + d.confidence + '/' + String(state.origLangFrom || '-') + ') id=' + id);
+      state.busy = false;
+      state.langWaitForId = id;
+      setStatus('Перевод: похоже, звук на русском\nнажмите OK — всё равно перевести', '#90a4ae', null, 1);
+      schedulePaint();
+      return;
+    }
+    if (!skip || heard !== skip) {
+      if (state.curId !== id || state.offForId === id || state.skipLangBlock === id
+          || uiPref('translate.enabled', true) === false) return;
+      var g = state.gate;
+      if (g && g.id === id) {
+        state.langWaitForId = null;
+        state.gate = null;
+        log('lang gate: late audio lang=' + heard + ' -> play id=' + id);
+        gateReady(id, g.url, g.partial);
+        return;
+      }
+      // Пока язык был неизвестен, запрос не отправляли. Продолжаем только
+      // один раз, когда надёжный язык этого ролика придёт позднее.
+      if (waiting && !state.busy && !state.active) {
+        var v = findVideo();
+        if (v && v.duration > 0 && isFinite(v.duration)) {
+          state.langWaitForId = null;
+          log('translate resume: audio lang=' + heard + ' id=' + id);
+          startTranslation(id, v.duration, state.lang || '');
+        }
+      }
+      return;
+    }
+    if (waiting) state.langWaitForId = null;
     if (state.skipLangBlock === id) return;
+    // Перевод для этого ролика выключен (кнопка в баре / выключен глобально):
+    // писать «перевод не нужен» в этом случае неверно — сообщение затирало
+    // статус «Перевод выключен» (жалоба на ТВ 31.10). Блокировку запоминаем,
+    // но молча: кнопка включения её снимет.
+    if (uiPref('translate.enabled', true) === false || state.offForId === id) {
+      state.skipLangBlock = id;
+      log('skip (silent): lang=' + heard + ' translate off id=' + id);
+      return;
+    }
     state.skipLangBlock = id;
     var wasRunning = state.active || state.audioPaused || state.busy;
-    log((wasRunning ? 'translate abort: source lang=' : 'translate skip (late meta): source lang=')
-      + lang + ' matches skipLang=' + skip + ' id=' + id);
+    log((wasRunning ? 'translate abort: ' : 'translate skip (late meta): ')
+      + (why || 'source') + ' lang=' + heard + ' matches skipLang=' + skip + ' id=' + id);
     state.busy = false;
     state.pendingPlay = null;
     state.gate = null;
     if (wasRunning) stopAudio(true);
-    setStatus('Перевод: ролик на языке «' + langLabel(lang) + '»\n(исключён в настройках)', '#90a4ae');
+    setStatus('Перевод: ' + (why === 'audio track' ? 'звук уже на вашем языке «' : 'ролик на вашем языке «')
+      + langLabel(heard) + '»\n(перевод не нужен)', '#90a4ae');
     schedulePaint();
   }
 
-  // Язык оригинала: на ТВ-сборке ytInitialPlayerResponse нет, поэтому язык
-  // спрашиваем у ПК; нужен для правила «не переводить с языка» и для гейта
-  // запуска звука (gateReady). Прямой запрос к ПК (http://192.168.1.186) из
-  // HTTPS-страницы блокируется как mixed content, поэтому идём через мост:
-  // /fill_status он уже проксирует на ПК, а ПК дописывает в ответ lang/title
-  // (быстрый детектор /youtubei/v1/player ~0.4-1 с, yt-dlp — фолбэк).
-  // Пока ПК не успел — повторяем опрос по META_GAPS.
-  // Serverless: язык оригинала спрашивает мост (/meta_local = порт yt_lang.py).
-  // Если мост не смог — тихо откатываемся на прежний путь через ПК.
-  // Serverless-приоритет: когда ПК-филлер выключен (pcFill:false) или мост работает
-  // в режиме local, язык спрашиваем у моста (/meta_local, порт player-ответа). Путь
-  // через ПК (/fill_status) при выключенном ПК — это до 10 запросов по META_GAPS
-  // (~17 с) на каждый ролик и гарантированный таймаут. Фолбэк на ПК оставляем
-  // только если pcFill явно разрешён.
+  // «Мой язык» — язык, на котором пользователь смотрит. Пусто/не задан —
+  // наследуем прежнюю настройку skipLang (по умолчанию русский), поэтому
+  // старые профили ведут себя как раньше.
+  function prefLangCode() {
+    var p = String(uiPref('prefLang', '') || '');
+    if (!p) p = String(uiPref('skipLang', 'ru') || '');
+    return langBase(p);
+  }
+
+  // Единая настройка языка: выбранный «мой язык» одновременно и язык-исключение
+  // (с него не переводим). Держим skipLang в согласии, чтобы все существующие
+  // проверки (maybeSkipNow/startTranslation) работали без правок.
+  function setPrefLang(v) {
+    var l = langBase(v);
+    // Повтор того же значения (клиент переисполняет команды пунктов попапа при
+    // перерисовке) не должен сбрасывать блокировки текущего ролика.
+    if (uiPref('prefLang', '') === l && String(uiPref('skipLang', 'ru')) === l) return;
+    uiSet('prefLang', l);
+    uiSet('skipLang', l);
+    state.skipLangBlock = null;
+    state.dubOffer = null;
+    state.dubPick = null;
+    log('prefLang=' + l);
+    // Настройку поменяли на ходу — переоцениваем уже звучащую дорожку тем же
+    // правилом (дедуп в __votAudioTrack по state.audioLang уже не сработает).
+    if (l && state.audioDubbed && state.audioLang === l && state.curId) {
+      offerDubChoice(state.curId, l);
+    }
+  }
+
+  // Короткая подпись выбранного варианта озвучки для меню/панели.
+  function dubPickLabel() {
+    if (state.dubPick === 'yandex') return 'перевод Яндекса';
+    if (state.dubPick === 'dub') return 'автодубляж';
+    if (state.dubOffer && state.dubOffer === state.curId) return 'выбрать: автодуб/Яндекс';
+    return 'авто';
+  }
+
+  // Плеер отдал автодуб на «моём языке» (prefLang). Яндекс тут не обязателен —
+  // звук уже понятен, но голос дубля обычно хуже синтеза, поэтому молча ничего
+  // не решаем: показываем предложение и ждём выбора (меню перевода → «Озвучка»
+  // либо кнопка 文A). Автоперевод на это время заблокирован.
+  function offerDubChoice(id, lang) {
+    if (state.dubPick || state.dubOffer === id) return;
+    var d = trackDecision(id);
+    if (d.dubSuppressedByPolicy) {
+      // Дубль вырезан мостом (SABR отвечает дублям policy-кадром): предлагать
+      // «автодуб / Яндекс» нельзя — автодуба пользователь всё равно не услышит.
+      log('dub offer skipped: dub stripped by policy id=' + id + ' lang=' + lang);
+      return;
+    }
+    state.dubOffer = id;
+    state.skipLangBlock = id;
+    state.busy = false;
+    log('dub offer id=' + id + ' lang=' + lang + ' pref=' + prefLangCode());
+    setStatus('Звук: автодубляж на языке «' + langLabel(lang) + '»\n'
+      + 'выбор: автодуб или перевод Яндекса\n(меню перевода → «Озвучка»)', '#29b6f6');
+    uiToast('Автодуб на языке «' + langLabel(lang) + '»: выбрать в меню 文A');
+    schedulePaint();
+  }
+
+  // Выбор озвучки для текущего ролика:
+  //   'yandex' — включить перевод Яндекса (обходит правила prefLang/skipLang);
+  //   'dub'    — слушать автодуб как есть, перевод для ролика выключаем.
+  function pickDub(v) {
+    var id = state.curId;
+    if (!id) { uiToast('Ролик не открыт'); return; }
+    var val = String(v || '').toLowerCase();
+    if (val !== 'dub' && val !== 'yandex') return;
+    // Повтор того же выбора (клиент умеет переисполнять команды пунктов при
+    // перерисовке попапа) ничего не меняет.
+    if (state.dubPick === val) return;
+    var vd = findVideo();
+    state.dubPick = val;
+    state.dubOffer = null;
+    if (val === 'yandex') {
+      state.skipLangBlock = null;
+      state.offForId = null;
+      state.forceTranslate = id;
+      state.langWaitForId = null;
+      uiSet('translate.enabled', true);
+      log('dub pick yandex id=' + id);
+      uiToast('Озвучка: перевод Яндекса');
+      var held = state.gate;
+      if (held && held.id === id) {
+        state.gate = null;
+        gateReady(id, held.url, held.partial);
+      } else {
+        state.busy = false;
+        startTranslation(id, (vd && vd.duration) ? vd.duration : 0, state.lang || '');
+      }
+    } else {
+      state.skipLangBlock = id;
+      state.busy = false;
+      state.langWaitForId = null;
+      state.pendingPlay = null;
+      state.gate = null;
+      stopAudio(true);
+      log('dub pick dub id=' + id);
+      uiToast('Озвучка: автодубляж');
+      setStatus('Звук: автодубляж\n(перевод для ролика выключен)', '#90a4ae');
+    }
+    try { paintToggleBtn(); } catch (e0) { }
+    schedulePaint();
+  }
+
+  // Язык-исключение, пришедший из /config моста (сервисный рычаг): применяем
+  // как обычную настройку, чтобы ручной выбор в меню работал так же.
+  window.__votSetSkipLang = function (v) {
+    try {
+      var l = langBase(v);
+      if (prefLangCode() === l) return;
+      setPrefLang(l);
+      log('skipLang set from config: ' + l);
+    } catch (e) { }
+  };
+
+  // Ручной выбор озвучки, пришедший из /config моста (сервисный рычаг):
+  // применяем как выбор в меню «Озвучка».
+  window.__votPickDub = function (v) {
+    try { pickDub(v); } catch (e) { }
+  };
+
+  // Язык звучащей дорожки из `xtags` (см. sabrTrackInfo в vot_net.js). Вызывается
+  // на первом POST плеера, то есть раньше /meta_local и раньше, чем мы вообще
+  // успеваем отправить звук в Яндекс: русский оригинал и русский автодуб
+  // отсекаются сразу, без запроса перевода.
+  window.__votAudioTrack = function (ti, vid) {
+    try {
+      if (!ti || !ti.lang) return;
+      var id = vid || state.curId;
+      if (!id) return;
+      if (id !== state.curId) {
+        // URL уже нового ролика, но watcher ещё не переключил state.curId.
+        // Кэшируем только событие с совпадающим id из адреса watch.
+        if (getVideoId() === id) earlyAudioTrack = { id: id, ti: ti };
+        return;
+      }
+      var l = langBase(ti.lang);
+      if (l === state.audioLang && !!ti.dubbed === state.audioDubbed
+          && !!ti.mapped === state.audioMapped) return;
+      // mapped=true: id дорожки из SABR-запроса плеера нашёлся в player-ответе,
+      // значит известны роль и язык (xtags). mapped=false: известен только id
+      // (`en-US.4`) — язык звука знаем, а оригинал это или дубль, нет.
+      var mapped = ti.mapped !== undefined ? !!ti.mapped : true;
+      state.audioLang = l;
+      state.audioAcont = String(ti.acont || '');
+      state.audioDubbed = !!ti.dubbed;
+      state.audioMapped = mapped;
+      state.audioTrackId = String(ti.trackId || '');
+      log('audio track lang=' + l + ' acont=' + state.audioAcont
+        + ' dubbed=' + (state.audioDubbed ? 1 : 0) + ' mapped=' + (mapped ? 1 : 0)
+        + ' tid=' + (state.audioTrackId || '-') + ' id=' + id);
+      var pref = prefLangCode();
+      // Автодуб уже на «моём языке»: не переводим молча, а предлагаем выбор
+      // (автодуб или Яндекс). Решение запоминается на ролик.
+      if (state.audioDubbed && pref && l === pref) { offerDubChoice(id, l); return; }
+      // Плеер переключился на дорожку без дубля — предложение снимаем: дальше
+      // работает обычное правило «оригинал на моём языке не переводим».
+      if (!state.audioDubbed && state.dubOffer === id) state.dubOffer = null;
+      // Дорожка без дубля и с подтверждённой ролью — это язык оригинала:
+      // решение «не переводить» принимаем сразу, не дожидаясь InnerTube.
+      if (mapped && !state.audioDubbed && !state.origLang) state.origLang = l;
+      // Язык, который реально звучит, исключён — переводить нечего.
+      maybeSkipNow(id, l, state.audioDubbed ? 'audio track' : 'sabr track');
+    } catch (e) { }
+  };
+
+  // «Язык не определён» — только когда опрос меты действительно исчерпан.
+  function langHoldText() {
+    var pol = String(uiPref('unknownPolicy', 'hold') || 'hold');
+    return pol === 'ask'
+      ? 'Перевод: язык звука не определён\nнажмите OK — перевести (авто)'
+      : 'Перевод: язык звука не определён\nнажмите OK — включить перевод';
+  }
+
+  // Пока мета ещё в пути — окно ожидания вместо ложного HOLD. Sticky нужен,
+  // чтобы OK на пульте сработал (holdPending), но текст не пугает «не определён».
+  function langWaitStatus(id) {
+    if (state.metaPending !== id) return false;
+    setStatus('Перевод: определяю язык звука…\nOK — перевести сразу', '#90a4ae', null, 1);
+    return true;
+  }
+
+  // Опрос закончился без языка: теперь HOLD честный, автостарта больше не будет
+  // (кроме следующих редких ретраев, если они ещё запланированы).
+  function showLangHold(id) {
+    if (!id || state.curId !== id || state.origLang) return;
+    if (state.langWaitForId !== id || state.forceTranslate === id) return;
+    log('translate hold: source lang unknown id=' + id);
+    setStatus(langHoldText(), '#90a4ae', null, 1);
+    schedulePaint();
+  }
+
+  // Язык оригинала. Оба источника живут на самой приставке, ПК не нужен:
+  //  1) GET /source — что мост фактически отдал звуком (role/acont/lang и флаг
+  //     dubStripped). Это описание тех байтов, которые ушли в Яндекс, поэтому
+  //     сигнал самый надёжный;
+  //  2) GET /meta_local — язык из player-ответа (его может не быть: например
+  //     playability LOGIN_REQUIRED или ролик без подсказки языка).
+  // Опрос повторяется по META_GAPS: аудио-задача моста идёт параллельно с
+  // первым /translate, так что /source поначалу пуст.
   function fetchMeta(id, tries) {
     var n = tries || 0;
-    var cfg = state.cfg || {};
-    var pcOk = cfg.pcFill === true;
-    if (cfg.audioMode === 'local' || !pcOk) { fetchMetaLocal(id, n, pcOk); return; }
-    fetchMetaPC(id, n);
+    // Опрос начат: до первого ответа язык «не определён» ещё не факт —
+    // startTranslation должен показать ожидание, а не HOLD.
+    state.metaPending = id;
+    http('GET', '/source?videoId=' + encodeURIComponent(id), null, function (j) {
+      if (state.curId !== id) return;
+      if (!j || !j.ok) { fetchMetaLocal(id, n); return; }
+      var lang = langBase(j.lang);
+      var role = String(j.role || 'PLAIN');
+      var stripped = !!j.dubStripped;
+      state.src = { role: role, lang: lang, itag: j.itag, dubStripped: stripped,
+        phase: String(j.phase || ''), served: String(j.served || ''),
+        mapped: (j.mapped === undefined ? -1 : Number(j.mapped)) };
+      log('source id=' + id + ' role=' + role + ' lang=' + (lang || '-')
+        + ' itag=' + j.itag + ' stripped=' + (stripped ? 1 : 0));
+      // Дубль просил сам плеер, а мост его вырезал: язык из этой записи — язык
+      // ДУБЛЯ, об оригинале она ничего не говорит. В таком случае идём дальше
+      // за /meta_local, но факт запоминаем для панели/решений.
+      if (stripped || role === 'AUTODUB' || role === 'DUB') { fetchMetaLocal(id, n); return; }
+      if (!lang) { fetchMetaLocal(id, n); return; }
+      state.metaPending = null;
+      if (lang && lang !== state.origLang) {
+        state.origLang = lang;
+        maybeSkipNow(id, lang, 'source');
+      }
+    }, function () { fetchMetaLocal(id, n); });
   }
 
-  function fetchMetaLocal(id, n, pcFallback) {
-    http('GET', '/meta_local?videoId=' + encodeURIComponent(id), null, function (j) {
+  function fetchMetaLocal(id, n, late) {
+    // visitorData страницы: гейт «confirm you're not a bot» привязан к visitor
+    // id, а страница под своим id спокойно стримит это же видео. Свой свежий
+    // visitor мост получает через visitor_id и быстро попадает под гейт.
+    var vd = '';
+    try { vd = String(ytcfgGet('VISITOR_DATA', '') || ''); } catch (e0) { }
+    http('GET', '/meta_local?videoId=' + encodeURIComponent(id)
+      + (vd ? ('&visitorData=' + encodeURIComponent(vd)) : '')
+      + (late ? '&retry=1&basic=1' : ''), null, function (j) {
       if (state.curId !== id) return;
-      var lang = String((j && j.lang) || '');
+      var lang = langBase((j && j.lang) || '');
       if (j && j.ok && lang) {
+        state.metaPending = null;
         if (lang !== state.origLang) {
           state.origLang = lang;
-          log('meta_local id=' + id + ' lang=' + lang + ' ms=' + (j.ms || 0)
-            + ' title=' + String(j.title || '').slice(0, 40));
-          maybeSkipNow(id, lang);
+          state.origLangFrom = String(j.langFrom || '');
+          log('meta_local id=' + id + ' lang=' + lang + ' from=' + String(j.langFrom || 'audio')
+            + ' ms=' + (j.ms || 0) + (late ? ' late' : '') + ' title=' + String(j.title || '').slice(0, 40));
+          maybeSkipNow(id, lang, 'meta_local');
         }
         return;
       }
-      // Без ПК повторять бессмысленно: язык доберём из ответа Яндекса (поле 8)
-      // в maybeSkipNow, а перевод всё равно стартует (source lang unknown).
-      if (!pcFallback) {
-        log('meta_local fail ' + String((j && j.err) || 'no lang') + ' (serverless, no pc meta)');
-        return;
-      }
-      log('meta_local fail ' + String((j && j.err) || 'no lang') + ' -> pc meta');
-      fetchMetaPC(id, n);
-    }, function (e) {
-      if (state.curId !== id) return;
-      if (!pcFallback) {
-        log('meta_local ERR ' + (e && e.message) + ' (serverless, no pc meta)');
-        return;
-      }
-      log('meta_local ERR ' + (e && e.message) + ' -> pc meta');
-      fetchMetaPC(id, n);
-    });
-  }
-
-  function fetchMetaPC(id, tries) {
-    var n = tries || 0;
-    http('GET', '/fill_status?videoId=' + encodeURIComponent(id), null, function (j) {
-      if (state.curId !== id) return;
-      var lang = String((j && j.lang) || '');
-      if (lang) {
-        if (lang !== state.origLang) {
-          state.origLang = lang;
-          log('meta id=' + id + ' lang=' + lang
-            + ' title=' + String((j && j.title) || '').slice(0, 40));
-          maybeSkipNow(id, lang);
+      var why = String((j && j.why) || '').slice(0, 60);
+      if (late) {
+        log('meta_local late fail ' + String((j && j.err) || 'no lang') + (why ? ' why=' + why : ''));
+        // Бот-гейт привязан к частоте запросов и проходит сам. Пока ролик
+        // играет и язык ещё неизвестен, продолжаем РЕДКИЕ попытки (45 с,
+        // один-два клиента): так язык подхватится без действий пользователя,
+        // а гейт не усугубляется, как при серии полных переборов.
+        var hardLate = /LOGIN_REQUIRED|not a bot/i.test(String((j && j.err) || ''));
+        if (hardLate && state.curId === id && !state.origLang
+            && (state.metaLateN || 0) < 8) {
+          state.metaLateN = (state.metaLateN || 0) + 1;
+          state.metaPending = id;
+          // Ретраи идут серией по 45 с, и нередко именно один из них проходит
+          // бот-гейт (на `P541-Kmv-6Q` язык нашёлся на третьем заходе, через
+          // ~90 с). Пока серия жива, «не определён» — всё ещё неправда:
+          // держим ожидание, OK по-прежнему форсирует перевод (sticky).
+          langWaitStatus(id);
+          setTimeout(function () {
+            if (state.curId !== id || state.origLang) return;
+            log('meta_local late retry id=' + id + ' n=' + state.metaLateN);
+            fetchMetaLocal(id, 0, true);
+          }, 45000);
+        } else {
+          state.metaPending = null;
+          showLangHold(id);
         }
         return;
       }
       if (n < META_GAPS.length) {
-        setTimeout(function () { fetchMetaPC(id, n + 1); }, META_GAPS[n]);
+        log('meta_local fail ' + String((j && j.err) || 'no lang') + ' try=' + (n + 1)
+          + (why ? ' why=' + why : ''));
+        // Бот-гейт: повторять чаще бессмысленно и вредно — каждый заход
+        // перебирает клиентов и только усугубляет пометку visitor'а. Гейт по
+        // частоте проходит сам, поэтому оставляем одну позднюю попытку.
+        var hard = /LOGIN_REQUIRED|not a bot/i.test(String((j && j.err) || ''));
+        if (hard && n >= 1) {
+          log('meta_local id=' + id + ' lang unknown (bot gate)');
+          if (state.metaLate !== id) {
+            state.metaLate = id;
+            state.metaPending = id;
+            setTimeout(function () {
+              if (state.curId !== id || state.origLang) return;
+              log('meta_local late retry id=' + id);
+              fetchMetaLocal(id, 0, true);
+            }, 25000);
+          }
+          return;
+        }
+        state.metaPending = id;
+        setTimeout(function () { fetchMeta(id, n + 1); }, META_GAPS[n]);
       } else {
-        log('meta id=' + id + ' lang unknown (pc meta timeout)');
+        state.metaPending = null;
+        log('meta_local id=' + id + ' lang unknown (source+meta timeout)');
+        showLangHold(id);
       }
     }, function (e) {
-      // Сетевая ошибка (ПК перезапускается) — это не «языка нет»: повторяем,
-      // иначе ролик навсегда останется без определения языка.
       if (state.curId !== id) return;
-      log('meta ERR ' + (e && e.message) + ' try=' + (n + 1));
       if (n < META_GAPS.length) {
-        setTimeout(function () { fetchMetaPC(id, n + 1); }, META_GAPS[n]);
-      }
-    });
-  }
-
-  function manualFill() {
-    var v = findVideo(), id = state.curId;
-    if (!id) { uiToast('Нет активного ролика'); return; }
-    uiToast('ПК заполняет звук…');
-    pcFill(id, (v && v.duration) ? v.duration : 0, { translationId: state.translationId }, 'manual');
-  }
-
-  function checkFillStatus() {
-    var id = state.curId;
-    if (!id) { uiToast('Нет активного ролика'); return; }
-    http('GET', '/fill_status?videoId=' + encodeURIComponent(id), null, function (j) {
-      // 'none' is not a failure: the PC keeps jobs in memory only, and a job
-      // exists solely after POST /fill for this very videoId. Say that plainly.
-      var st = String((j && j.state) || '');
-      var text;
-      if (st === 'run') {
-        text = 'ПК: качает и синтезирует…';
-      } else if (st === 'ok') {
-        text = 'ПК: готово';
-      } else if (st === 'err') {
-        var why = String((j && (j.error || j.why)) || '');
-        text = 'ПК: не смог' + (why ? ' — ' + why.slice(0, 70) : '');
-      } else if (st === 'offline') {
-        text = 'ПК: недоступен';
+        state.metaPending = id;
+        setTimeout(function () { fetchMeta(id, n + 1); }, META_GAPS[n]);
       } else {
-        text = 'ПК: этот ролик не отправляли';
+        state.metaPending = null;
+        log('meta_local ERR ' + (e && e.message));
+        showLangHold(id);
       }
-      if (j && j.status) { text += ' · status=' + j.status; }
-      uiToast(text);
-    }, function (e) { uiToast('ПК недоступен: ' + (e && e.message)); });
-  }
-
-  function openTranslatePanel() {
-    if (!window.VOTUI || !VOTUI.open) { uiToast('UI-слой не загружен'); return; }
-    var items = [
-      { title: 'Перевод включён', type: 'toggle',
-        value: function () { return uiPref('translate.enabled', true) !== false; },
-        // Тот же выключатель, что и кнопка в баре: выключение останавливает
-        // звук и запрещает автоперевод следующих роликов.
-        onSelect: function () { toggleTranslate(); } },
-      { title: 'Шард запроса', type: 'choice',
-        value: function () { return String(uiPref('shard', 'auto')); },
-        options: function () { return [{ label: 'auto (как на ТВ)', value: 'auto' }, { label: 'en', value: 'en' }]; },
-        onPick: function (v) { uiSet('shard', v); state.lang = v; } },
-      { title: 'Искать в другом кэше', type: 'toggle',
-        value: function () { return uiPref('otherShard.enabled', true) !== false; },
-        onSelect: function () { uiSet('otherShard.enabled', uiPref('otherShard.enabled', true) === false); } },
-      { title: 'ПК-филлер', type: 'toggle',
-        value: function () { return uiPref('pcFill.enabled', true) !== false; },
-        onSelect: function () { uiSet('pcFill.enabled', uiPref('pcFill.enabled', true) === false); } },
-      { title: 'Громкость перевода', type: 'slider', min: 0, max: 100, step: 5,
-        value: function () { return volPct('vol.translate', 100); },
-        format: function (v) { return v + '%'; },
-        onChange: function (v) { uiSet('vol.translate', v); applyVolume(); } },
-      { title: 'Оригинал при переводе', type: 'slider', min: 0, max: 100, step: 5,
-        value: function () { return volPct('vol.original', 0); },
-        format: function (v) { return v + '%'; },
-        onChange: function (v) { uiSet('vol.original', v); applyVolume(); } },
-      { title: 'Не переводить с языка (по умолч. рус.)', type: 'choice',
-        value: function () { return langLabel(uiPref('skipLang', 'ru')); },
-        options: function () { return VOT_LANGS; },
-        onPick: function (v) {
-          uiSet('skipLang', v);
-          // Пользователь поменял правило: снимаем блокировку с текущего ролика.
-          state.skipLangBlock = null;
-        } },
-      { title: 'Заполнить звук на ПК сейчас', type: 'action', onSelect: manualFill },
-      { title: 'Проверить статус ПК', type: 'action', onSelect: checkFillStatus },
-      { title: 'Статус перевода', type: 'info', value: function () { return state.uiStatus || ''; } }
-    ];
-    VOTUI.open({
-      title: 'Перевод Яндекс',
-      subtitle: state.curId ? ('ролик ' + state.curId + (state.lang ? ' · шард ' + state.lang : '')) : 'ролик не открыт',
-      items: items
     });
   }
+
+  // Только для будущего источника ПОДТВЕРЖДЁННОГО языка. Список дорожек из
+  // player JSON (audtrk/defaultAudioTrackIndex) сюда больше не передаётся:
+  // дефолтная дорожка не обязательно звучит и не обязательно оригинальная.
+  window.__votMetaLang = function (vid, lang, src) {
+    try {
+      var id = String(vid || '');
+      var l = langBase(lang);
+      if (!id || !l) return;
+      // Ответ плеера приходит раньше, чем watcher переключит state.curId:
+      // запоминаем по id и применяем в watcher'е (как earlyAudioTrack).
+      if (id !== state.curId) {
+        if (getVideoId() === id) earlyMetaLang = { id: id, lang: l, src: src };
+        return;
+      }
+      if (state.audioLang) return;
+      if (state.origLang === l) return;
+      var had = state.origLang;
+      state.origLang = l;
+      state.origLangFrom = String(src || 'player');
+      log('origLang=' + l + ' from ' + (src || 'player') + ' (was ' + (had || '-')
+        + ') id=' + id);
+      maybeSkipNow(id, l, 'source');
+    } catch (e) { log('metaLang ERR ' + (e && e.name)); }
+  };
 
   // ---- нативное меню «Перевод» (многоуровневое, как «Аудио»/«Качество») -----
   // Клиент рисует панель по данным из САМОЙ команды
@@ -2404,8 +2872,9 @@
 
   function votSrcText() {
     var o = uiPref('otherShard.enabled', true) !== false;
-    var p = uiPref('pcFill.enabled', true) !== false;
-    return (o ? 'другой кэш' : 'только шард') + (p ? ' + ПК' : '');
+    var s = String((state.cfg && state.cfg.audioMode) || 'local');
+    var m = s === 'capture' ? 'захват MSE' : s === 'off' ? 'мост: выкл' : 'мост: сам';
+    return (o ? 'другой кэш' : 'только шард') + ' · ' + m;
   }
 
   function votStatusText() {
@@ -2419,10 +2888,8 @@
     if (lv === 'vot-src') {
       out.push(votSwitch('Другой шард кэша', 'искать озвучку в соседнем кэше',
         'otherShard.enabled', uiPref('otherShard.enabled', true) !== false));
-      out.push(votSwitch('ПК-филлер', 'дозаполнять звук через ПК',
-        'pcFill.enabled', uiPref('pcFill.enabled', true) !== false));
-      out.push(votItem({ title: 'Заполнить звук сейчас', sub: 'через ПК', action: 'VOT_FILL' }));
-      out.push(votItem({ title: 'Проверить статус ПК', action: 'VOT_FILLSTATUS' }));
+      out.push(votItem({ title: 'Звук для Яндекса', sub: 'мост качает сам, ПК не нужен',
+        icon: 'CLOUD_DONE' }));
       return out;
     }
     if (lv === 'vot-shard') {
@@ -2443,23 +2910,80 @@
       return out;
     }
     if (lv === 'vot-skip') {
-      var sk = String(uiPref('skipLang', 'ru') || '');
+      // «Мой язык» — на нём смотрю, с него не перевожу (и автодуб на нём даёт
+      // выбор «автодуб / Яндекс», см. offerDubChoice).
+      var sk = String(uiPref('prefLang', '') || uiPref('skipLang', 'ru') || '');
       for (i = 0; i < VOT_LANGS.length; i++) {
-        out.push(votCheck(VOT_LANGS[i].label, 'skipLang', String(VOT_LANGS[i].value),
+        out.push(votCheck(VOT_LANGS[i].label, 'prefLang', String(VOT_LANGS[i].value),
           sk === String(VOT_LANGS[i].value)));
       }
+      return out;
+    }
+    if (lv === 'vot-dub') {
+      var pick = String(state.dubPick || '');
+      out.push(votCheck('Автодубляж (как есть)', 'dub', 'dub', pick === 'dub'));
+      out.push(votCheck('Перевод Яндекса', 'dub', 'yandex', pick === 'yandex'));
+      var dd = state.curId ? trackDecision(state.curId) : null;
+      out.push(votItem({ title: 'Звучит сейчас',
+        sub: dd
+          ? ((dd.language ? langLabel(dd.language) : '?') + ' · ' + dd.role.toLowerCase()
+            + ' · ' + dd.source + '/' + dd.confidence.toLowerCase())
+          : '—' }));
+      return out;
+    }
+    if (lv === 'vot-unknown') {
+      // Политика «язык звука неизвестен». HOLD по умолчанию: русский ролик не
+      // должен уехать в перевод из-за отсутствия метаданных, а иностранный —
+      // потеряться. ASK/AUTO — осознанный выбор пользователя.
+      var up = String(uiPref('unknownPolicy', 'hold') || 'hold');
+      out.push(votCheck('Держать (по умолчанию)', 'unknownPolicy', 'hold', up === 'hold'));
+      out.push(votCheck('Предлагать автоопределение', 'unknownPolicy', 'ask', up === 'ask'));
+      out.push(votCheck('Переводить с автоопределением', 'unknownPolicy', 'auto', up === 'auto'));
       return out;
     }
     // корень
     out.push(votItem({ title: 'Перевод Яндекс', sub: on ? 'включён' : 'выключен',
       icon: 'TRANSLATE', second: on ? 'CHECK' : 'RADIO_BUTTON_UNCHECKED',
       action: VOT_TOGGLE_ACTION }));
+    var cur = state.curId ? trackDecision(state.curId) : null;
+    if (cur && cur.confidence === 'NONE' && state.curId) {
+      // Язык звука не определён: единственный безопасный ручной путь — перевод
+      // с автоопределением (Яндекс сам определит исходный язык).
+      out.push(votItem({ title: 'Перевести с автоопределением',
+        sub: 'язык звука не определён', action: 'VOT_AUTOLANG' }));
+    }
     out.push(votNavItem('Источник перевода', votSrcText(), 'vot-src'));
     out.push(votNavItem('Шард запроса', String(uiPref('shard', 'auto')), 'vot-shard'));
+    out.push(votNavItem('Озвучка', dubPickLabel(), 'vot-dub'));
     out.push(votNavItem('Громкость', votVolText(), 'vot-vol'));
-    out.push(votNavItem('Не переводить с', langLabel(uiPref('skipLang', 'ru')), 'vot-skip'));
+    out.push(votNavItem('Мой язык', langLabel(prefLangCode()), 'vot-skip'));
+    out.push(votNavItem('Если язык не определён', unknownPolicyLabel(), 'vot-unknown'));
     out.push(votItem({ title: 'Статус', sub: votStatusText() }));
     return out;
+  }
+
+  function unknownPolicyLabel() {
+    var p = String(uiPref('unknownPolicy', 'hold') || 'hold');
+    return p === 'auto' ? 'автоопределение' : p === 'ask' ? 'предлагать' : 'держать';
+  }
+
+  // Ручной перевод с автоопределением исходного языка (lang:"auto"). Это тот
+  // самый пункт «Перевести с автоопределением»: политика ASK запускает его
+  // кнопкой, AUTO_DETECT делает то же автоматически.
+  function translateAuto() {
+    var id = state.curId, v = findVideo();
+    if (!id) { uiToast('Нет активного ролика'); return; }
+    state.forceTranslate = id;
+    state.skipLangBlock = null;
+    state.offForId = null;
+    state.langWaitForId = null;
+    uiSet('translate.enabled', true);
+    log('manual translate: auto-detect id=' + id);
+    uiToast('Перевод: автоопределение языка');
+    var held = state.gate;
+    if (held && held.id === id) { state.gate = null; gateReady(id, held.url, held.partial); return; }
+    state.busy = false;
+    startTranslation(id, (v && v.duration) ? v.duration : 0, 'auto');
   }
 
   function votSet(rest) {
@@ -2467,9 +2991,18 @@
     if (p < 0) { log('vot set: bad ' + s.slice(0, 24)); return; }
     var k = s.slice(0, p), v = s.slice(p + 1);
     if (k === 'shard') { uiSet('shard', v); state.lang = v; }
-    else if (k === 'otherShard.enabled' || k === 'pcFill.enabled') uiSet(k, v === '1');
+    else if (k === 'otherShard.enabled') uiSet(k, v === '1');
     else if (k === 'vol.translate' || k === 'vol.original') { uiSet(k, Number(v) || 0); applyVolume(); }
-    else if (k === 'skipLang') { uiSet('skipLang', v); state.skipLangBlock = null; }
+    else if (k === 'skipLang' || k === 'prefLang') setPrefLang(v);
+    else if (k === 'unknownPolicy') {
+      var pol = String(v || 'hold');
+      if (pol !== 'hold' && pol !== 'ask' && pol !== 'auto') pol = 'hold';
+      uiSet(k, pol);
+      // Смена политики не должна оставлять ролик в вечном ожидании: снимаем
+      // удержание и даём шанс решить заново на текущем ролике.
+      state.langWaitForId = null;
+    }
+    else if (k === 'dub') pickDub(v);
     else { log('vot set: unknown ' + k); return; }
     if (votSetLog < 24) { votSetLog++; log('vot set ' + k + '=' + v); }
     // Нативная панель закрывается на выборе (как «Качество»), поэтому ничего не
@@ -2482,13 +3015,10 @@
     var s = String(a || '');
     if (!s) return false;
     if (s === VOT_TOGGLE_ACTION) { log('btn TOGGLE'); toggleTranslate(); return true; }
-    // VOT_ACTION/VOT_NAV остаются только как страховка: их шлют пункты,
-    // собранные до того, как мы поймали шаблон нативной панели.
-    if (s === VOT_ACTION) { log('btn PRESSED'); openTranslatePanel(); return true; }
-    if (s.indexOf('VOT_NAV:') === 0) { openTranslatePanel(); return true; }
+    // Старые fallback-команды не открывают отвергнутый DOM popup.
+    if (s === VOT_ACTION || s.indexOf('VOT_NAV:') === 0) return true;
     if (s.indexOf('VOT_SET:') === 0) { votSet(s.slice(8)); return true; }
-    if (s === 'VOT_FILL') { manualFill(); return true; }
-    if (s === 'VOT_FILLSTATUS') { checkFillStatus(); return true; }
+    if (s === 'VOT_AUTOLANG') { translateAuto(); return true; }
     return false;
   }
 
@@ -2499,14 +3029,28 @@
   // Клиент рисует подписи из нашей команды ровно один раз, поэтому после
   // изменения уровня строку приходится перерисовывать вручную (votPaintValue).
   var volKeyLog = 0;
+  // Диагностика «навигация умерла»: первые несколько стрелок влево/вправо
+  // показываем, какой узел реально в фокусе и опознали ли мы его как наш слайдер.
+  var navDiag = 0;
 
   // Какая из наших строк в фокусе. Подпись может лежать в aria-label (как у
   // кнопок плеера) или текстом в поддереве — проверяем и то, и другое.
   function volKeyOf(a) {
-    if (!a) return '';
+    if (!a || a.nodeType !== 1) return '';
+    // body/html (и вообще полноэкранные контейнеры) содержат ВЕСЬ текст страницы,
+    // включая наши собственные подписи и последний тост «Громкость перевода: N%»,
+    // которые остаются в DOM навсегда. Раньше совпадение по такому агрегату
+    // заставляло нас гасить LEFT/RIGHT при activeElement=body — то есть всегда,
+    // после того как панель/тост хоть раз отрисовались, и пульт в плеере «умирал»
+    // до перезапуска приложения. Опознаём строку только по её собственному тексту.
+    if (a === document.body || a === document.documentElement) return '';
+    try { if (a.closest && a.closest('#vot-ui-root')) return ''; } catch (e0) { }
     var al = '', tx = '';
     try { if (a.getAttribute) al = String(a.getAttribute('aria-label') || ''); } catch (e) { }
     try { tx = String(a.textContent || ''); } catch (e2) { }
+    // У контейнера textContent — весь интерфейс (бар плеера, панель настроек).
+    // Подпись строки короткая; длинный текст означает, что узел не строка.
+    if (tx.length > 120) tx = '';
     var s = (al + ' ' + tx).replace(/\s+/g, ' ').toLowerCase();
     if (s.indexOf('громкость перевода') >= 0) return 'vol.translate';
     if (s.indexOf('оригинал при переводе') >= 0) return 'vol.original';
@@ -2553,6 +3097,8 @@
   var volIgn = 0;
   function nodeOnScreen(a) {
     if (!a || a.nodeType !== 1 || !a.getBoundingClientRect) return false;
+    // body всегда «на экране» и всегда 1200x800 — как признак видимой строки не годится.
+    if (a === document.body || a === document.documentElement) return false;
     try {
       if (!document.body || !document.body.contains(a)) return false;
       var r = a.getBoundingClientRect();
@@ -2577,6 +3123,13 @@
       var kc = e.keyCode;
       if (kc !== 37 && kc !== 39) return;
       var a = document.activeElement, key = volKeyOf(a);
+      if (navDiag < 4) {
+        navDiag++;
+        log('nav key kc=' + kc + ' af='
+          + (a ? (a.tagName || '?') + (a.id ? '#' + a.id : '')
+            + ' cls=' + String(a.className || '').slice(0, 32) : '-')
+          + ' vol=' + (key || '-'));
+      }
       if (!key) return;
       if (!nodeOnScreen(a)) {
         // Клавишу не трогаем — она уходит клиенту как обычно.
@@ -2612,6 +3165,7 @@
     var v = findVideo(), id = state.curId || getVideoId();
     if (isTranslateOn()) {
       state.busy = false;
+      state.langWaitForId = null;
       state.pendingPlay = null;
       state.wantOn = null;
       state.offForId = id || state.curId;
@@ -2629,18 +3183,104 @@
     if (!id) { setStatus('Перевод: включён, откройте видео', '#90a4ae'); return; }
     state.offForId = null;
     state.skipLangBlock = null;
+    state.langWaitForId = null;
     state.forceTranslate = id;
     state.wantOn = id;
     log('toggle: on id=' + id);
     try { paintToggleBtn(); } catch (e1) { }
-    startTranslation(id, (v && v.duration) ? v.duration : 0, state.lang || '');
+    var held = state.gate;
+    if (held && held.id === id) {
+      state.gate = null;
+      log('lang gate: manual -> play cached id=' + id);
+      gateReady(id, held.url, held.partial);
+    } else {
+      state.busy = false;
+      startTranslation(id, (v && v.duration) ? v.duration : 0, state.lang || '');
+    }
     schedulePaint();
+  }
+
+  // HOLD «язык не определён» показывается, когда бара плеера на экране нет,
+  // поэтому нажать 文A физически некуда. OK на пульте — тот же выключатель:
+  // при langWaitForId isTranslateOn() уже false, значит toggleTranslate()
+  // уйдёт в ветку «включить» и проставит forceTranslate. Перехватываем OK
+  // только пока висит именно это окно (kind=idle + sticky), иначе сломаем
+  // обычную паузу.
+  // Фокус на кнопке бара плеера (или в нашей панели): OK принадлежит ей.
+  // Раньше перехват HOLD съедал первое нажатие — с фокусом на «шестерёнке»
+  // прожимáлась кнопка перевода, а нужная кнопка срабатывала со второго раза.
+  // Важно: проверять именно интерактивный контрол, а не «что-то кроме body».
+  // Когда бар скрыт, фокус уезжает на YTLR-WATCH-DEFAULT — это не контрол, и
+  // OK там обязан форсировать перевод (иначе пропадёт весь смысл хоткея).
+  var FOCUS_CTRL = [
+    'ytlr-button', 'yt-button-container', 'button', '[role="button"]',
+    '[role="menuitem"]', '[role="checkbox"]', '[role="radio"]', 'a[href]',
+    'input', 'select', 'textarea',
+    'ytlr-player-actions-container', 'ytlr-menu-item', 'ytlr-playlist-item',
+    'ytlr-toggle-button', 'ytlr-icon-button', 'ytlr-compact-link'
+  ].join(',');
+
+  function focusOwnsKey() {
+    try {
+      var a = document.activeElement;
+      if (!a || a === document.body || a === document.documentElement) return false;
+      if (a.id === 'vot-status') return false;
+      if (!a.closest) return false;
+      if (a.closest('#vot-ui-root')) return false;
+      return !!a.closest(FOCUS_CTRL);
+    } catch (e) { return false; }
+  }
+
+  function holdPending() {
+    return !!(state.langWaitForId && state.langWaitForId === state.curId
+      && stSticky && stKind === 'idle' && !focusOwnsKey());
+  }
+  document.addEventListener('keydown', function (e) {
+    var kc = e.keyCode || e.which;
+    if (kc !== 13 && kc !== 23) return;
+    if (!holdPending()) return;
+    e.preventDefault();
+    if (e.stopPropagation) e.stopPropagation();
+    if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+    log('hotkey OK kc=' + kc + ' -> force translate');
+    toggleTranslate();
+  }, true);
+  // F4 (Android KEYCODE_F4 = 134, DOM keyCode = 115) — тот же выключатель
+  // для отладки с клавиатуры. На пульте его нет, поэтому основной путь — OK.
+  window.addEventListener('keydown', function (e) {
+    var kc = e.keyCode || e.which;
+    if (kc !== 115 && kc !== 134) return;
+    e.preventDefault();
+    if (e.stopPropagation) e.stopPropagation();
+    log('hotkey F4 kc=' + kc + ' -> toggle');
+    toggleTranslate();
+  }, true);
+
+  // Диагностика жалобы «в плеере не работают кнопки». Пишем первые 24 клавиши
+  // в capture-фазе (до клиента) и в bubble-фазе (после его обработчиков):
+  // если в bubble `prevented=1` — событие дошло и клиент его обработал сам,
+  // если bubble-строки вообще нет — клиент (или его оверлей) остановил поток.
+  var kdiag = 0;
+  function keyDiag() {
+    window.addEventListener('keydown', function (e) {
+      if (kdiag >= 24) return;
+      kdiag++;
+      var a = document.activeElement;
+      log('kdiag cap kc=' + e.keyCode + ' af=' + (a ? String(a.tagName || '?').slice(0, 20) : '-')
+        + (a && a.className ? ' cls=' + String(a.className).slice(0, 24) : ''));
+    }, true);
+    window.addEventListener('keydown', function (e) {
+      if (kdiag > 24) return;
+      log('kdiag bub kc=' + e.keyCode + ' prevented=' + (e.defaultPrevented ? 1 : 0)
+        + ' cancel=' + (e.cancelable ? 1 : 0));
+    }, false);
   }
 
   function setupUI() {
     if (!window.VOTUI || !VOTUI.on) return;
     VOTUI.init();
     votSliderKeys();
+    keyDiag();
     // Однократная миграция префов. В тестах skipLang сохранился как «en»,
     // из-за чего основной сценарий (англоязычный ролик) молча пропускался.
     // Перевод нужен «с иностранного на русский», поэтому исключён русский.
@@ -2658,14 +3298,1236 @@
       uiSet('prefs.v', 3);
       log('prefs migrated to v3: vol.translate=100 orig=0');
     }
-    VOTUI.on('menu.toggle', function () {
-      if (VOTUI.isOpen()) VOTUI.close(); else openTranslatePanel();
-    });
+    // v4: «мой язык» (prefLang). Раньше был только skipLang — переносим его
+    // значение, чтобы меню сразу показывало выбранный язык.
+    if (Number(uiPref('prefs.v', 1)) < 4) {
+      if (!uiPref('prefLang', '')) uiSet('prefLang', langBase(uiPref('skipLang', 'ru')));
+      uiSet('prefs.v', 4);
+      log('prefs migrated to v4: prefLang=' + prefLangCode());
+    }
     VOTUI.on('translate.toggle', function () { toggleTranslate(); });
     VOTUI.on('pref.vol.translate', applyVolume);
     VOTUI.on('pref.vol.original', applyVolume);
     log('ui ready v=' + String(VOTUI.version));
   }
+
+  // Пассивная диагностика штатной строки поиска и native popup. Никаких
+  // надписей, input.value, классов, URL, команд или содержимого запроса.
+  var sortProbeLines = 0, sortProbeSeen = {};
+  function sortProbeLog(code) {
+    if (sortProbeLines >= 16 || sortProbeSeen[code]) return;
+    sortProbeSeen[code] = true;
+    sortProbeLines++;
+    log('sortProbe ' + code);
+  }
+  function sortProbeRow() {
+    if (!document.querySelectorAll) return null;
+    try {
+      var rows = document.querySelectorAll('yt-focus-container');
+      for (var i = 0; i < rows.length; i++) {
+        var row = rows[i], ch = row.children;
+        if (ch.length !== 3) continue;
+        var rects = [], valid = true;
+        for (var j = 0; j < 3; j++) {
+          // Старый kbdDescribe обрезал tagName до 18 символов: «...-CO» —
+          // префикс имени обёртки, а не полный тег.
+          if (String(ch[j].tagName).toUpperCase().indexOf('YT-KEYBOARD-KEY-CO') !== 0 ||
+              !ch[j].querySelector('yt-keyboard-key[role="button"]')) { valid = false; break; }
+          rects.push(ch[j].getBoundingClientRect());
+        }
+        if (!valid) continue;
+        sortProbeLog('row-shape=3'); // три родные кнопки, без чтения надписей
+        var w = window.innerWidth ||
+          (document.documentElement && document.documentElement.clientWidth) || 1920;
+        if (!rects[0].width || !rects[1].width || !rects[2].width ||
+            rects[0].right > rects[1].left + 3 ||
+            rects[1].right > rects[2].left + 3 ||
+            rects[1].left - rects[0].right > w * 0.15 ||
+            rects[2].left - rects[1].right > w * 0.15 ||
+            Math.max(rects[0].top, rects[1].top, rects[2].top) -
+              Math.min(rects[0].top, rects[1].top, rects[2].top) > 12) {
+          sortProbeLog('row-shape-rejected');
+          continue;
+        }
+        return row; // три кнопки одного ряда, без viewport-зон и текста
+      }
+    } catch (e) { }
+    return null;
+  }
+  function sortProbeFocus(row) {
+    var last = row.children[2], key = last.querySelector('yt-keyboard-key');
+    var active = document.activeElement, focus = 'other';
+    if (active === key || key && key.contains(active)) focus = 'key';
+    else if (active === last || last.contains(active)) focus = 'wrapper';
+    else if (active === row || row.contains(active)) focus = 'row';
+    var attr = key && (key.hasAttribute('aria-selected') ? 1 : 0) +
+      (key.hasAttribute('data-focused') ? 2 : 0);
+    return 'focus=' + focus + ' mark=' + (attr || 0);
+  }
+  function sortProbePopup(cmd, method) {
+    if (!cmd || !cmd.openPopupAction || cmd.__votOwn || !sortProbeRow()) return;
+    try {
+      var oa = cmd.openPopupAction, uid = String(oa.uniqueId || '');
+      var kind = uid === 'playback-settings' ? 'playback' :
+        /search|sort|filter/i.test(uid) ? 'searchish' : 'other';
+      var pop = oa.popup, sec = pop && pop.overlaySectionRenderer;
+      var ov = sec && sec.overlay, tp = ov && ov.overlayTwoPanelRenderer;
+      var ap = tp && tp.actionPanel, pan = ap && ap.overlayPanelRenderer;
+      var ct = pan && pan.content, lst = ct && ct.overlayPanelItemListRenderer;
+      var items = lst && lst.items;
+      sortProbeLog('popup method=' + method + ' kind=' + kind +
+        ' list=' + (Array.isArray(items) ? 1 : 0) +
+        ' n=' + (Array.isArray(items) ? Math.min(99, items.length) : 0));
+    } catch (e) { sortProbeLog('popup unavailable'); }
+  }
+  function setupSearchSortProbe() {
+    sortProbeLog('v=3'); // версия JS; подтверждение обновления bundle на ТВ
+    var tries = 0, timer = setInterval(function () {
+      var row = sortProbeRow();
+      if (row) {
+        var last = row.children[2], key = last.querySelector('yt-keyboard-key');
+        sortProbeLog('row=3 ' + sortProbeFocus(row) +
+          ' renderer=' + (key && 'renderer' in key ? 1 : 0) +
+          ' command=' + (key && 'command' in key ? 1 : 0) +
+          ' data=' + (key && 'data' in key ? 1 : 0));
+      }
+      if (++tries >= 600) clearInterval(timer);
+    }, 2000);
+    document.addEventListener('keydown', function (e) {
+      if (e.keyCode !== 39) return;
+      var row = sortProbeRow();
+      if (!row) return;
+      sortProbeLog('right before ' + sortProbeFocus(row));
+      setTimeout(function () {
+        var after = sortProbeRow();
+        if (after) sortProbeLog('right after ' + sortProbeFocus(after));
+      }, 0);
+      // Ничего не предотвращаем: штатная навигация остаётся без изменений.
+    }, true);
+  }
+
+  // ---- Фильтры поиска ------------------------------------------------------
+  // Вложенная панель справа от клавиатуры: корень (4 группы + «Сброс») и
+  // подменю значений (Left — назад). Панель живёт только вместе с видимой
+  // клавиатурой и уезжает вместе с ней. Выдачу не трогаем: params запроса
+  // правит сетевой слой (vot_net.js). Значения в префах VOTUI, сброс — вручную.
+  function setupSearchFilters() {
+    if (!window.VOTUI || !document.querySelectorAll || !document.body) return;
+    var GROUPS = [
+      { key: 'search.sort', title: 'Сортировка',
+        items: ['По релевантности', 'По дате загрузки', 'По просмотрам', 'По рейтингу'] },
+      { key: 'search.date', title: 'Дата загрузки',
+        items: ['Любая', 'За час', 'Сегодня', 'За неделю', 'За месяц', 'За год'] },
+      { key: 'search.type', title: 'Тип',
+        items: ['Все', 'Видео', 'Каналы', 'Плейлисты', 'Фильмы'] },
+      { key: 'search.duration', title: 'Длительность',
+        items: ['Любая', 'Короткие', 'Длинные'] }
+    ];
+    var panel = null, pageRoot = null, pageSub = null, rows = [], items = [];
+    var searchKey = null, lastLayout = '', lastDiag = '', statusHidden = false;
+    var openGroup = -1, rerunAt = 0, hideTimer = 0;
+    // Панель видна только вместе с клавиатурой; resultEl — карточка выдачи,
+    // на которую уходим по Down с «Сброса».
+    var resultEl = null;
+    var suppressUntil = 0, chainDone = false, kbGoneSince = 0, lastKb = null;
+    var lastNavLog = 0;
+    // После ухода из панели в выдачу окно не показываем, пока фокус не вернётся
+    // в клавиатуру или поле поиска.
+    var awayToResults = false;
+    var kbSeen = false;
+    var enterFrom = null;
+    // Быстрый сторож клавиатуры: окно стартует свою анимацию в том кадре, в
+    // котором прозрачность клавиатуры ушла от 1 (гаснет) или от 0 (появляется),
+    // а не на ближайшем такте скана (100 мс) — иначе окно отстаёт.
+    var ancBox = null, kbOpPrev = 1, kbLeaving = false;
+    // Белый маркер фокуса клавиши рисуется отдельным элементом/состоянием
+    // приложения; пока фокус в окне, прячем его и возвращаем на Left.
+    var ringEls = [], ringLogged = false;
+    // Пока true — не перехватываем Down с нижнего ряда, чтобы снять нативное
+    // поведение. Диагностический режим, затем снимается.
+    // Нативное поведение снято (Down с клавиатуры → ytlr-playback-preview,
+    // клавиатура гаснет opacity .3s) — перехват включён.
+    var NATIVE_PROBE = false;
+
+    function diag(code) {
+      if (lastDiag === code) return;
+      lastDiag = code;
+      log('searchFilters ' + code);
+    }
+    function style(el, values) {
+      for (var key in values) if (Object.prototype.hasOwnProperty.call(values, key))
+        el.style[key] = values[key];
+    }
+    function visible(el) {
+      if (!el.getClientRects || !el.getClientRects().length) return false;
+      var st = window.getComputedStyle && window.getComputedStyle(el);
+      if (st && (st.visibility === 'hidden' || st.display === 'none' ||
+          Number(st.opacity) === 0)) return false;
+      for (var p = el; p && p !== document.body; p = p.parentElement)
+        if (p.getAttribute && p.getAttribute('aria-hidden') === 'true') return false;
+      return true;
+    }
+    // Эффективная видимость с учётом предков: клавиатура гаснет прозрачностью
+    // у дальнего контейнера, поэтому идём до корня документа, а не на 7 уровней.
+    function effVis(el) {
+      var o = 1, p = el, i = 0;
+      visZeroAt = -1;
+      for (; p && p !== document.documentElement && i < 80; i++) {
+        var st = window.getComputedStyle && window.getComputedStyle(p);
+        if (st) {
+          if (st.display === 'none' || st.visibility === 'hidden' ||
+              st.visibility === 'collapse') { visZeroAt = i; return 0; }
+          var a = parseFloat(st.opacity);
+          if (!isNaN(a) && a < 1) {
+            o *= a;
+            if (o <= 0.04) { visZeroAt = i; return 0; }
+          }
+        }
+        p = p.parentElement;
+      }
+      return o;
+    }
+    // Доля площади элемента, не срезанная предками с overflow != visible.
+    // Клавиатура «уезжает» именно так: контейнер схлопывает высоту с обрезкой.
+    function clipRatio(el) {
+      var r0 = el.getBoundingClientRect();
+      var area0 = r0.width * r0.height;
+      if (!area0) return 0;
+      var t = r0.top, b = r0.bottom, l = r0.left, r = r0.right;
+      for (var p = el.parentElement; p && p !== document.body; p = p.parentElement) {
+        var st = window.getComputedStyle && window.getComputedStyle(p);
+        if (!st) continue;
+        var ox = st.overflowX || st.overflow, oy = st.overflowY || st.overflow;
+        if ((!ox || ox === 'visible') && (!oy || oy === 'visible')) continue;
+        var pr = p.getBoundingClientRect();
+        t = Math.max(t, pr.top); b = Math.min(b, pr.bottom);
+        l = Math.max(l, pr.left); r = Math.min(r, pr.right);
+      }
+      if (b <= t || r <= l) return 0;
+      return ((b - t) * (r - l)) / area0;
+    }
+    // Клавиша действительно отрисована сверху: в скрытом состоянии клавиатура
+    // остаётся непрозрачной в DOM, но лежит ЗА страницей поиска.
+    function keyPainted(key, kr) {
+      var hit = null;
+      try {
+        hit = document.elementFromPoint(Math.round(kr.left + kr.width * .5),
+          Math.round(kr.top + kr.height * .5));
+      } catch (e) { return true; }
+      if (!hit) return false;
+      if (hit === key || key.contains(hit)) return true;
+      var wrap = key.parentElement;
+      return !!(wrap && wrap.contains(hit));
+    }
+    // Клавиатура реально на экране: размеры, координаты, прозрачность, обрезка,
+    // и клавиша должна быть верхним элементом в своей точке.
+    function keyboardVisible(key, kr, vw, vh) {
+      if (!key || !kr) return false;
+      if (!(kr.width > 0 && kr.height > 0)) return false;
+      if (!(kr.bottom > 4 && kr.top < vh - 4 && kr.right > 4 && kr.left < vw - 4)) return false;
+      if (key.checkVisibility) {
+        try {
+          if (!key.checkVisibility({ opacityProperty: true, visibilityProperty: true,
+              contentVisibilityAuto: true })) return false;
+        } catch (e) { }
+      }
+      if (effVis(key) <= 0.04) return false;
+      if (clipRatio(key) <= 0.45) return false;
+      return keyPainted(key, kr);
+    }
+    // Диагностика клавиатуры: почему считаем её видимой или скрытой.
+    var probeAt = 0, lastProbe = '', visZeroAt = -1;
+    function kbProbe(key, kr) {
+      if (Date.now() - probeAt < 700) return;
+      probeAt = Date.now();
+      var hit = null;
+      try {
+        hit = document.elementFromPoint(Math.round(kr.left + kr.width * .5),
+          Math.round(kr.top + kr.height * .5));
+      } catch (e) { }
+      var v = effVis(key);
+      var line = 'kbprobe r=' + Math.round(kr.top) + ',' + Math.round(kr.left) + ',' +
+        Math.round(kr.width) + 'x' + Math.round(kr.height) +
+        ' vis=' + v.toFixed(2) + ' zz=' + visZeroAt +
+        ' clip=' + clipRatio(key).toFixed(2) +
+        ' hit=' + (hit ? String(hit.tagName || '').toLowerCase() : 'none') +
+        ' inKey=' + (hit && (hit === key || key.contains(hit)) ? 1 : 0) +
+        ' rows=' + document.querySelectorAll('yt-focus-container').length;
+      if (hit && !(hit === key || key.contains(hit))) {
+        var hr = hit.getBoundingClientRect();
+        line += ' hcls=' + String(hit.className || hit.getAttribute('data-vot-search-filters') ||
+          '').slice(0, 40) + '@' + Math.round(hr.top) + ',' + Math.round(hr.height);
+      }
+      if (line === lastProbe) return;
+      lastProbe = line;
+      log(line);
+    }
+    // Правый край клавиатуры, включая «&123»: панель встаёт только правее.
+    function keyboardRight() {
+      var keys = document.querySelectorAll('yt-keyboard-key'), max = 0;
+      for (var i = 0; i < keys.length; i++) {
+        if (!visible(keys[i])) continue;
+        var r = keys[i].getBoundingClientRect();
+        if (r.right > max) max = r.right;
+      }
+      return Math.round(max);
+    }
+    // Текст запроса нужен только чтобы понять, есть ли что искать; не логируем.
+    function queryText() {
+      var inputs = document.querySelectorAll('input');
+      for (var i = 0; i < inputs.length; i++) {
+        var v = inputs[i].value;
+        if (typeof v === 'string' && v.length) return v;
+      }
+      return '';
+    }
+    function selected(gi) {
+      if (gi < 0 || gi >= GROUPS.length) return 0;
+      var n = Number(uiPref(GROUPS[gi].key, 0)), max = GROUPS[gi].items.length - 1;
+      return n >= 0 && n <= max && Math.floor(n) === n ? n : 0;
+    }
+    function page() {
+      var el = document.createElement('div');
+      style(el, { position: 'absolute', left: '0', top: '0', width: '100%',
+        height: '100%', boxSizing: 'border-box', padding: '12px',
+        background: '#212121',
+        transition: 'transform .2s cubic-bezier(.2,0,0,1), opacity .2s ease' });
+      return el;
+    }
+    function makeRow(text) {
+      var row = document.createElement('button');
+      row.type = 'button';
+      row.tabIndex = -1;
+      style(row, { display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        width: '100%', padding: '0 22px', margin: '0 0 6px 0', boxSizing: 'border-box',
+        border: '0', borderRadius: '12px', outline: 'none', textAlign: 'left',
+        fontFamily: 'inherit', fontWeight: '500', fontSize: '24px', cursor: 'pointer',
+        background: '#272727', color: '#f1f1f1' });
+      var label = document.createElement('span');
+      label.textContent = text;
+      style(label, { overflow: 'hidden', textOverflow: 'ellipsis',
+        whiteSpace: 'nowrap' });
+      var tail = document.createElement('span');
+      style(tail, { marginLeft: '18px', fontWeight: '400', fontSize: '20px',
+        color: '#aaa', whiteSpace: 'nowrap' });
+      row.appendChild(label);
+      row.appendChild(tail);
+      row.votLabel = label;
+      row.votTail = tail;
+      return row;
+    }
+    function paint() {
+      var act = document.activeElement;
+      for (var i = 0; i < rows.length; i++) {
+        var row = rows[i], on = row === act;
+        row.style.background = on ? '#f1f1f1' : '#272727';
+        row.style.color = on ? '#0f0f0f' : '#f1f1f1';
+        row.style.boxShadow = on ? '0 0 0 3px #fff' : 'none';
+        if (row.votTail) {
+          row.votTail.style.color = on ? '#0f0f0f' : '#aaa';
+          if (i < GROUPS.length)
+            row.votTail.textContent = GROUPS[i].items[selected(i)];
+        }
+      }
+      for (var j = 0; j < items.length; j++) {
+        var it = items[j], on2 = it === act;
+        it.style.background = on2 ? '#f1f1f1' : '#272727';
+        it.style.color = on2 ? '#0f0f0f' : '#f1f1f1';
+        it.style.boxShadow = on2 ? '0 0 0 3px #fff' : 'none';
+        if (it.votTail) {
+          it.votTail.textContent = j === selected(openGroup) ? '✓' : '';
+          it.votTail.style.color = on2 ? '#0f0f0f' : '#3ea6ff';
+        }
+      }
+    }
+    function head(text) {
+      var el = document.createElement('div');
+      el.textContent = text;
+      style(el, { height: '42px', lineHeight: '40px', fontSize: '22px',
+        fontWeight: '600', color: '#aaa', paddingLeft: '8px', marginBottom: '4px',
+        boxSizing: 'border-box', whiteSpace: 'nowrap', overflow: 'hidden' });
+      return el;
+    }
+    function buildRoot() {
+      pageRoot.textContent = '';
+      rows = [];
+      pageRoot.appendChild(head('Фильтры'));
+      for (var i = 0; i < GROUPS.length; i++) {
+        var row = makeRow(GROUPS[i].title);
+        row.setAttribute('data-vot-filter', GROUPS[i].key);
+        row.addEventListener('focus', paint);
+        row.addEventListener('blur', paint);
+        row.addEventListener('click', (function (n) {
+          return function () { openSub(n); };
+        })(i));
+        pageRoot.appendChild(row);
+        rows.push(row);
+      }
+      var reset = makeRow('Сброс');
+      reset.setAttribute('data-vot-reset', '');
+      reset.addEventListener('focus', paint);
+      reset.addEventListener('blur', paint);
+      reset.addEventListener('click', resetAll);
+      pageRoot.appendChild(reset);
+      rows.push(reset);
+    }
+    function buildSub(gi) {
+      pageSub.textContent = '';
+      items = [];
+      pageSub.appendChild(head(GROUPS[gi].title));
+      var list = GROUPS[gi].items;
+      for (var i = 0; i < list.length; i++) {
+        var row = makeRow(list[i]);
+        row.setAttribute('data-vot-value', String(i));
+        row.addEventListener('focus', paint);
+        row.addEventListener('blur', paint);
+        row.addEventListener('click', (function (n) {
+          return function () { pick(n); };
+        })(i));
+        pageSub.appendChild(row);
+        items.push(row);
+      }
+      applySizes();
+      paint();
+    }
+    // Высота строк считается от фактической высоты панели (границы задания).
+    function applySizes() {
+      if (!panel) return;
+      var h = parseInt(panel.style.height, 10) || 380;
+      var gap = 8, avail = h - 24 - 46;
+      var n = rows.length || 1;
+      var rh = Math.floor((avail - gap * (n - 1)) / n);
+      if (rh > 104) rh = 104;
+      if (rh < 34) rh = 34;
+      var font = Math.max(22, Math.min(42, Math.round(rh * .46)));
+      for (var i = 0; i < rows.length; i++)
+        style(rows[i], { height: rh + 'px', fontSize: font + 'px' });
+      var n2 = items.length;
+      var rh2 = n2 ? Math.floor((avail - gap * (n2 - 1)) / n2) : rh;
+      if (rh2 > 104) rh2 = 104;
+      if (rh2 < 34) rh2 = 34;
+      var font2 = Math.max(22, Math.min(44, Math.round(rh2 * .46)));
+      for (var j = 0; j < n2; j++)
+        style(items[j], { height: rh2 + 'px', fontSize: font2 + 'px' });
+    }
+    function openSub(gi) {
+      if (!panel || gi < 0 || gi >= GROUPS.length) return;
+      openGroup = gi;
+      buildSub(gi);
+      pageSub.style.transform = 'translateX(100%)';
+      pageSub.style.opacity = '0';
+      pageRoot.style.transform = 'translateX(-30%)';
+      pageRoot.style.opacity = '0';
+      if (pageSub.offsetWidth >= 0) { /* принудительный reflow для анимации */ }
+      pageSub.style.transform = 'none';
+      pageSub.style.opacity = '1';
+      var sel = selected(gi);
+      if (items[sel]) items[sel].focus();
+      paint();
+      diag('sub');
+    }
+    function closeSub() {
+      if (openGroup < 0) return;
+      var gi = openGroup;
+      openGroup = -1;
+      pageRoot.style.transform = 'none';
+      pageRoot.style.opacity = '1';
+      pageSub.style.transform = 'translateX(100%)';
+      pageSub.style.opacity = '0';
+      if (rows[gi]) rows[gi].focus();
+      paint();
+      diag('root');
+    }
+    function pick(i) {
+      if (openGroup < 0 || i < 0 || i >= GROUPS[openGroup].items.length) return;
+      uiSet(GROUPS[openGroup].key, i);
+      log('searchFilters pick group=' + openGroup + ' value=' + i);
+      paint();
+      rerun();
+    }
+    function resetAll() {
+      for (var i = 0; i < GROUPS.length; i++) uiSet(GROUPS[i].key, 0);
+      log('searchFilters reset');
+      paint();
+      rerun();
+    }
+    function fireKey(el, type, code, keyName) {
+      var ev = null;
+      var kn = keyName || 'Enter';
+      try {
+        ev = new KeyboardEvent(type, { key: kn, code: kn, keyCode: code,
+          which: code, bubbles: true, cancelable: true });
+      } catch (e) {
+        try {
+          ev = document.createEvent('KeyboardEvent');
+          ev.initKeyboardEvent(type, true, true, window, kn, 0, '', false, '');
+          try {
+            Object.defineProperty(ev, 'keyCode', { get: function () { return code; } });
+          } catch (e2) { }
+        } catch (e3) { ev = null; }
+      }
+      if (!ev) return;
+      try { el.dispatchEvent(ev); } catch (e4) { }
+    }
+    // Отметка фильтра сразу повторяет текущий поиск (если запрос уже набран).
+    function rerun() {
+      if (!queryText()) { log('searchFilters refresh=noquery'); return; }
+      if (Date.now() - rerunAt < 800) return;
+      rerunAt = Date.now();
+      var key = searchKey && document.body.contains(searchKey) ? searchKey : null;
+      log('searchFilters refresh=go key=' + (key ? 1 : 0));
+      if (!key) return;
+      // Enter должен уйти штатному обработчику клавиши поиска.
+      try { key.focus(); } catch (e) { }
+      fireKey(key, 'keydown', 13);
+      setTimeout(function () { fireKey(key, 'keyup', 13); }, 40);
+    }
+    function backToSearch() {
+      closeSub();
+      clearRing();
+      // Left из окна возвращает фокус туда, откуда в него вошли (⌫, &123, 🌐,
+      // «ПОИСК»), иначе — на клавишу «ПОИСК».
+      var back = enterFrom && document.body.contains(enterFrom) ? enterFrom : searchKey;
+      if (!back || !document.body.contains(back)) back = document.querySelector('input');
+      if (back && back.focus) back.focus();
+      paint();
+      diag('blur to=' + tagOf(back));
+    }
+    // Анимацию скрытия окна берём у самой клавиатуры: длительность и кривую
+    // читаем из computed style `ytlr-search-keyboard`, а не задаём константой.
+    var kbAnim = '';
+    function kbTransition(box) {
+      if (!box) return '';
+      var st = window.getComputedStyle && window.getComputedStyle(box);
+      if (!st) return '';
+      var dur = st.transitionDuration || '';
+      var tf = st.transitionTimingFunction || '';
+      if (!dur || dur === '0s' || dur === '0') dur = '0.3s';
+      if (!tf || tf === 'ease') tf = 'cubic-bezier(0.26, 0.86, 0.44, 0.985)';
+      return 'opacity ' + dur + ' ' + tf;
+    }
+    // Длительность этого перехода в миллисекундах — чтобы снять окно ровно
+    // тогда, когда клавиатура закончила гаснуть.
+    function kbAnimMs() {
+      var m = /opacity\s+([\d.]+)(m?s)/.exec(kbAnim || '');
+      if (!m) return 300;
+      var v = parseFloat(m[1]);
+      return m[2] === 's' ? Math.round(v * 1000) : Math.round(v);
+    }
+    // Прозрачность контейнера клавиатуры напрямую: клавиатура гаснет и
+    // появляется именно ею, поэтому одного getComputedStyle за кадр хватает.
+    function kbOpNow(box) {
+      if (!box) return -1;
+      var st = window.getComputedStyle && window.getComputedStyle(box);
+      if (!st) return -1;
+      var a = parseFloat(st.opacity);
+      return isNaN(a) ? 1 : a;
+    }
+    // Сторож клавиатуры, один дешёвый замер за кадр. Гасим окно в том же кадре,
+    // когда клавиатура начала гаснуть, и монтируем, как только она начала
+    // проявляться, — окно и клавиатура анимируются синхронно.
+    function fastWatch() {
+      requestAnimationFrame(fastWatch);
+      if (!ancBox || !document.body.contains(ancBox)) { kbOpPrev = 1; return; }
+      var op = kbOpNow(ancBox);
+      if (op < 0) return;
+      if (op >= 0.98 || op <= 0.02) kbLeaving = false;
+      else if (kbOpPrev >= 0.98) {
+        kbLeaving = true;
+        if (panel) { hide(); diag('sync drop'); }
+      }
+      if (!panel && !kbLeaving && op > 0.02 && kbOpPrev <= 0.02) scan();
+      kbOpPrev = op;
+    }
+    function mount() {
+      if (panel) return;
+      try {
+        panel = document.createElement('div');
+        panel.setAttribute('data-vot-search-filters', '');
+        panel.setAttribute('role', 'group');
+        panel.setAttribute('aria-label', 'Фильтры поиска');
+        style(panel, { position: 'fixed', zIndex: '2147483000',
+          boxSizing: 'border-box', overflow: 'hidden', borderRadius: '16px',
+          background: '#212121', boxShadow: '0 8px 28px rgba(0,0,0,.55)',
+          fontFamily: 'Roboto, Arial, sans-serif', color: '#f1f1f1',
+          opacity: '0',
+          transition: kbAnim || 'opacity 0.3s cubic-bezier(0.26, 0.86, 0.44, 0.985)' });
+        pageRoot = page();
+        pageSub = page();
+        pageSub.style.transform = 'translateX(100%)';
+        pageSub.style.opacity = '0';
+        panel.appendChild(pageRoot);
+        panel.appendChild(pageSub);
+        document.body.appendChild(panel);
+        buildRoot();
+        applySizes();
+        paint();
+        // Кадр с opacity 0 обязан быть посчитан, иначе перехода не будет; но
+        // ждать таймер незачем — фиксируем значение чтением layout и сразу
+        // включаем opacity, чтобы окно проявлялось вместе с клавиатурой.
+        panel.getBoundingClientRect();
+        panel.style.opacity = '1';
+      } catch (e) {
+        if (panel && panel.parentNode) panel.parentNode.removeChild(panel);
+        panel = null; rows = []; items = [];
+        diag('mount-fail');
+      }
+    }
+    // Клавиатура лежит ниже выдачи: карточки наезжают на неё, когда уходишь
+    // вниз. Ставим окно в тот же слой — сразу за клавиатурой, — чтобы карточки
+    // наезжали и на окно, а не под ним. Если слой клавиатуры искажает позицию
+    // (transform предка) или окно в нём перекрыто, возвращаемся в body.
+    var layerBad = false, layerDone = false;
+    function placeByKeyboard(kbEl, left, top, width) {
+      if (!panel || layerBad || !kbEl) return;
+      var host = kbEl.parentNode;
+      if (!host || host === document.body) { layerBad = true; return; }
+      if (layerDone) {
+        if (panel.parentNode !== host) {
+          try { host.insertBefore(panel, kbEl.nextSibling); } catch (e) { layerBad = true; }
+        }
+        return;
+      }
+      layerDone = true;
+      var bad = false;
+      if (panel.parentNode !== host) {
+        try { host.insertBefore(panel, kbEl.nextSibling); } catch (e2) { bad = true; }
+      }
+      var r = bad ? null : panel.getBoundingClientRect();
+      if (!r || Math.abs(r.left - left) > 2 || Math.abs(r.top - top) > 2) bad = true;
+      if (!bad) {
+        var hit = null;
+        try { hit = document.elementFromPoint(Math.round(left + width / 2), Math.round(top + 20)); } catch (e3) { }
+        if (!hit || !(hit === panel || panel.contains(hit))) bad = true;
+      }
+      if (bad) {
+        layerBad = true;
+        try { document.body.appendChild(panel); } catch (e4) { }
+      }
+      log('searchFilters layer=' + (bad ? 'body' : 'kb'));
+    }
+    // Плашку «Перевод: ожидание видео…» на экране поиска не показываем.
+    function hideStatus() {
+      var el = document.getElementById('vot-status');
+      if (!el) return;
+      el.style.setProperty('display', 'none', 'important');
+      statusHidden = true;
+    }
+    function showStatus() {
+      if (!statusHidden) return;
+      statusHidden = false;
+      var el = document.getElementById('vot-status');
+      if (el) el.style.removeProperty('display');
+    }
+    function hide(silent) {
+      if (!silent) diag('hidden');
+      showStatus();
+      clearRing();
+      if (!panel) return;
+      var p = panel;
+      panel = null; rows = []; items = []; pageRoot = null; pageSub = null;
+      openGroup = -1; searchKey = null; lastLayout = '';
+      p.style.opacity = '0';
+      clearTimeout(hideTimer);
+      // Снимаем окно ровно тогда, когда клавиатура закончила гаснуть.
+      hideTimer = setTimeout(function () {
+        if (p.parentNode) p.parentNode.removeChild(p);
+      }, kbAnimMs() + 20);
+    }
+    function fromSearch(active) {
+      if (!active) return false;
+      if (searchKey && (active === searchKey || searchKey.contains(active))) return true;
+      var tag = String(active.tagName || '').toUpperCase();
+      if (tag === 'INPUT' || tag === 'TEXTAREA') return true;
+      try {
+        if (active.closest && active.closest('ytlr-search-box, [role="combobox"]')) return true;
+      } catch (e) { }
+      return false;
+    }
+    // Поле ввода запроса: пилюля с фоном вокруг скрытого input или текста.
+    function bgAlpha(el) {
+      var st = window.getComputedStyle && window.getComputedStyle(el);
+      if (!st) return 0;
+      var m = /rgba?\(([^)]+)\)/.exec(st.backgroundColor || '');
+      if (!m) return 0;
+      var parts = m[1].split(',');
+      return parts.length > 3 ? parseFloat(parts[3]) : 1;
+    }
+    function hasBg(el) {
+      var st = window.getComputedStyle && window.getComputedStyle(el);
+      if (!st) return false;
+      var bi = st.backgroundImage;
+      if (bi && bi !== 'none') return true;
+      return bgAlpha(el) >= 0.25;
+    }
+    function pillBox(el) {
+      for (var p = el; p && p !== document.body; p = p.parentElement) {
+        var r = p.getBoundingClientRect();
+        if (r.height < 40 || r.height > 140) continue;
+        if (r.width < 400) continue;
+        if (r.top < 0 || r.bottom > window.innerHeight * .5) continue;
+        if (!hasBg(p)) continue;
+        return r;
+      }
+      return null;
+    }
+    // Поле ввода запроса: пилюля вокруг скрытого input или текста запроса.
+    // Основной путь — точка в левой части пилюли (поле всегда в этом месте).
+    function searchPillRect() {
+      var w = window.innerWidth, h = window.innerHeight;
+      var el = null;
+      try {
+        el = document.elementFromPoint(Math.round(w * .156), Math.round(h * .091));
+      } catch (e) { }
+      if (el && (panel ? !panel.contains(el) : true)) {
+        for (var p = el; p && p !== document.body; p = p.parentElement) {
+          var r = p.getBoundingClientRect();
+          if (r.height < 40 || r.height > 140) continue;
+          if (r.width < 400) continue;
+          if (r.top < 0 || r.bottom > h * .5) continue;
+          return r;
+        }
+      }
+      var best = null, bestTop = 1e9;
+      var ins = document.querySelectorAll('input, textarea, [contenteditable="true"]');
+      for (var i = 0; i < ins.length; i++) {
+        var r0 = ins[i].getBoundingClientRect();
+        if (r0.top < bestTop) { bestTop = r0.top; best = ins[i]; }
+      }
+      var box = best ? pillBox(best) : null;
+      if (box) return box;
+      var q = queryText();
+      if (!q) return null;
+      var list = document.querySelectorAll('div, span, yt-formatted-string');
+      var leaf = null;
+      bestTop = 1e9;
+      for (var j = 0; j < list.length; j++) {
+        var n = list[j];
+        if (n.children.length) continue;
+        if ((n.textContent || '').trim() !== q) continue;
+        if (!visible(n)) continue;
+        var r2 = n.getBoundingClientRect();
+        if (!r2.width || !r2.height) continue;
+        if (r2.top < bestTop) { bestTop = r2.top; leaf = n; }
+      }
+      return leaf ? pillBox(leaf) : null;
+    }
+    // Диагностика: цепочка предков input/textarea, если пилюлю найти не удалось.
+    function chainLog() {
+      var ins = document.querySelectorAll('input, textarea, [contenteditable="true"]');
+      var out = '';
+      for (var i = 0; i < ins.length && i < 3; i++) {
+        var p = ins[i];
+        for (var d = 0; d < 3 && p && p !== document.body; d++) {
+          var r = p.getBoundingClientRect();
+          out += (d ? '>' : '') + String(p.tagName || '').toLowerCase() +
+            '(' + Math.round(r.top) + ',' + Math.round(r.height) + ')';
+          p = p.parentElement;
+        }
+        out += ' ';
+      }
+      log('searchFilters chain=' + (out || 'x'));
+    }
+    // Диагностика состояния: какие страницы в корне поиска и видны ли они.
+    var skelDone = {};
+    function skeleton(tag) {
+      var root = document.querySelector('ytlr-classic-search-page') || document.body;
+      var out = '', kids = root.children;
+      for (var i = 0; i < kids.length && i < 6; i++) {
+        var k = kids[i];
+        var r = k.getBoundingClientRect();
+        out += String(k.tagName || '').toLowerCase() + '[' + Math.round(r.top) + ',' +
+          Math.round(r.height) + ',' + effVis(k).toFixed(2) + '] ';
+      }
+      log('skel ' + tag + ' ' + (out || 'x'));
+    }
+    // Клавиатуру определяем по её родному контейнеру ytlr-search-keyboard:
+    // нативно она скрывается ровно его прозрачностью (opacity .3s), поэтому
+    // прозрачность контейнера — единственный достоверный признак «клавиатура на
+    // экране». Копий в DOM может быть несколько, берём непрозрачную на экране.
+    function keyboardAnchor(vw, vh) {
+      var boxes = null;
+      try { boxes = document.querySelectorAll('ytlr-search-keyboard'); } catch (e) { }
+      var res = { key: null, kr: null, sample: null, box: null, n: boxes ? boxes.length : 0 };
+      if (!boxes) return res;
+      for (var b = 0; b < boxes.length; b++) {
+        var box = boxes[b];
+        // Порог 0.02: как только клавиатура начала проявляться, окно должно
+        // стартовать вместе с ней, а не после её полного появления.
+        if (effVis(box) <= 0.02) continue;
+        var br = box.getBoundingClientRect();
+        if (!br.width || !br.height) continue;
+        if (br.bottom <= 4 || br.top >= vh - 4) continue;
+        var rowsAll = box.querySelectorAll('yt-focus-container');
+        var bestTop = -1, bestRow = null;
+        for (var i = 0; i < rowsAll.length; i++) {
+          var row = rowsAll[i], ch = row.children;
+          if (ch.length !== 3) continue;
+          var ok = true, top = 0, prev = null;
+          for (var j = 0; j < 3; j++) {
+            if (!ch[j].querySelector('yt-keyboard-key[role="button"]')) { ok = false; break; }
+            var r = ch[j].getBoundingClientRect();
+            if (!r.width || !r.height || prev && (r.left < prev.left ||
+                Math.abs(r.top - prev.top) > 24)) { ok = false; break; }
+            prev = r; top = r.top;
+          }
+          if (ok && top > bestTop) { bestTop = top; bestRow = row; }
+        }
+        if (!bestRow) continue;
+        var k = bestRow.children[2].querySelector('yt-keyboard-key[role="button"]');
+        var kr = k ? k.getBoundingClientRect() : null;
+        if (!kr) continue;
+        if (!res.sample) res.sample = { key: k, kr: kr, box: box };
+        if (!res.key) { res.key = k; res.kr = kr; res.box = box; }
+      }
+      return res;
+    }
+    // Как нативно скрывается клавиатура: чем анимируются клавиша, ряд и контейнеры.
+    function kbHideTrace(sample) {
+      if (!sample || !sample.key) return;
+      var key = sample.key;
+      var dump = function (tag) {
+        var row = null;
+        try { row = key.closest ? key.closest('yt-focus-container') : null; } catch (e) { }
+        log('kbhide ' + tag + ' key: ' + animOf(key) +
+          ' row: ' + (row ? animChain(row, 3) : 'x'));
+      };
+      dump('t0');
+      setTimeout(function () { dump('t250'); }, 250);
+    }
+    function scan() {
+      if (panel && !document.body.contains(panel)) {
+        panel = null; rows = []; items = []; pageRoot = null; pageSub = null;
+        openGroup = -1; searchKey = null; lastLayout = '';
+      }
+      // Окно фильтров видно только вместе с клавиатурой поиска. Клавиатура
+      // остаётся в DOM, поэтому смотрим координаты, прозрачность, обрезку и то,
+      // что клавиша реально верхняя в своей точке.
+      var vw = window.innerWidth, vh = window.innerHeight;
+      var anc = keyboardAnchor(vw, vh);
+      // Сторож работает по этому контейнеру; при смене копии клавиатуры
+      // сбрасываем прежнее значение прозрачности.
+      if (anc.box !== ancBox) {
+        ancBox = anc.box;
+        kbOpPrev = anc.box ? kbOpNow(anc.box) : 1;
+      }
+      var key = anc.key, kr = anc.kr, kb = !!(key && kr);
+      if (panel && anc.sample) kbProbe(anc.sample.key, anc.sample.kr);
+      if (kb !== lastKb) {
+        lastKb = kb;
+        if (!skelDone[kb ? 1 : 0]) { skelDone[kb ? 1 : 0] = true; skeleton(kb ? 'kb1' : 'kb0'); }
+        if (!kb) kbHideTrace(anc.sample);
+      }
+      if (!kb) {
+        // Гасим, как только клавиатура пропала: пока окно на экране, ждём
+        // считанные кадры, без окна — не суетимся.
+        if (kbGoneSince === 0) kbGoneSince = Date.now();
+        if (Date.now() - kbGoneSince >= (panel ? 32 : 120)) { kbSeen = false; hide(); return; }
+        return;
+      }
+      kbGoneSince = 0;
+      // Клавиатура уже начала гаснуть — окно гасим тем же тактом и тем же
+      // переходом. Направление берём у сторожа: пока клавиатура проявляется,
+      // окно должно проявляться вместе с ней, а не гаснуть.
+      var kbOp = anc.box ? effVis(anc.box) : 1;
+      if (kbLeaving) { if (panel) hide(); return; }
+      kbSeen = true;
+      // Длительность и кривая гашения окна — ровно как у клавиатуры.
+      var tr = kbTransition(anc.box);
+      if (tr && tr !== kbAnim) {
+        kbAnim = tr;
+        if (panel) panel.style.transition = tr;
+        log('searchFilters anim=' + tr + ' ms=' + kbAnimMs());
+      }
+      // Ушли из панели на выдачу — окно держим скрытым, пока фокус не вернётся
+      // в клавиатуру или в поле поиска.
+      if (awayToResults) {
+        var act = document.activeElement;
+        var backIn = act && (isKeyboardEl(act) || fromSearch(act) ||
+          (panel && panel.contains(act)));
+        if (!backIn) { hide(true); return; }
+        awayToResults = false;
+      }
+      // Пока идёт переход «Сброс» → первая карточка, панель не монтируем снова.
+      if (Date.now() < suppressUntil) { hide(true); return; }
+      hideStatus();
+      var w = window.innerWidth, h = window.innerHeight;
+      // Верх = верхняя граница поля ввода, низ = низ ряда клавиш «Поиск» и т.д.
+      var pill = searchPillRect();
+      var top = pill ? Math.round(pill.top) : Math.round(h * .143);
+      var bottom = Math.round(kr.bottom);
+      var left = Math.max(Math.round(w * .6875), Math.ceil(keyboardRight() + 24));
+      var width = Math.round(w - left - 12);
+      var height = bottom - top;
+      if (width < 300) { hide(true); diag('narrow'); return; }
+      if (height < 220) { hide(true); diag('low'); return; }
+      if (!panel) mount();
+      if (!panel) return;
+      searchKey = key;
+      var layout = left + ',' + top + ',' + width + ',' + height;
+      if (layout !== lastLayout) {
+        style(panel, { left: left + 'px', top: top + 'px',
+          width: width + 'px', height: height + 'px' });
+        lastLayout = layout;
+        applySizes();
+        paint();
+        log('searchFilters geo top=' + top + ' bot=' + bottom + ' left=' + left +
+          ' w=' + width + ' h=' + height + ' pill=' +
+          (pill ? Math.round(pill.top) + '-' + Math.round(pill.bottom) : 'x'));
+        if (!pill && !chainDone) { chainDone = true; chainLog(); }
+      }
+      placeByKeyboard(anc.box, left, top, width);
+      diag(openGroup >= 0 ? 'shown-sub' : 'shown');
+    }
+    // ---- переход из панели в выдачу -----------------------------------------
+    function isKeyboardEl(el) {
+      try {
+        if (el.closest && el.closest('yt-keyboard-key, yt-keyboard')) return true;
+      } catch (e) { }
+      return String(el.tagName || '').toUpperCase().indexOf('YT-KEYBOARD') === 0;
+    }
+    // Первая карточка выдачи (страховка, если фокус не удалось запомнить).
+    // Ищем именно карточку: контейнер виртуального списка тоже подходит под
+    // общие роли и перекрывает её по геометрии, поэтому набор сужен.
+    // Карточку ищем по геометрии и прозрачности, без visible(): выдача может
+    // лежать под aria-hidden слоем, пока открыта клавиатура.
+    function cardVis(el) {
+      var r = el.getBoundingClientRect();
+      if (!r.width || !r.height) return false;
+      if (r.bottom <= 0 || r.top >= window.innerHeight) return false;
+      if (r.width < 80 || r.height < 60) return false;
+      var st = window.getComputedStyle && window.getComputedStyle(el);
+      if (st && (st.display === 'none' || st.visibility === 'hidden')) return false;
+      return effVis(el) > 0.04;
+    }
+    function tagOf(el) {
+      if (!el) return 'none';
+      var s = String(el.tagName || '').toLowerCase();
+      try {
+        var ti = el.getAttribute && el.getAttribute('tabindex');
+        if (ti != null) s += '#' + ti;
+        var ro = el.getAttribute && el.getAttribute('role');
+        if (ro) s += '.' + ro;
+      } catch (e) { }
+      return s;
+    }
+    // Первая карточка выдачи по геометрии (левая верхняя на экране).
+    function pickCard(sel) {
+      var list = null;
+      try { list = document.querySelectorAll(sel); } catch (e) { return null; }
+      var best = null, bestTop = 1e9, bestLeft = 1e9;
+      for (var i = 0; i < list.length; i++) {
+        var el = list[i];
+        if (panel && panel.contains(el)) continue;
+        if (isKeyboardEl(el) || fromSearch(el)) continue;
+        if (!cardVis(el)) continue;
+        var r2 = el.getBoundingClientRect();
+        if (r2.top < bestTop - 1 || Math.abs(r2.top - bestTop) <= 1 && r2.left < bestLeft) {
+          best = el; bestTop = r2.top; bestLeft = r2.left;
+        }
+      }
+      return best;
+    }
+    // Нативно Down с клавиатуры уходит на ytlr-playback-preview[role=gridcell] —
+    // именно этот элемент приложение само ставит в фокус в выдаче.
+    function firstResultEl() {
+      return pickCard('ytlr-playback-preview') ||
+        pickCard('yt-lockup-view-model, ytlr-video-renderer, ytlr-grid-video-renderer, ' +
+          'ytlr-playlist-renderer, ytlr-channel-renderer');
+    }
+    // Фокус ставим напрямую на элемент карточки — так же, как делает приложение.
+    function focusCard(el) {
+      if (!el || !el.focus) return false;
+      try { el.focus(); } catch (e) { return false; }
+      return document.activeElement === el || (el.contains && el.contains(document.activeElement));
+    }
+    function firstCard() {
+      var t = firstResultEl();
+      if (!t && resultEl && document.body.contains(resultEl)) t = resultEl;
+      return t || null;
+    }
+    // Переход «Сброс» → выдача делаем нативно: возвращаем фокус клавише нижнего
+    // ряда («ПОИСК») и отдаём ей Down — дальше плеер сам ставит фокус на первую
+    // карточку, ровно как при обычном Down с клавиатуры. Окно при этом гаснет.
+    function leaveToResults() {
+      var anc = keyboardAnchor(window.innerWidth, window.innerHeight);
+      var key = anc && anc.key;
+      suppressUntil = Date.now() + 700;
+      awayToResults = true;
+      hide();
+      if (!key) { diag('to-results key=0'); return; }
+      try { key.focus(); } catch (e) { }
+      fireKey(key, 'keydown', 40, 'ArrowDown');
+      setTimeout(function () { fireKey(key, 'keyup', 40, 'ArrowDown'); }, 40);
+      setTimeout(function () {
+        var a = document.activeElement;
+        diag('to-results act=' + tagOf(a) + ' inKb=' + (isKeyboardEl(a) ? 1 : 0));
+      }, 320);
+    }
+    // Нижний ряд клавиатуры: «Пробел», «Очистить», «Поиск».
+    function inBottomRow(el) {
+      if (!el || !isKeyboardEl(el)) return false;
+      var row = null;
+      try { row = el.closest ? el.closest('yt-focus-container') : null; } catch (e) { }
+      if (!row || row.children.length !== 3) return false;
+      for (var i = 0; i < 3; i++)
+        if (!row.children[i].querySelector('yt-keyboard-key[role="button"]')) return false;
+      return true;
+    }
+    // Текущий элемент вверх по дереву: тег, tabindex, роль, координаты.
+    function chainOf(el) {
+      var s = '', p = el;
+      for (var d = 0; d < 5 && p && p !== document.body; d++, p = p.parentElement) {
+        var r = p.getBoundingClientRect();
+        s += (d ? '>' : '') + tagOf(p) + '@' + Math.round(r.top) + ',' +
+          Math.round(r.left) + ',' + Math.round(r.width) + 'x' + Math.round(r.height);
+      }
+      return s || 'x';
+    }
+    // Стили перехода элемента: чем именно анимируется нативный переход.
+    function animOf(el) {
+      var st = window.getComputedStyle && window.getComputedStyle(el);
+      if (!st) return 'x';
+      return 'tr=' + (st.transitionProperty || '-') + '/' + (st.transitionDuration || '-') +
+        '/' + (st.transitionTimingFunction || '-') +
+        ' tf=' + String(st.transform || '-').slice(0, 32) + ' op=' + st.opacity;
+    }
+    function animChain(el, depth) {
+      var s = '', p = el;
+      for (var d = 0; d < depth && p && p !== document.body; d++, p = p.parentElement)
+        s += (d ? ' | ' : '') + String(p.tagName || '').toLowerCase() + ': ' + animOf(p);
+      return s || 'x';
+    }
+    // Запоминаем карточку выдачи, чтобы вернуться к ней с «Сброса».
+    // Заодно логируем нативный переход: что получает фокус и как оно анимируется.
+    document.addEventListener('focusin', function (e) {
+      var a = e.target;
+      if (!a || a === document.body) return;
+      if (panel && panel.contains(a)) return;
+      if (fromSearch(a) || isKeyboardEl(a)) return;
+      // Фокус ушёл в выдачу — окно начинает гаснуть в том же кадре, что и
+      // клавиатура (её гасит само приложение), не дожидаясь такта скана.
+      if (panel) { awayToResults = true; hide(); }
+      resultEl = a;
+      var now = Date.now();
+      if (now - lastNavLog > 400) {
+        lastNavLog = now;
+        log('nav focusin ' + chainOf(a) + ' || ' + animOf(a));
+      }
+    }, true);
+    // Правее последней клавиши ряда на экране только окно фильтров, поэтому
+    // Right с «⌫», «&123», «🌐» и «ПОИСК» должно вести в него так же, как из
+    // поля поиска.
+    function isRowLastKey(el) {
+      if (!el || !isKeyboardEl(el)) return false;
+      var row = null;
+      try { row = el.closest ? el.closest('yt-focus-container') : null; } catch (e) { }
+      if (!row) return false;
+      var kids = row.children, last = kids[kids.length - 1];
+      if (!last) return false;
+      if (last === el || last.contains(el)) return true;
+      var r = el.getBoundingClientRect(), lr = last.getBoundingClientRect();
+      return lr.width > 0 && r.right > lr.right - 6;
+    }
+    // После входа в окно на клавише остаётся белый маркер фокуса — смотрим,
+    // чем он нарисован (класс/предок/контур), чтобы убрать его.
+    function clsOf(el) {
+      if (!el) return 'none';
+      var s = '';
+      try {
+        s = String(el.getAttribute('class') || '-');
+        var p = el.parentElement;
+        if (p && p.getAttribute) s += ' / ' + String(p.getAttribute('class') || '-');
+        var st = window.getComputedStyle && window.getComputedStyle(el);
+        if (st) s += ' | out=' + st.outlineStyle + '/' + st.outlineWidth +
+          ' bs=' + String(st.boxShadow || '-').slice(0, 20);
+      } catch (e) { }
+      return s.slice(0, 240);
+    }
+    // Белый маркер фокуса клавиши рисуется самим приложением по своему
+    // состоянию навигации, поэтому после программной передачи фокуса в окно он
+    // остаётся. Ищем, чем он нарисован: пустой элемент в размер клавиши с
+    // рамкой/тенью/фоном — это и есть рамка фокуса.
+    function boxSig(el) {
+      var st = window.getComputedStyle && window.getComputedStyle(el);
+      if (!st) return 'x';
+      return 'b=' + st.borderTopWidth + '/' + st.borderTopColor +
+        ' bg=' + st.backgroundColor + ' im=' + String(st.backgroundImage || 'none').slice(0, 14) +
+        ' sh=' + String(st.boxShadow || 'none').slice(0, 14) + ' o=' + st.opacity;
+    }
+    function sameBox(a, b) {
+      if (!a || !b) return false;
+      var ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
+      return Math.abs(ra.width - rb.width) <= 12 && Math.abs(ra.height - rb.height) <= 12 &&
+        Math.abs(ra.top - rb.top) <= 12 && Math.abs(ra.left - rb.left) <= 12;
+    }
+    function ringCandidates(key) {
+      var out = [];
+      if (!key) return out;
+      var box = null;
+      try { box = key.closest ? key.closest('ytlr-search-keyboard') : null; } catch (e) { }
+      if (!box) box = key.parentElement;
+      if (!box) return out;
+      var list = box.querySelectorAll('*');
+      for (var i = 0; i < list.length && out.length < 4; i++) {
+        var el = list[i];
+        if (el === key) continue;
+        // Текст и предков не трогаем: рамка — пустой слой, а не буква.
+        if (String(el.textContent || '').trim()) continue;
+        if (el.contains && el.contains(key)) continue;
+        if (!sameBox(el, key)) continue;
+        var st = window.getComputedStyle && window.getComputedStyle(el);
+        if (!st) continue;
+        var painted = parseFloat(st.borderTopWidth) > 0 ||
+          String(st.boxShadow || 'none') !== 'none' ||
+          String(st.backgroundImage || 'none') !== 'none' || bgAlpha(el) > 0.05;
+        if (!painted) continue;
+        out.push(el);
+      }
+      return out;
+    }
+    function ringProbe(key) {
+      if (ringLogged || !key) return;
+      ringLogged = true;
+      var out = 'key{' + boxSig(key) + '}';
+      var p = key.parentElement;
+      for (var d = 0; d < 2 && p && p !== document.body; d++, p = p.parentElement)
+        out += ' p' + d + '{' + boxSig(p) + '}';
+      var c = ringCandidates(key);
+      for (var i = 0; i < c.length; i++)
+        out += ' c' + i + '.' + String(c[i].getAttribute('class') || '-').slice(0, 20) +
+          '{' + boxSig(c[i]) + '}';
+      log('ring n=' + c.length + ' ' + out.slice(0, 640));
+    }
+    // Пока фокус в окне, белый маркер с клавиши снимаем; на Left возвращаем.
+    // Найденный слой запоминаем на самой клавише, чтобы не сканировать клавиатуру
+    // на каждом входе.
+    function markRing(key) {
+      clearRing();
+      var c = null;
+      var cached = key ? key.__votRing : null;
+      if (cached && document.body.contains(cached) && sameBox(cached, key)) c = [cached];
+      else c = ringCandidates(key);
+      if (c && c.length && c[0].nodeType === 1) {
+        try { key.__votRing = c[0]; } catch (e) { }
+      }
+      for (var i = 0; i < (c ? c.length : 0); i++) {
+        ringEls.push({ el: c[i], op: c[i].style.opacity });
+        c[i].style.setProperty('opacity', '0', 'important');
+      }
+      log('ring hide n=' + (c ? c.length : 0));
+    }
+    function clearRing() {
+      for (var i = 0; i < ringEls.length; i++) {
+        var s = ringEls[i];
+        try {
+          if (s.op) s.el.style.opacity = s.op; else s.el.style.removeProperty('opacity');
+        } catch (e) { }
+      }
+      ringEls = [];
+    }
+    function onKey(e) {
+      var code = e.keyCode || e.which, active = document.activeElement;
+      // Down с нижнего ряда клавиатуры не перехватываем: плеер сам уводит
+      // фокус на первую карточку (ytlr-playback-preview) — проверено нативно.
+      if (!panel || !document.body.contains(panel)) return;
+      var rootIndex = rows.indexOf(active), subIndex = items.indexOf(active);
+      if (rootIndex < 0 && subIndex < 0) {
+        if (code !== 39) return;
+        if (!fromSearch(active) && !isRowLastKey(active)) return;
+        var start = 0;
+        if (!rows.length) return;
+        enterFrom = active;
+        var keyCls = clsOf(active);
+        ringProbe(active);
+        rows[start].focus();
+        if (document.activeElement !== rows[start]) return;
+        markRing(active);
+        diag('enter by=' + tagOf(active));
+        log('marker before=' + keyCls + ' after=' + clsOf(active));
+      } else if (subIndex >= 0) {
+        if (code === 38) items[(subIndex + items.length - 1) % items.length].focus();
+        else if (code === 40) items[(subIndex + 1) % items.length].focus();
+        else if (code === 37) { closeSub(); }
+        else if (code === 13 || code === 23) { pick(subIndex); }
+        else return;
+      } else {
+        if (code === 38) rows[(rootIndex + rows.length - 1) % rows.length].focus();
+        else if (code === 40) {
+          if (rootIndex === rows.length - 1) leaveToResults();
+          else rows[rootIndex + 1].focus();
+        }
+        else if (code === 37) { backToSearch(); }
+        else if (code === 39 || code === 13 || code === 23) {
+          if (rootIndex === rows.length - 1) resetAll();
+          else openSub(rootIndex);
+        } else return;
+      }
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+    }
+    document.addEventListener('keydown', onKey, true);
+    // Диагностика нативных переходов: куда уходит фокус и как это анимируется.
+    document.addEventListener('keydown', function (e) {
+      var code = e.keyCode || e.which;
+      if (code !== 37 && code !== 38 && code !== 39 && code !== 40 &&
+          code !== 13 && code !== 23) return;
+      var a = document.activeElement;
+      if (!a || a === document.body) return;
+      if (panel && panel.contains(a)) return;
+      // ВРЕМЕННАЯ диагностика: почему Right в баре плеера уводит фокус из ряда.
+      if (code === 39) {
+        try {
+          var bar = a.closest ? a.closest('ytlr-player-actions-container') : null;
+          if (bar) {
+            var nodes = bar.querySelectorAll('ytlr-button-renderer, ytlr-video-owner-renderer');
+            var out = [];
+            for (var q = 0; q < nodes.length && out.length < 24; q++) {
+              var nd = nodes[q], r2 = nd.getBoundingClientRect();
+              if (!r2.width && !r2.height) continue;
+              var lb2 = '';
+              try {
+                lb2 = String(nd.getAttribute('aria-label') || nd.getAttribute('title') || '');
+                if (!lb2) {
+                  var in2 = nd.querySelector('[aria-label],[title]');
+                  if (in2) lb2 = String(in2.getAttribute('aria-label') || in2.getAttribute('title') || '');
+                }
+              } catch (e6) { }
+              out.push(String(nd.tagName || '?').toLowerCase().replace('ytlr-', '')
+                + '[' + lb2.slice(0, 18) + ']' + Math.round(r2.left) + ',' + Math.round(r2.top)
+                + ' ' + Math.round(r2.width) + 'x' + Math.round(r2.height)
+                + ' ti=' + (nd.getAttribute ? nd.getAttribute('tabindex') : '-')
+                + ' ah=' + (nd.getAttribute ? nd.getAttribute('aria-hidden') : '-')
+                + ' dis=' + (nd.disabled ? 1 : 0));
+            }
+            log('bar dump n=' + out.length + ': ' + out.join(' | '));
+          }
+        } catch (e7) { }
+      }
+      var before = chainOf(a);
+      setTimeout(function () {
+        log('nav key=' + code + ' from=' + before + ' to=' +
+          chainOf(document.activeElement) + ' | ' + animOf(document.activeElement));
+      }, 240);
+    }, true);
+    window.addEventListener('vot-pref', function (e) {
+      if (!e.detail) return;
+      for (var i = 0; i < GROUPS.length; i++)
+        if (e.detail.key === GROUPS[i].key) { paint(); return; }
+    });
+    // Пока панель на экране, клавиатуру опрашиваем чаще, чтобы окно уезжало
+    // вместе с ней, а не через четверть секунды.
+    function tick() {
+      scan();
+      // Синхронизацию анимации ведёт покадровый сторож, скану достаточно
+      // раз в 100 мс: геометрия и монтаж окна.
+      setTimeout(tick, panel || kbSeen ? 100 : 250);
+    }
+    try { requestAnimationFrame(fastWatch); } catch (e) { }
+    tick();
+  }
+
   // ---- кнопка «Перевод» в панели плеера -------------------------------------
   // Панель плеера строит функция из window._yttv, чей код содержит
   // TRANSPORT_CONTROLS_BUTTON_TYPE_*: у неё методы возвращают массив кнопок.
@@ -2714,6 +4576,12 @@
     }
     if (state.offForId === id) { state.paintOn = false; return false; }
     if (state.skipLangBlock === id) { state.paintOn = false; return false; }
+    // Unknown→hold означает, что перевод НЕ запущен: первое нажатие 文A
+    // должно принудительно включить его, а не выключить уже остановленный.
+    if (state.langWaitForId === id && state.forceTranslate !== id) {
+      state.paintOn = false;
+      return false;
+    }
     state.paintOn = true;
     return true;
   }
@@ -3051,18 +4919,14 @@
   // «Качество» — стопкой плашек справа, с родной анимацией и навигацией.
   function votPopupItem() {
     var cmd = votPanelCmd('vot-settings');
+    if (!cmd) return null; // без шаблона не вставляем пункт, открывающий DOM popup
     var lr = {
       title: { simpleText: 'Перевод Яндекс' },
       icon: { iconType: 'TRANSLATE' },
       // Стрелка — как у плашек, открывающих подменю («Скорость», «Пожалуйста»).
       secondaryIcon: { iconType: 'CHEVRON_RIGHT' }
     };
-    if (cmd) {
-      lr.serviceEndpoint = { commandExecutorCommand: { commands: [cmd] } };
-    } else {
-      // Шаблон не поймали (настройки ещё не открывались) — DOM-панель.
-      lr.serviceEndpoint = { commandExecutorCommand: { commands: [{ customAction: { action: VOT_ACTION } }] } };
-    }
+    lr.serviceEndpoint = { commandExecutorCommand: { commands: [cmd] } };
     return { compactLinkRenderer: lr };
   }
 
@@ -3143,11 +5007,13 @@
       var arr = lists[i];
       if (!arr || !arr.length) continue;
       if (popupHasOurs(arr)) continue;
-      arr.splice(Math.min(2, arr.length), 0, votPopupItem());
+      var item = votPopupItem();
+      if (!item) continue;
+      arr.splice(Math.min(2, arr.length), 0, item);
       if (popupLog < 12) {
         popupLog++;
         var tt = [];
-        for (var j = 0; j < arr.length && j < 6; j++) tt.push(linkTitle(arr[j]));
+        for (var j = 0; j < arr.length && j < 14; j++) tt.push(linkTitle(arr[j]));
         log('popup item inserted n=' + arr.length + ' [' + tt.join(' / ') + ']');
       }
       return 1;
@@ -3172,14 +5038,20 @@
           var uid = String(cmd.openPopupAction.uniqueId || '');
           if (popupInstLog < 24) {
             popupInstLog++;
-            log('popup inst=' + inst.__votId + ' uid=' + (uid || '-')
-              + ' own=' + (cmd.__votOwn ? 1 : 0) + ' w=' + where);
+            log('popup inst=' + inst.__votId + ' kind=' +
+              (uid === 'playback-settings' ? 'playback' : cmd.__votOwn ? 'own' : 'other')
+              + ' own=' + (cmd.__votOwn ? 1 : 0));
           }
         }
       } catch (e9) { }
       try {
         if (handleAction(actionOf(cmd))) return true;
-        var cc = cmd && cmd.commandExecutorCommand && cmd.commandExecutorCommand.commands;
+        // Вложенные команды исполняем только для «нажатия» пункта. Если команда
+        // сама открывает попап (openPopupAction), это перерисовка панели: клиент
+        // переиспользует вложенный список при каждом рендере, и наши VOT_SET
+        // срабатывали сами по себе (проверено на ТВ: dub=dub/dub=yandex в цикле).
+        var cc = (!cmd || !cmd.openPopupAction)
+          ? (cmd && cmd.commandExecutorCommand && cmd.commandExecutorCommand.commands) : null;
         if (cc && cc.length) {
           for (var i = 0; i < cc.length; i++) {
             if (handleAction(actionOf(cc[i]))) return true;
@@ -3187,6 +5059,7 @@
         }
       } catch (e) { }
       if (doPopup && cmd && cmd.openPopupAction) {
+        try { sortProbePopup(cmd, name); } catch (probeErr) { }
         try { popupInsert(cmd); } catch (e1) { log('popup pre ERR ' + (e1 && e1.message)); }
       }
       var r = rc.apply(this, arguments);
@@ -3313,8 +5186,8 @@
     try {
       var rt = document.getElementById('vot-ui-root');
       pn = (rt && String(rt.className).indexOf('vot-open') >= 0) ? 1 : 0;
-      var ts = document.getElementById('vot-toast');
-      toast = (ts && ts.style.display === 'block') ? 1 : 0;
+      // Витрина статуса теперь одна (#vot-status); старое #vot-toast удалено.
+      toast = stShown ? 1 : 0;
     } catch (e4) { }
     var af = '-';
     try { af = document.activeElement ? String(document.activeElement.tagName || '').toLowerCase().slice(0, 12) : '-'; } catch (e5) { }
@@ -3339,6 +5212,8 @@
       if (!state.curId || document.hidden) return;
       // Сторож интерфейса: раз в два тика (~2.4 с), только на странице ролика.
       if (uiTickN % 2 === 0) uiWatch();
+      // Витрина статуса прячется/показывается вместе с баром плеера.
+      statusTick();
       paintToggleBtn();
     } catch (e) { }
   }, 1200);
@@ -3378,6 +5253,9 @@
   } catch (e2) { log('MO ERR ' + (e2 && e2.message)); }
 
   setupUI();
+  // Даты в поиске — собственные кнопки справа от штатной клавиатуры.
+  setupSearchSortProbe();
+  setupSearchFilters();
   btnRetry();
 
 })();
