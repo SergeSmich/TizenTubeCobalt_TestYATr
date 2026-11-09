@@ -411,3 +411,32 @@
   Библиотека, Видеоигры, Новости, DW News, Shorts, Настройки) целы.
 
 
+## 09.11: субтитры при загрузке
+
+- Причина: YouTube TV сам выбирает дорожку субтитров на старте ролика (трек
+  `{"languageCode":"en",...}` появляется в `getOption('captions','track')`
+  примерно через 8 с после открытия видео, ещё до нашего mute). Состояние
+  переживает перезапуск приложения: в leveldb
+  `yt-html5-player-modules::subtitlesModuleData::module-enabled=false`,
+  но плеер всё равно выбирает дорожку — состоянием управляет сам ytlr.
+- Плеер ytlr (`document.querySelector('.html5-video-player')`) даёт готовый API:
+  `isSubtitlesOn`, `toggleSubtitlesOn`, `getOption`/`setOption`,
+  `loadModule`/`unloadModule`, `getSubtitlesUserSettings`.
+- Решение в `dev_server/vot.js`: `capArm(id)` — стартовое окно 10 с на каждый
+  ролик; гасим субтитры через `setOption('captions','track',{})` (плюс
+  `toggleSubtitlesOn`, если `isSubtitlesOn()` ещё true) и фолбэк
+  `video.textTracks[i].mode='disabled'`. Окно перезапускается при первом `play`
+  и в `beginPlayback` после `muteVideo()` (мьют тоже провоцирует включение).
+  После окна guard только логирует `capstate on/off`; увидев `on`, ставит
+  `capGuard.userOn` и больше субтитры не трогает — ручное включение уважается.
+- Диагностика в логе: `capdiag player=…`, `capdiag props=…`, `cap_on … on=1`,
+  `cap_off …`, `capstate off track=off`, `cap_guard done off=N`, `cap_user_on`.
+- Проверено на 192.168.1.100: первый прогон дал
+  `cap_on load track={"languageCode":"en"…}` → `cap_off`, после этого во всех
+  сессиях `capstate off track=off` (ролики OKvp8h2m60w, ybvnQv4UuiE,
+  dQw4w9WgXcQ). Перевод названий и точки работают (`title_tr n=1`,
+  `title_domq n=1`).
+- Ограничение: ручное включение субтитров пультом в тесте не проверено
+  (навигация по кнопкам плеера keyevent-ами нестабильна), но после 10 с guard
+  не вмешивается, а `userOn` отключает его до перезапуска приложения.
+

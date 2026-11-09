@@ -497,6 +497,11 @@
         schedulePaint();
       });
       v.addEventListener('play', function () {
+        // Первый старт ролика: субтитры могли включиться уже после навигации.
+        if (capGuard && state.curId && capGuard.playId !== state.curId) {
+          capGuard.playId = state.curId;
+          capArm(state.curId);
+        }
         if (state.active && state.audioPaused) {
           state.audioPaused = false;
           log('sync resume(ev)');
@@ -1810,8 +1815,143 @@
     }, delay);
   }
 
+  // ---- subtitles off on load ------------------------------------------
+  // YouTube TV иногда сам включает субтитры при старте ролика (настройка
+  // аккаунта/устройства). Гасим их в первые секунды после загрузки, потом
+  // оставляем плеер в покое: ручное включение в меню должно работать.
+  var capGuard = { id: null, until: 0, n: 0, off: 0, diag: 0, playId: null, userOn: false };
+
+  function capPlayer() {
+    try { return document.querySelector('.html5-video-player'); } catch (e) { return null; }
+  }
+
+  function capTracksOff() {
+    var v = findVideo(), n = 0;
+    if (!v) return 0;
+    try {
+      for (var i = 0; i < v.textTracks.length; i++) {
+        var tt = v.textTracks[i];
+        if (tt && tt.mode === 'showing') { tt.mode = 'disabled'; n++; }
+      }
+    } catch (e) { }
+    return n;
+  }
+
+  // Возвращает число выключений (0 — субтитры и так не показываются).
+  function capOff(reason) {
+    // Пользователь включил субтитры вручную — больше не трогаем их до
+    // перезапуска приложения.
+    if (capGuard.userOn) return 0;
+    var pl = capPlayer(), n = 0, cur = null, on = false;
+    if (pl) {
+      try {
+        if (typeof pl.getOption === 'function') cur = pl.getOption('captions', 'track');
+      } catch (e) { }
+      try {
+        if (typeof pl.isSubtitlesOn === 'function') on = !!pl.isSubtitlesOn();
+      } catch (e) { }
+      if (cur && typeof cur === 'object' && Object.keys(cur).length) n++;
+      if (on) n++;
+      if (n) {
+        log('cap_on ' + reason + ' track=' + JSON.stringify(cur).slice(0, 80) + ' on=' + (on ? 1 : 0));
+        try { if (typeof pl.setOption === 'function') pl.setOption('captions', 'track', {}); } catch (e) { }
+        // Имя метода — toggle, поэтому вызываем только если субтитры ещё живы.
+        try {
+          if (typeof pl.toggleSubtitlesOn === 'function' && typeof pl.isSubtitlesOn === 'function' &&
+            pl.isSubtitlesOn()) pl.toggleSubtitlesOn();
+        } catch (e) { }
+        try { if (typeof pl.setSubtitlesTrack === 'function') pl.setSubtitlesTrack(null); } catch (e) { }
+      }
+    }
+    var nt = capTracksOff();
+    if (nt) n += nt;
+    if (n) log('cap_off ' + reason + ' n=' + n);
+    return n;
+  }
+
+  function capDiag() {
+    if (capGuard.diag) return;
+    var pl = capPlayer();
+    if (!pl) return; // плеер ещё не в DOM: дамп отложим до следующего тика
+    capGuard.diag = 1;
+    log('capdiag player=' + pl.tagName + '.' + String(pl.className).slice(0, 40));
+    var hits = [];
+    try {
+      var o = pl, depth = 0;
+      while (o && o !== Object.prototype && depth++ < 5) {
+        var names = Object.getOwnPropertyNames(o);
+        for (var i = 0; i < names.length && hits.length < 40; i++) {
+          var nm = names[i];
+          if (/cap|subtitle|track|option|toggle|module/i.test(nm) && hits.indexOf(nm) === -1) hits.push(nm);
+        }
+        o = Object.getPrototypeOf(o);
+      }
+    } catch (e) { }
+    log('capdiag props=' + (hits.join(',') || '-'));
+    try {
+      if (!pl.__votCapEv) {
+        pl.__votCapEv = 1;
+        // События приходят и при ручном включении — реагируем только в
+        // стартовом окне, иначе пользователь не сможет включить субтитры.
+        pl.addEventListener('onCaptionsTrackListChanged', function () {
+          if (Date.now() <= capGuard.until) capOff('evt');
+        });
+        pl.addEventListener('captionssettingschanged', function () {
+          if (Date.now() <= capGuard.until) capOff('evt');
+        });
+      }
+    } catch (e) { }
+    var v = findVideo(), tts = [];
+    try {
+      if (v) {
+        for (var i = 0; i < v.textTracks.length; i++) {
+          var tt = v.textTracks[i];
+          tts.push((tt.kind || '?') + ':' + (tt.language || '?') + ':' + tt.mode);
+        }
+      }
+    } catch (e) { }
+    log('capdiag textTracks=' + (tts.join(',') || 'none'));
+  }
+
+  function capArm(id) {
+    if (capGuard.userOn) return;
+    capGuard.id = id;
+    capGuard.gen = (capGuard.gen || 0) + 1;
+    capGuard.until = Date.now() + 10000;
+    capGuard.off = 0;
+    var gen = capGuard.gen;
+    var stopAt = Date.now() + 60000;
+    var last = 0;
+    capDiag();
+    capOff('arm');
+    (function tick() {
+      if (capGuard.gen !== gen) return;
+      var now = Date.now();
+      if (now <= capGuard.until) {
+        if (capOff('load')) capGuard.off++;
+      } else if (now - last >= 10000) {
+        // Гасим только в стартовом окне; дальше лишь наблюдаем, чтобы понять,
+        // возвращаются ли субтитры после нашего mute.
+        last = now;
+        var pl = capPlayer(), st = '?', tr = null;
+        try {
+          if (pl && typeof pl.isSubtitlesOn === 'function') st = pl.isSubtitlesOn() ? 'on' : 'off';
+          if (pl && typeof pl.getOption === 'function') tr = pl.getOption('captions', 'track');
+        } catch (e) { }
+        log('capstate ' + st + ' track=' + (tr && Object.keys(tr).length ? 'on' : 'off'));
+        // Субтитры включились уже после стартового окна — это сделал
+        // пользователь, дальше его выбор не оспариваем.
+        if (st === 'on') { capGuard.userOn = true; log('cap_user_on'); return; }
+      }
+      if (now > stopAt) { log('cap_guard done off=' + capGuard.off); return; }
+      setTimeout(tick, now <= capGuard.until ? 400 : 2000);
+    })();
+  }
+
   function muteVideo() {
     var v = findVideo();
+    // Глушим всегда, но субтитры трогаем только в стартовом окне ролика.
+    if (Date.now() <= capGuard.until) { try { capOff('mute'); } catch (e) { } }
     if (!v) return;
     try { v.muted = true; } catch (e) { }
     try { v.volume = 0; } catch (e) { }
@@ -1880,6 +2020,9 @@
     }
     state.pendingPlay = null;
     muteVideo();
+    // Мьют иногда заставляет YouTube TV включить субтитры — гасим их заново,
+    // но только если стартовое окно ролика уже истекло.
+    if (state.curId && Date.now() > capGuard.until) capArm(state.curId);
     if (!state.playedOnce) {
       restartVideo(function () { startBridgePlayer(url, done); });
       return;
@@ -2193,6 +2336,7 @@
     http('POST', '/stop', { }, function () { }, function () { });
     setStatus('Перевод: видео найдено, жду плеер…\nvideo=' + id, '#90a4ae');
     log('watch detected id=' + id);
+    capArm(id);
     // После полного сброса применяем только подтверждённую дорожку этого id.
     var early = earlyAudioTrack;
     earlyAudioTrack = null;
@@ -2222,7 +2366,10 @@
         probeYtcfg();
         probeAudio();
         probeLang();
-        if (state.curId === id) startTranslation(id, v.duration);
+        if (state.curId === id) {
+          capOff('ready');
+          startTranslation(id, v.duration);
+        }
       } else if (tries++ < 60) {
         setTimeout(wait, 1000);
       } else {
